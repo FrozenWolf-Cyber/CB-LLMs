@@ -139,7 +139,7 @@ if __name__ == "__main__":
 
     perplexity = evaluate.load("perplexity", module_type="metric")
     
-    for i in range(100):
+    for i in range(len(pred)):
         perplexity.add_batch(predictions=[pred[i]])
         
     with torch.no_grad():
