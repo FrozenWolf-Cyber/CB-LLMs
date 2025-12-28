@@ -120,22 +120,22 @@ if __name__ == "__main__":
     from transformers import LlamaForCausalLM
 
 
-    preLM_lm = LlamaForCausalLM.from_pretrained(
-        "meta-llama/Meta-Llama-3-8B",
-        torch_dtype=torch.bfloat16
-    ).to(device)
+    # preLM_lm = LlamaForCausalLM.from_pretrained(
+    #     "meta-llama/Meta-Llama-3-8B",
+    #     torch_dtype=torch.bfloat16
+    # ).to(device)
 
-    preLM_lm.eval()
+    # preLM_lm.eval()
 
 
-    mean_ppl = compute_perplexity_streaming(
-        pred,
-        model=preLM_lm,  
-        tokenizer=tokenizer,
-        max_length=100,
-    )
+    # mean_ppl = compute_perplexity_streaming(
+    #     pred,
+    #     model=preLM_lm,  
+    #     tokenizer=tokenizer,
+    #     max_length=100,
+    # )
     
-    print("Mean perplexity:", mean_ppl)
+    # print("Mean perplexity:", mean_ppl)
 
     perplexity = evaluate.load("perplexity", module_type="metric")
     
