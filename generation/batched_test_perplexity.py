@@ -102,11 +102,13 @@ if __name__ == "__main__":
                 text_ids[0],
                 skip_special_tokens=True
             )
+            print(text)
             pred.append(text)
 
 
 
-
+    import pickle
+    pickle.dump(pred, open("generated_texts.pkl", "wb"))
     del preLM
     del cbl
     gc.collect()
