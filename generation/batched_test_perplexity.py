@@ -120,6 +120,8 @@ if __name__ == "__main__":
     for p in pred_2:
         if len(p.split()) < 35:
             temp.append(p)
+            
+    print("Filtered length:", len(temp))
     pred = temp
             
     from transformers import LlamaForCausalLM
