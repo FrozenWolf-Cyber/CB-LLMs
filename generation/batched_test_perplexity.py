@@ -2,42 +2,48 @@ import torch
 import torch.nn.functional as F
 import math
 
-def compute_perplexity_single(model, tokenizer, text, device, max_length=100):
-    enc = tokenizer(
-        text,
-        return_tensors="pt",
-        truncation=True,
-        max_length=max_length,
-    )
+import torch
+import numpy as np
+from transformers import LlamaForCausalLM, AutoTokenizer
+import gc
 
-    input_ids = enc["input_ids"].to(device)
-    attention_mask = enc["attention_mask"].to(device)
+def compute_perplexity_streaming(
+    texts,
+    model,
+    tokenizer,
+    max_length=100,
+):
+    """
+    Streaming perplexity (batch size = 1), evaluate-compatible.
+    """
+    model.eval()
+    total_loss = 0.0
+    total_tokens = 0
 
     with torch.no_grad():
-        outputs = model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-        )
-        logits = outputs.logits 
+        for text in texts:
+            enc = tokenizer(
+                text,
+                return_tensors="pt",
+                truncation=True,
+                max_length=max_length,
+                padding=False,
+            ).to(model.device)
 
-    # Shift
-    shift_logits = logits[:, :-1, :]
-    shift_labels = input_ids[:, 1:]
-    shift_mask = attention_mask[:, 1:]
+            outputs = model(
+                input_ids=enc.input_ids,
+                labels=enc.input_ids,
+            )
 
-    loss = F.cross_entropy(
-        shift_logits.reshape(-1, shift_logits.size(-1)),
-        shift_labels.reshape(-1),
-        reduction="none",
-    )
+            # HF loss is mean over tokens
+            loss = outputs.loss.item()
+            num_tokens = enc.input_ids.numel()
 
-    loss = loss * shift_mask.reshape(-1)
+            total_loss += loss * num_tokens
+            total_tokens += num_tokens
 
-    total_loss = loss.sum()
-    total_tokens = shift_mask.sum()
-
-    ppl = torch.exp(total_loss / total_tokens)
-    return ppl.item()
+    avg_loss = total_loss / total_tokens
+    return float(np.exp(avg_loss))
 
 
 
@@ -85,31 +91,44 @@ if __name__ == "__main__":
     cbl.eval()
 
     pred = []
-    perplexities = []
-    
     input_ids = torch.tensor([tokenizer.encode("")]).to(device)
-    
+
     for i in range(100):
         print("example", i, end="\r")
-    
+
         with torch.no_grad():
             text_ids, _ = cbl.generate(input_ids, preLM)
-            text = tokenizer.decode(text_ids[0], skip_special_tokens=True)
+            text = tokenizer.decode(
+                text_ids[0],
+                skip_special_tokens=True
+            )
             pred.append(text)
-    
-        ppl = compute_perplexity_single(
-            model=preLM,
-            tokenizer=tokenizer,
-            text=text,
-            device=device,
-            max_length=100,
-        )
-        perplexities.append(ppl)
+
+
+
 
     del preLM
     del cbl
     gc.collect()
     torch.cuda.empty_cache()
 
-    mean_ppl = sum(perplexities) / len(perplexities)
+
+    from transformers import LlamaForCausalLM
+
+
+    preLM_lm = LlamaForCausalLM.from_pretrained(
+        "meta-llama/Meta-Llama-3-8B",
+        torch_dtype=torch.bfloat16
+    ).to(device)
+
+    preLM_lm.eval()
+
+
+    mean_ppl = compute_perplexity_streaming(
+        pred,
+        model=preLM_lm,  
+        tokenizer=tokenizer,
+        max_length=100,
+    )
+    
     print("Mean perplexity:", mean_ppl)
