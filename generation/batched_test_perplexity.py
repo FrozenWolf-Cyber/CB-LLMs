@@ -2,10 +2,7 @@ import torch
 import torch.nn.functional as F
 import math
 
-def compute_perplexity_single(model, tokenizer, text, device, max_length=1024):
-    """
-    Compute perplexity for a single text sequence.
-    """
+def compute_perplexity_single(model, tokenizer, text, device, max_length=100):
     enc = tokenizer(
         text,
         return_tensors="pt",
@@ -21,20 +18,21 @@ def compute_perplexity_single(model, tokenizer, text, device, max_length=1024):
             input_ids=input_ids,
             attention_mask=attention_mask,
         )
-        logits = outputs.last_hidden_state @ model.embed_tokens.weight.T
+        logits = outputs.logits 
 
-    # Shift for next-token prediction
-    shift_logits = logits[:, :-1, :].contiguous()
-    shift_labels = input_ids[:, 1:].contiguous()
-    shift_mask = attention_mask[:, 1:].contiguous()
+    # Shift
+    shift_logits = logits[:, :-1, :]
+    shift_labels = input_ids[:, 1:]
+    shift_mask = attention_mask[:, 1:]
 
     loss = F.cross_entropy(
-        shift_logits.view(-1, shift_logits.size(-1)),
-        shift_labels.view(-1),
+        shift_logits.reshape(-1, shift_logits.size(-1)),
+        shift_labels.reshape(-1),
         reduction="none",
     )
 
-    loss = loss * shift_mask.view(-1)
+    loss = loss * shift_mask.reshape(-1)
+
     total_loss = loss.sum()
     total_tokens = shift_mask.sum()
 
