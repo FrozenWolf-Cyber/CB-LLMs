@@ -49,11 +49,13 @@ if __name__ == "__main__":
         with torch.no_grad():
             text_ids, _ = cbl.generate(input_ids, preLM)
             pred.append(tokenizer.decode(text_ids[0]))
+            if len(pred[-1].split()) > 35:
+                continue
             perplexity.add_batch(predictions=[pred[i]])
 
 
     import pickle
-    pickle.dump(pred, open("generated_texts_2.pkl", "wb"))
+    pickle.dump(pred, open("generated_texts_3.pkl", "wb"))
     del preLM
     del cbl
     gc.collect()
