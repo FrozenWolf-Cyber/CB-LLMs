@@ -115,7 +115,7 @@ if __name__ == "__main__":
     # torch.cuda.empty_cache()
 
     import pickle
-    pred = pickle.load(open("generated_texts.pkl", "rb"))
+    pred = pickle.load(open("generated_texts_2.pkl", "rb"))
     
     from transformers import LlamaForCausalLM
 
