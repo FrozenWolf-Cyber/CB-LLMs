@@ -223,6 +223,9 @@ if __name__ == "__main__":
                 best_loss = avg_val_loss
                 preLM.save_pretrained(prefix + model_name + "_epoch_" + str(e + 1))
                 torch.save(cbl.state_dict(), prefix + cbl_name + "_epoch_" + str(e + 1) + ".pt")
+            else:
+                preLM.save_pretrained(prefix + model_name + "_low_score_epoch_" + str(e + 1))
+                torch.save(cbl.state_dict(), prefix + cbl_name + "_low_score_epoch_" + str(e + 1) + ".pt")
         else:
             print("save model")
             preLM.save_pretrained(prefix + model_name + "_epoch_" + str(e + 1))
