@@ -70,51 +70,53 @@ if __name__ == "__main__":
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
     args = parser.parse_args()
 
-    config = LlamaConfig.from_pretrained('meta-llama/Meta-Llama-3-8B')
+    # config = LlamaConfig.from_pretrained('meta-llama/Meta-Llama-3-8B')
     tokenizer = AutoTokenizer.from_pretrained('meta-llama/Meta-Llama-3-8B')
-    tokenizer.pad_token = tokenizer.eos_token
+    # tokenizer.pad_token = tokenizer.eos_token
 
-    roberta_tokenizer = RobertaTokenizerFast.from_pretrained('roberta-base')
-
-
-    concept_set = CFG.concepts_from_labels[args.dataset]
-    print("concept len: ", len(concept_set))
-
-    print("preparing backbone")
-    peft_path = "from_pretained_llama3_lora_cbm/" + args.dataset.replace('/', '_') + "/llama3"
-    cbl_path = "from_pretained_llama3_lora_cbm/" + args.dataset.replace('/', '_') + "/cbl.pt"
-    preLM = LlamaModel.from_pretrained('meta-llama/Meta-Llama-3-8B', torch_dtype=torch.bfloat16).to(device)
-    preLM.load_adapter(peft_path)
-    preLM.eval()
-    cbl = CBL(config, len(concept_set), tokenizer).to(device)
-    cbl.load_state_dict(torch.load(cbl_path, map_location=device))
-    cbl.eval()
-
-    pred = []
-    input_ids = torch.tensor([tokenizer.encode("")]).to(device)
-
-    for i in range(100):
-        print("example", i, end="\r")
-
-        with torch.no_grad():
-            text_ids, _ = cbl.generate(input_ids, preLM)
-            text = tokenizer.decode(
-                text_ids[0],
-                skip_special_tokens=True
-            )
-            print(text)
-            pred.append(text)
+    # roberta_tokenizer = RobertaTokenizerFast.from_pretrained('roberta-base')
 
 
+    # concept_set = CFG.concepts_from_labels[args.dataset]
+    # print("concept len: ", len(concept_set))
+
+    # print("preparing backbone")
+    # peft_path = "from_pretained_llama3_lora_cbm/" + args.dataset.replace('/', '_') + "/llama3"
+    # cbl_path = "from_pretained_llama3_lora_cbm/" + args.dataset.replace('/', '_') + "/cbl.pt"
+    # preLM = LlamaModel.from_pretrained('meta-llama/Meta-Llama-3-8B', torch_dtype=torch.bfloat16).to(device)
+    # preLM.load_adapter(peft_path)
+    # preLM.eval()
+    # cbl = CBL(config, len(concept_set), tokenizer).to(device)
+    # cbl.load_state_dict(torch.load(cbl_path, map_location=device))
+    # cbl.eval()
+
+    # pred = []
+    # input_ids = torch.tensor([tokenizer.encode("")]).to(device)
+
+    # for i in range(100):
+    #     print("example", i, end="\r")
+
+    #     with torch.no_grad():
+    #         text_ids, _ = cbl.generate(input_ids, preLM)
+    #         text = tokenizer.decode(
+    #             text_ids[0],
+    #             skip_special_tokens=True
+    #         )
+    #         print(text)
+    #         pred.append(text)
+
+
+
+    # import pickle
+    # pickle.dump(pred, open("generated_texts.pkl", "wb"))
+    # del preLM
+    # del cbl
+    # gc.collect()
+    # torch.cuda.empty_cache()
 
     import pickle
-    pickle.dump(pred, open("generated_texts.pkl", "wb"))
-    del preLM
-    del cbl
-    gc.collect()
-    torch.cuda.empty_cache()
-
-
+    pred = pickle.load(open("generated_texts.pkl", "rb"))
+    
     from transformers import LlamaForCausalLM
 
 
@@ -134,3 +136,13 @@ if __name__ == "__main__":
     )
     
     print("Mean perplexity:", mean_ppl)
+
+    perplexity = evaluate.load("perplexity", module_type="metric")
+    
+    for i in range(100):
+        perplexity.add_batch(predictions=[pred[i]])
+        
+    with torch.no_grad():
+        print(perplexity.compute(model_id='meta-llama/Meta-Llama-3-8B', max_length=100)['mean_perplexity'])
+
+    
