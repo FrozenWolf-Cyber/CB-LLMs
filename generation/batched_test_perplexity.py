@@ -115,10 +115,10 @@ if __name__ == "__main__":
     # torch.cuda.empty_cache()
 
     import pickle
-    pred_2 = pickle.load(open("generated_texts_2.pkl", "rb"))
+    pred_2 = pickle.load(open("generated_texts_3.pkl", "rb"))
     temp = []
     for p in pred_2:
-        if len(p.split()) < 35:
+        if len(p.split()) < 25:
             temp.append(p)
             
     print("Filtered length:", len(temp))
