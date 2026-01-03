@@ -373,7 +373,7 @@ if __name__ == "__main__":
             training_loss["training_loss_total"] += total_loss.detach().cpu().numpy()
             training_loss["training_loss_clf"] += clf_loss.detach().cpu().numpy()
             training_loss["training_loss_concept_similarity"] += loss.detach().cpu().numpy()
-            training_loss["training_loss_orthogonal"] += orthogonal_loss.detach().cpu().numpy()
+            training_loss["training_loss_orthogonal"] += orthogonal_loss.detach().cpu().numpy() if args.orthogonal_loss_weight>0 else 0
             
         metrics_result = metric_eval(metrics.compute(), prefix="train")
         for k in training_loss.keys():
@@ -434,7 +434,7 @@ if __name__ == "__main__":
                     val_loss["val_total_loss"] += total_loss.detach().cpu().numpy()
                     val_loss["val_clf_loss"] += clf_loss.detach().cpu().numpy()
                     val_loss["val_concept_similarity_loss"] += loss.detach().cpu().numpy()
-                    val_loss["val_orthogonal_loss"] += orthogonal_loss.detach().cpu().numpy()
+                    val_loss["val_orthogonal_loss"] += orthogonal_loss
                     
                     if args.residual_ratio != 0:
                         cbl_features = torch.cat([cbl_features, feature_residual], dim=-1)
