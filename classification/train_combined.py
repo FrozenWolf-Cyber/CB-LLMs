@@ -323,7 +323,7 @@ if __name__ == "__main__":
                             raise Exception("backbone should be roberta or gpt2")
                         cbl_features = cbl(LM_features)
                     else:
-                        cbl_features = backbone_cbl(batch_text)
+                        cbl_features, pred = backbone_cbl(batch_text)
                     loss = -cos_sim_cubed(cbl_features, batch_sim)
                     clf_loss = CE_criterion(pred, batch_text["label"])
                     total_loss = loss + clf_loss
