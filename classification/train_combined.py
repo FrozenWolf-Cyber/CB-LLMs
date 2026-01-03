@@ -275,9 +275,6 @@ if __name__ == "__main__":
             else:
                 cbl_features, pred = backbone_cbl(batch_text)
             
-            print(cbl_features.shape, batch_sim.shape, pred.shape)
-            print(batch_text.keys())
-            print(batch_text)
             loss = -cos_sim_cubed(cbl_features, batch_sim)
             clf_loss = CE_criterion(pred, batch_text["label"])
             metrics.add_batch(predictions=torch.argmax(pred, dim=-1).cpu(), references=batch_text["label"].cpu())
