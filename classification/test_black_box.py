@@ -7,7 +7,7 @@ import evaluate
 import config as CFG
 from modules import Roberta_Baseline, GPT2_Baseline, MLP
 from utils import eos_pooling
-
+import wandb
 parser = argparse.ArgumentParser()
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -39,6 +39,9 @@ def build_loaders(texts, mode):
 if __name__ == "__main__":
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
     args = parser.parse_args()
+    wandb.init(project="CB-LLMs Baseline Test",
+               config=vars(args),
+               name=f"test_{args.dataset.replace('/', '_')}_{'mlp_only' if args.tune_mlp_only else 'full_model'}")
 
     backbone = args.model_path.split("/")[1]
 
@@ -116,4 +119,7 @@ if __name__ == "__main__":
         pred = torch.argmax(p, dim=-1)
         metric.add_batch(predictions=pred, references=batch["label"])
 
-    print(metric.compute())
+    m = metric.compute()
+    print("Test Accuracy: ", m['accuracy'])
+    wandb.log({"Test Accuracy": m['accuracy']})
+    

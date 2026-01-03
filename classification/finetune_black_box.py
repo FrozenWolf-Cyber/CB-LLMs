@@ -7,7 +7,7 @@ from datasets import load_dataset
 import config as CFG
 from modules import Roberta_Baseline, GPT2_Baseline, MLP
 from utils import eos_pooling
-
+import wandb
 parser = argparse.ArgumentParser()
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -40,7 +40,10 @@ def build_loaders(texts, mode):
 if __name__ == "__main__":
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
     args = parser.parse_args()
-
+    wandb.init(project="CB-LLMs Baseline Finetune",
+               config=vars(args),
+               name=f"{args.dataset.replace('/', '_')}_{args.backbone}_{'mlp_only' if args.tune_mlp_only else 'full_model'}")
+    
     print("loading data...")
     train_dataset = load_dataset(args.dataset, split='train')
     if args.dataset == 'SetFit/sst2':
@@ -157,6 +160,7 @@ if __name__ == "__main__":
             loss.backward()
             optimizer.step()
             print("batch ", str(i), " loss: ", loss.detach().cpu().numpy(), end="\r")
+            wandb.log({"batch_training_loss": loss.detach().cpu().numpy(), "epoch":e+1, "batch":i})
             training_loss.append(loss.detach().cpu().numpy())
         avg_training_loss = sum(training_loss) / len(training_loss)
         print("training loss: ", avg_training_loss)
@@ -185,6 +189,7 @@ if __name__ == "__main__":
                     val_loss.append(loss.detach().cpu().numpy())
             avg_val_loss = sum(val_loss)/len(val_loss)
             print("val loss: ", avg_val_loss)
+            wandb.log({"val_loss": avg_val_loss, "epoch": e+1})
             if avg_val_loss < best_loss:
                 print("save model")
                 best_loss = avg_val_loss
