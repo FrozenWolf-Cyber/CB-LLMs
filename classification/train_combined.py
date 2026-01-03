@@ -193,7 +193,10 @@ if __name__ == "__main__":
     train_loader = build_loaders(encoded_train_dataset, train_similarity, mode="train")
     if args.dataset == 'SetFit/sst2':
         val_loader = build_loaders(encoded_val_dataset, val_similarity, mode="valid")
-    test_loader = build_loaders(encoded_test_dataset, mode="test")
+     ## dummy placeholder float numbers for test
+    test_similarity = np.zeros((len(encoded_test_dataset), len(concept_set)))
+    
+    test_loader = build_loaders(encoded_test_dataset, test_similarity, mode="test")
 
     if args.backbone == 'roberta':
         if args.tune_cbl_only:
@@ -353,9 +356,8 @@ if __name__ == "__main__":
     print("time of training CBL:", (end - start) / 3600, "hours")
     metric = init_metrics()
     for i, batch in enumerate(test_loader):
-        batch_text, batch_sim = batch[0], batch[1]
+        batch_text, _ = batch[0], batch[1]
         batch_text = {k: v.to(device) for k, v in batch_text.items()}
-        batch_sim = batch_sim.to(device)
         with torch.no_grad():
             if args.tune_cbl_only:
                 LM_features = preLM(input_ids=batch_text["input_ids"], attention_mask=batch_text["attention_mask"]).last_hidden_state
