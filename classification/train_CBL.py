@@ -60,7 +60,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     wandb.init(project="CB-LLMs", 
                name=f"train_CBL_{args.dataset}_{args.backbone}_{args.labeling}_tunecblonly_{args.tune_cbl_only}_acc_{args.automatic_concept_correction}",
-                config=OmegaConf.create(vars(args)))
+                config=vars(args))
     
     print("loading data...")
     train_dataset = load_dataset(args.dataset, split='train')
