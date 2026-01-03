@@ -196,10 +196,10 @@ if __name__ == "__main__":
     if args.dataset == 'SetFit/sst2':
         val_loader = build_loaders(encoded_val_dataset, val_similarity, mode="valid")
      ## dummy placeholder float numbers for test
-    test_similarity = np.zeros((len(encoded_test_dataset["label"]),))
+    test_similarity = np.zeros((len(encoded_test_dataset["label"]),1))
     
     test_loader = build_loaders(encoded_test_dataset, test_similarity, mode="test")
-
+    next(iter(test_loader))
     if args.backbone == 'roberta':
         if args.tune_cbl_only:
             print("preparing CBL only...")
@@ -297,7 +297,7 @@ if __name__ == "__main__":
                        "batch_training_loss": total_loss.detach().cpu().numpy(),
                        "epoch": e+1, "batch": i})
             
-            print(f"batch {i} total loss: ", total_loss.detach().cpu().numpy(),
+            print(f"batch {i}/{len(train_loader)} total loss: ", total_loss.detach().cpu().numpy(),
                   f" clf loss: {clf_loss.detach().cpu().numpy()}",
                   f" concept similarity loss: {loss.detach().cpu().numpy()}", end="\r")
             
