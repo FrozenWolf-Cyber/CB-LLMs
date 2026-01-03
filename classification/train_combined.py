@@ -7,9 +7,10 @@ import numpy as np
 from transformers import RobertaTokenizerFast, RobertaModel, GPT2TokenizerFast, GPT2Model
 from datasets import load_dataset, concatenate_datasets
 import config as CFG
-from modules import CBL, RobertaCBL, GPT2CBL
+from modules import CBL, RobertaCBL, GPT2CBL, RobertaCBLResidual
 from utils import cos_sim_cubed, get_labels, eos_pooling
 import time
+import evaluate
 import wandb
 from omegaconf import OmegaConf
 
@@ -27,15 +28,6 @@ parser.add_argument("--batch_size", type=int, default=16)
 parser.add_argument("--max_length", type=int, default=512)
 parser.add_argument("--num_workers", type=int, default=0)
 parser.add_argument("--dropout", type=float, default=0.1)
-
-parser.add_argument("--sage_inference_batch_size", type=int, default=128)
-parser.add_argument("--saga_epoch", type=int, default=500)
-parser.add_argument("--saga_batch_size", type=int, default=256)
-
-parser.add_argument("--saga_max_length", type=int, default=512)
-parser.add_argument("--saga_dropout", type=float, default=0.1)
-
-
 
 class ClassificationDataset(torch.utils.data.Dataset):
     def __init__(self, encode_roberta, s):
@@ -61,35 +53,37 @@ def build_loaders(encode_roberta, s, mode):
                                              shuffle=True if mode == "train" else False)
     return dataloader
 
+def init_metrics():
+    metrics = evaluate.combine([
+        evaluate.load("accuracy"),
+        evaluate.load("f1"),
+        evaluate.load("precision"),
+        evaluate.load("recall"),
+        evaluate.load("confusion_matrix"),
+    ])
+    return metrics
 
-class ClassificationInferenceDataset(torch.utils.data.Dataset):
-    def __init__(self, texts):
-        self.texts = texts
-
-    def __getitem__(self, idx):
-        t = {key: torch.tensor(values[idx]) for key, values in self.texts.items()}
-        return t
-
-    def __len__(self):
-        return len(self.texts['input_ids'])
-
-
-def build_inf_loaders(texts, mode):
-    dataset = ClassificationInferenceDataset(texts)
-    dataloader = torch.utils.data.DataLoader(dataset, batch_size=args.saga_batch_size, num_workers=args.num_workers,
-                                             shuffle=True if mode == "train" else False)
-    return dataloader
-
+def metric_eval(metrics, prefix="train"):
+    cm = metrics.pop('confusion_matrix')
+    metrics['TN'] = cm[0][0]
+    metrics['FP'] = cm[0][1]
+    metrics['FN'] = cm[1][0]
+    metrics['TP'] = cm[1][1]
+    metrics = {f"{prefix}_{k}": v for k, v in metrics.items()}
+    return metrics
+      
 
 if __name__ == "__main__":
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
     args = parser.parse_args()
     wandb.init(project="CB-LLMs", 
                name=f"train_CBL_{args.dataset}_{args.backbone}_{args.labeling}_tunecblonly_{args.tune_cbl_only}_acc_{args.automatic_concept_correction}",
-                config=vars(args))
+                config=vars(args),
+                )
     
     print("loading data...")
     train_dataset = load_dataset(args.dataset, split='train')
+    test_dataset = load_dataset(args.dataset, split='test')
     if args.dataset == 'SetFit/sst2':
         val_dataset = load_dataset(args.dataset, split='validation')
     print("training data len: ", len(train_dataset))
@@ -143,7 +137,14 @@ if __name__ == "__main__":
             encoded_val_dataset = encoded_val_dataset.remove_columns(['title'])
         encoded_val_dataset = encoded_val_dataset[:len(encoded_val_dataset)]
 
-
+    encoded_test_dataset = test_dataset.map(lambda e: tokenizer(e[CFG.example_name[args.dataset]], padding=True, truncation=True, max_length=args.max_length), batched=True, batch_size=len(test_dataset))
+    encoded_test_dataset = encoded_test_dataset.remove_columns([CFG.example_name[args.dataset]])
+    if args.dataset == 'SetFit/sst2':
+        encoded_test_dataset = encoded_test_dataset.remove_columns(['label_text'])
+    if args.dataset == 'dbpedia_14':
+        encoded_test_dataset = encoded_test_dataset.remove_columns(['title'])
+    encoded_test_dataset = encoded_test_dataset[:len(encoded_test_dataset)]
+    
     concept_set = CFG.concept_set[args.dataset]
     print("concept len: ", len(concept_set))
 
@@ -192,6 +193,7 @@ if __name__ == "__main__":
     train_loader = build_loaders(encoded_train_dataset, train_similarity, mode="train")
     if args.dataset == 'SetFit/sst2':
         val_loader = build_loaders(encoded_val_dataset, val_similarity, mode="valid")
+    test_loader = build_loaders(encoded_test_dataset, mode="test")
 
     if args.backbone == 'roberta':
         if args.tune_cbl_only:
@@ -202,7 +204,8 @@ if __name__ == "__main__":
             optimizer = torch.optim.Adam(cbl.parameters(), lr=1e-4)
         else:
             print("preparing backbone(roberta)+CBL...")
-            backbone_cbl = RobertaCBL(len(concept_set), args.dropout).to(device)
+            # backbone_cbl = RobertaCBL(len(concept_set), args.dropout).to(device)
+            backbone_cbl = RobertaCBLResidual(len(concept_set), args.dropout, CFG.class_num[args.datset]).to(device)
             optimizer = torch.optim.Adam(backbone_cbl.parameters(), lr=5e-6)
     elif args.backbone == 'gpt2':
         if args.tune_cbl_only:
@@ -240,7 +243,11 @@ if __name__ == "__main__":
         epochs = 10
     else:
         epochs = CFG.cbl_epochs[args.dataset]
+        
+    CE_criterion = torch.nn.CrossEntropyLoss()
+    
     for e in range(epochs):
+        metrics = init_metrics()
         print("Epoch ", e+1, ":")
         if args.tune_cbl_only:
             cbl.train()
@@ -263,15 +270,35 @@ if __name__ == "__main__":
                         raise Exception("backbone should be roberta or gpt2")
                 cbl_features = cbl(LM_features)
             else:
-                cbl_features = backbone_cbl(batch_text)
+                cbl_features, pred = backbone_cbl(batch_text)
+            
+            print(cbl_features.shape, batch_sim.shape, pred.shape)
+            print(batch_text.keys())
+            print(batch_text)
             loss = -cos_sim_cubed(cbl_features, batch_sim)
+            clf_loss = CE_criterion(pred, batch_text["label"])
+            metrics.add_batch(predictions=torch.argmax(pred, dim=-1).cpu(), references=batch_text["label"].cpu())
+            total_loss = loss + clf_loss
+
             optimizer.zero_grad()
-            loss.backward()
+            total_loss.backward()
             optimizer.step()
-            print("batch ", str(i), " loss: ", loss.detach().cpu().numpy(), end="\r")
-            wandb.log({"batch_training_loss": loss.detach().cpu().numpy(), "epoch": e+1, "batch": i})
-            training_loss.append(loss.detach().cpu().numpy())
+            
+            wandb.log({"clf_loss": clf_loss.detach().cpu().numpy(),
+                       "concept_similarity_loss": loss.detach().cpu().numpy(),
+                       "batch_training_loss": total_loss.detach().cpu().numpy(),
+                       "epoch": e+1, "batch": i})
+            
+            print(f"batch {i} total loss: ", total_loss.detach().cpu().numpy(),
+                  f" clf loss: {clf_loss.detach().cpu().numpy()}",
+                  f" concept similarity loss: {loss.detach().cpu().numpy()}", end="\r")
+            
+            training_loss.append(total_loss.detach().cpu().numpy())
         avg_training_loss = sum(training_loss)/len(training_loss)
+        metrics_result = metric_eval(metrics.compute(), prefix="train")
+        
+        wandb.log(metrics_result)
+        print("metrics: ", metrics_result)
         print("training loss: ", avg_training_loss)
 
         if args.dataset == 'SetFit/sst2':
@@ -280,6 +307,7 @@ if __name__ == "__main__":
             else:
                 backbone_cbl.eval()
             val_loss = []
+            val_metrics = init_metrics()
             for batch in val_loader:
                 batch_text, batch_sim = batch[0], batch[1]
                 batch_text = {k: v.to(device) for k, v in batch_text.items()}
@@ -297,10 +325,16 @@ if __name__ == "__main__":
                     else:
                         cbl_features = backbone_cbl(batch_text)
                     loss = -cos_sim_cubed(cbl_features, batch_sim)
-                    val_loss.append(loss.detach().cpu().numpy())
+                    clf_loss = CE_criterion(pred, batch_text["label"])
+                    total_loss = loss + clf_loss
+                    val_loss.append(total_loss.detach().cpu().numpy())
+                    val_metrics.add_batch(predictions=torch.argmax(pred, dim=-1).cpu(), references=batch_text["label"].cpu())
+                    
             avg_val_loss = sum(val_loss)/len(val_loss)
             print("val loss: ", avg_val_loss)
-            wandb.log({"val_loss": avg_val_loss, "epoch": e+1})
+            val_metrics_result = metric_eval(val_metrics.compute(), prefix="val")
+            log = {"val_loss": avg_val_loss, "epoch": e+1, **val_metrics_result}
+            wandb.log(log)
             if avg_val_loss < best_loss:
                 print("save model")
                 best_loss = avg_val_loss
@@ -317,4 +351,27 @@ if __name__ == "__main__":
 
     end = time.time()
     print("time of training CBL:", (end - start) / 3600, "hours")
+    metric = init_metrics()
+    for i, batch in enumerate(test_loader):
+        batch_text, batch_sim = batch[0], batch[1]
+        batch_text = {k: v.to(device) for k, v in batch_text.items()}
+        batch_sim = batch_sim.to(device)
+        with torch.no_grad():
+            if args.tune_cbl_only:
+                LM_features = preLM(input_ids=batch_text["input_ids"], attention_mask=batch_text["attention_mask"]).last_hidden_state
+                if args.backbone == 'roberta':
+                    LM_features = LM_features[:, 0, :]
+                elif args.backbone == 'gpt2':
+                    LM_features = eos_pooling(LM_features, batch_text["attention_mask"])
+                else:
+                    raise Exception("backbone should be roberta or gpt2")
+                cbl_features = cbl(LM_features)
+            else:
+                cbl_features, pred = backbone_cbl(batch_text)
+        metric.add_batch(predictions=torch.argmax(pred, dim=-1).cpu(), references=batch_text["label"].cpu())
+    
+    m = metric_eval(metric.compute(), prefix="test")
+    print("Test results: ", m['accuracy'])
+    wandb.log(m)
+    
     wandb.finish()
