@@ -208,7 +208,7 @@ if __name__ == "__main__":
         else:
             print("preparing backbone(roberta)+CBL...")
             # backbone_cbl = RobertaCBL(len(concept_set), args.dropout).to(device)
-            backbone_cbl = RobertaCBLResidual(len(concept_set), args.dropout, CFG.class_num[args.datset]).to(device)
+            backbone_cbl = RobertaCBLResidual(len(concept_set), args.dropout, CFG.class_num[args.dataset]).to(device)
             optimizer = torch.optim.Adam(backbone_cbl.parameters(), lr=5e-6)
     elif args.backbone == 'gpt2':
         if args.tune_cbl_only:
