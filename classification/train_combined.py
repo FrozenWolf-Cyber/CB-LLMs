@@ -74,6 +74,23 @@ def metric_eval(metrics, prefix="train"):
     metrics['TP'] = cm[1][1]
     metrics = {f"{prefix}_{k}": v for k, v in metrics.items()}
     return metrics
+
+@torch.no_grad()
+def concept_activation_error_rate(feature, label):
+    feature = F.relu(feature)
+    error_rate = []
+    for i in range(feature.T.size(0)):
+        error = 0
+        total = 0
+        value, s = feature.T[i].topk(5)
+        for j in range(5):
+            if value[j] > 1.0:
+                total += 1
+                if get_labels(i, args.dataset) != label[s[j]]:
+                    error += 1
+        if total != 0:
+            error_rate.append(error/total)
+    return sum(error_rate) / len(error_rate)
       
 
 if __name__ == "__main__":
@@ -83,7 +100,7 @@ if __name__ == "__main__":
                name=f"train_CBL_{args.dataset}_{args.backbone}_{args.labeling}_tunecblonly_{args.tune_cbl_only}_acc_{args.automatic_concept_correction}",
                 config=vars(args),
                 )
-    
+    run_name = wandb.run.name
     print("loading data...")
     train_dataset = load_dataset(args.dataset, split='train')
     test_dataset = load_dataset(args.dataset, split='test')
@@ -265,7 +282,12 @@ if __name__ == "__main__":
             cbl.train()
         else:
             backbone_cbl.train()
-        training_loss = []
+        training_loss = {"training_loss_total": 0, 
+                         "training_loss_clf": 0, 
+                         "training_loss_concept_similarity": 0,
+                         "training_loss_orthogonal": 0}
+        cbl_feature = []
+        cbl_labels = []
         for i, batch in enumerate(train_loader):
             batch_text, batch_sim = batch[0], batch[1]
             batch_text = {k: v.to(device) for k, v in batch_text.items()}
@@ -295,6 +317,11 @@ if __name__ == "__main__":
                 
             metrics.add_batch(predictions=torch.argmax(pred, dim=-1).cpu(), references=batch_text["label"].cpu())
             total_loss = loss + clf_loss + args.orthogonal_loss_weight*orthogonal_loss
+            
+
+            
+            cbl_feature.append(cbl_features.detach().cpu())
+            cbl_labels.append(batch_text["label"].detach().cpu())
 
             optimizer.zero_grad()
             total_loss.backward()
@@ -310,21 +337,35 @@ if __name__ == "__main__":
                   f" clf loss: {clf_loss.detach().cpu().numpy()}",
                   f" concept similarity loss: {loss.detach().cpu().numpy()}", end="\r")
             
-            training_loss.append(total_loss.detach().cpu().numpy())
-        avg_training_loss = sum(training_loss)/len(training_loss)
+            training_loss["training_loss_total"] += total_loss.detach().cpu().numpy()
+            training_loss["training_loss_clf"] += clf_loss.detach().cpu().numpy()
+            training_loss["training_loss_concept_similarity"] += loss.detach().cpu().numpy()
+            training_loss["training_loss_orthogonal"] += orthogonal_loss.detach().cpu().numpy()
+            
         metrics_result = metric_eval(metrics.compute(), prefix="train")
+        for k in training_loss.keys():
+            training_loss[k] /= len(train_loader)
+            metrics_result[k] = training_loss[k]
+        
+        metrics_result["train_concept_activation_error_rate"] =  concept_activation_error_rate(torch.cat(cbl_feature, dim=0), torch.cat(cbl_labels, dim=0))
         
         wandb.log(metrics_result)
         print("metrics: ", metrics_result)
-        print("training loss: ", avg_training_loss)
+
 
         if args.dataset == 'SetFit/sst2':
             if args.tune_cbl_only:
                 cbl.eval()
             else:
                 backbone_cbl.eval()
-            val_loss = []
+            val_loss = {"val_loss_total_loss": 0,
+                        "val_loss_clf_loss": 0,
+                        "val_loss_concept_similarity_loss": 0,
+                        "val_loss_orthogonal_loss": 0}
+            
             val_metrics = init_metrics()
+            cbl_feature = []
+            cbl_labels = []
             for batch in val_loader:
                 batch_text, batch_sim = batch[0], batch[1]
                 batch_text = {k: v.to(device) for k, v in batch_text.items()}
@@ -351,31 +392,44 @@ if __name__ == "__main__":
                         orthogonal_loss = F.cosine_similarity(cbl_features, feature_residual, dim=-1).mean()
                     
                     total_loss = loss + clf_loss + orthogonal_loss
-                    val_loss.append(total_loss.detach().cpu().numpy())
-                    val_metrics.add_batch(predictions=torch.argmax(pred, dim=-1).cpu(), references=batch_text["label"].cpu())
+                    val_loss["val_total_loss"] += total_loss.detach().cpu().numpy()
+                    val_loss["val_clf_loss"] += clf_loss.detach().cpu().numpy()
+                    val_loss["val_concept_similarity_loss"] += loss.detach().cpu().numpy()
+                    val_loss["val_orthogonal_loss"] += orthogonal_loss.detach().cpu().numpy()
                     
-            avg_val_loss = sum(val_loss)/len(val_loss)
-            print("val loss: ", avg_val_loss)
+                    cbl_feature.append(cbl_features.detach().cpu())
+                    cbl_labels.append(batch_text["label"].detach().cpu())
+                    val_metrics.add_batch(predictions=torch.argmax(pred, dim=-1).cpu(), references=batch_text["label"].cpu())
+             
             val_metrics_result = metric_eval(val_metrics.compute(), prefix="val")
-            log = {"val_loss": avg_val_loss, "epoch": e+1, **val_metrics_result}
-            wandb.log(log)
+                   
+            for k in val_loss.keys():
+                val_loss[k] /= len(val_loader)
+                val_metrics_result[k] = val_loss[k]
+                 
+            val_concept_act_error_rate = concept_activation_error_rate(torch.cat(cbl_feature, dim=0), torch.cat(cbl_labels, dim=0))
+            wandb.log(val_metrics_result)
+            
+            avg_val_loss = val_loss["val_total_loss"]
+            
             if avg_val_loss < best_loss:
                 print("save model")
                 best_loss = avg_val_loss
                 if args.tune_cbl_only:
-                    torch.save(cbl.state_dict(), prefix + model_name + ".pt")
+                    torch.save(cbl.state_dict(), prefix + model_name + f"-{run_name}.pt")
                 else:
-                    torch.save(backbone_cbl.state_dict(), prefix + model_name + ".pt")
+                    torch.save(backbone_cbl.state_dict(), prefix + model_name + f"-{run_name}.pt")
         else:
             print("save model")
             if args.tune_cbl_only:
-                torch.save(cbl.state_dict(), prefix + model_name + ".pt")
+                torch.save(cbl.state_dict(), prefix + model_name + f"-{run_name}.pt")
             else:
-                torch.save(backbone_cbl.state_dict(), prefix + model_name + ".pt")
+                torch.save(backbone_cbl.state_dict(), prefix + model_name + f"-{run_name}.pt")
 
     end = time.time()
     print("time of training CBL:", (end - start) / 3600, "hours")
     metric = init_metrics()
+    FL_test_features = []
     for i, batch in enumerate(test_loader):
         batch_text, _ = batch[0], batch[1]
         batch_text = {k: v.to(device) for k, v in batch_text.items()}
@@ -395,9 +449,18 @@ if __name__ == "__main__":
                 else:
                     cbl_features, feature_residual, pred = backbone_cbl(batch_text)
                     
+        FL_test_features.append(cbl_features)
+                    
         metric.add_batch(predictions=torch.argmax(pred, dim=-1).cpu(), references=batch_text["label"].cpu())
     
+    test_c = torch.cat(FL_test_features, dim=0).detach().cpu()
+    label = encoded_test_dataset["label"]
+    
+    error_rate = concept_activation_error_rate(test_c, label)
+    
+    
     m = metric_eval(metric.compute(), prefix="test")
+    m["test_concept_activation_error_rate"] = error_rate
     print("Test results: ", m)
     wandb.log(m)
     
