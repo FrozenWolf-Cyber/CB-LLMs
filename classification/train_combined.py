@@ -473,6 +473,10 @@ if __name__ == "__main__":
             else:
                 torch.save(backbone_cbl.state_dict(), prefix + model_name + f"-{run_name}.pt")
 
+    ## load best model for test
+    print("loading best model for test...")
+    backbone_cbl.load_state_dict(torch.load(prefix + model_name + f"-{run_name}.pt", map_location=device))
+    
     end = time.time()
     print("time of training CBL:", (end - start) / 3600, "hours")
     metric = init_metrics()
