@@ -358,10 +358,10 @@ if __name__ == "__main__":
                 cbl.eval()
             else:
                 backbone_cbl.eval()
-            val_loss = {"val_loss_total_loss": 0,
-                        "val_loss_clf_loss": 0,
-                        "val_loss_concept_similarity_loss": 0,
-                        "val_loss_orthogonal_loss": 0}
+            val_loss = {"val_total_loss": 0,
+                        "val_clf_loss": 0,
+                        "val_concept_similarity_loss": 0,
+                        "val_orthogonal_loss": 0}
             
             val_metrics = init_metrics()
             cbl_feature = []
