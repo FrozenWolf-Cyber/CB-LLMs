@@ -71,4 +71,4 @@ class RobertaCBLResidual(nn.Module):
         x = F.relu(feature)
         x = self.clf(x)
         x = F.softmax(x, dim=-1)
-        return feature, x
+        return feature, feature_residual, x

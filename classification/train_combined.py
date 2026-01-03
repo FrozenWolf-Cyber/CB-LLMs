@@ -30,6 +30,7 @@ parser.add_argument("--max_length", type=int, default=512)
 parser.add_argument("--num_workers", type=int, default=0)
 parser.add_argument("--dropout", type=float, default=0.1)
 parser.add_argument("--residual_ratio", type=float, default=0)
+parser.add_argument("--orthogonal_loss_weight", type=float, default=0)
 
 class ClassificationDataset(torch.utils.data.Dataset):
     def __init__(self, encode_roberta, s):
@@ -281,12 +282,19 @@ if __name__ == "__main__":
                         raise Exception("backbone should be roberta or gpt2")
                 cbl_features = cbl(LM_features)
             else:
-                cbl_features, pred = backbone_cbl(batch_text)
+                if args.residual_ratio == 0:
+                    cbl_features, pred = backbone_cbl(batch_text)
+                else:
+                    cbl_features, feature_residual, pred = backbone_cbl(batch_text)
             
             loss = -cos_sim_cubed(cbl_features, batch_sim)
             clf_loss = CE_criterion(pred, batch_text["label"])
+            orthogonal_loss = 0
+            if args.orthogonal_loss_weight>0: ## cosin similarity between concept features and residual features
+                orthogonal_loss = F.cosine_similarity(cbl_features, feature_residual, dim=-1).mean()
+                
             metrics.add_batch(predictions=torch.argmax(pred, dim=-1).cpu(), references=batch_text["label"].cpu())
-            total_loss = loss + clf_loss
+            total_loss = loss + clf_loss + args.orthogonal_loss_weight*orthogonal_loss
 
             optimizer.zero_grad()
             total_loss.backward()
@@ -295,6 +303,7 @@ if __name__ == "__main__":
             wandb.log({"clf_loss": clf_loss.detach().cpu().numpy(),
                        "concept_similarity_loss": loss.detach().cpu().numpy(),
                        "batch_training_loss": total_loss.detach().cpu().numpy(),
+                       "orthogonal_loss": orthogonal_loss.detach().cpu().numpy() if args.orthogonal_loss_weight>0 else 0,
                        "epoch": e+1, "batch": i})
             
             print(f"batch {i}/{len(train_loader)} total loss: ", total_loss.detach().cpu().numpy(),
@@ -331,10 +340,17 @@ if __name__ == "__main__":
                             raise Exception("backbone should be roberta or gpt2")
                         cbl_features = cbl(LM_features)
                     else:
-                        cbl_features, pred = backbone_cbl(batch_text)
+                        if args.residual_ratio == 0:
+                            cbl_features, pred = backbone_cbl(batch_text)
+                        else:
+                            cbl_features, feature_residual, pred = backbone_cbl(batch_text)
                     loss = -cos_sim_cubed(cbl_features, batch_sim)
                     clf_loss = CE_criterion(pred, batch_text["label"])
-                    total_loss = loss + clf_loss
+                    orthogonal_loss = 0
+                    if args.orthogonal_loss_weight>0: ## cosin similarity between concept features and residual features
+                        orthogonal_loss = F.cosine_similarity(cbl_features, feature_residual, dim=-1).mean()
+                    
+                    total_loss = loss + clf_loss + orthogonal_loss
                     val_loss.append(total_loss.detach().cpu().numpy())
                     val_metrics.add_batch(predictions=torch.argmax(pred, dim=-1).cpu(), references=batch_text["label"].cpu())
                     
@@ -374,7 +390,11 @@ if __name__ == "__main__":
                     raise Exception("backbone should be roberta or gpt2")
                 cbl_features = cbl(LM_features)
             else:
-                cbl_features, pred = backbone_cbl(batch_text)
+                if args.residual_ratio == 0:
+                    cbl_features, pred = backbone_cbl(batch_text)
+                else:
+                    cbl_features, feature_residual, pred = backbone_cbl(batch_text)
+                    
         metric.add_batch(predictions=torch.argmax(pred, dim=-1).cpu(), references=batch_text["label"].cpu())
     
     m = metric_eval(metric.compute(), prefix="test")
