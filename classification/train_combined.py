@@ -100,7 +100,8 @@ if __name__ == "__main__":
                name=f"train_CBL_{args.dataset}_{args.backbone}_{args.labeling}_tunecblonly_{args.tune_cbl_only}_acc_{args.automatic_concept_correction}",
                 config=vars(args),
                 )
-    run_name = wandb.run.name
+    run_name = wandb.run.id
+    print("Run name: ", run_name)
     print("loading data...")
     train_dataset = load_dataset(args.dataset, split='train')
     test_dataset = load_dataset(args.dataset, split='test')
