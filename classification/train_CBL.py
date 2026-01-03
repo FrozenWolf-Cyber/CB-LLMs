@@ -10,6 +10,8 @@ import config as CFG
 from modules import CBL, RobertaCBL, GPT2CBL
 from utils import cos_sim_cubed, get_labels, eos_pooling
 import time
+import wandb
+from omegaconf import OmegaConf
 
 parser = argparse.ArgumentParser()
 
@@ -56,7 +58,10 @@ def build_loaders(encode_roberta, s, mode):
 if __name__ == "__main__":
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
     args = parser.parse_args()
-
+    wandb.init(project="CB-LLMs", 
+               name=f"train_CBL_{args.dataset}_{args.backbone}_{args.labeling}_tunecblonly_{args.tune_cbl_only}_acc_{args.automatic_concept_correction}",
+                config=OmegaConf.create(vars(args)))
+    
     print("loading data...")
     train_dataset = load_dataset(args.dataset, split='train')
     if args.dataset == 'SetFit/sst2':
@@ -238,6 +243,7 @@ if __name__ == "__main__":
             loss.backward()
             optimizer.step()
             print("batch ", str(i), " loss: ", loss.detach().cpu().numpy(), end="\r")
+            wandb.log({"batch_training_loss": loss.detach().cpu().numpy(), "epoch": e+1, "batch": i})
             training_loss.append(loss.detach().cpu().numpy())
         avg_training_loss = sum(training_loss)/len(training_loss)
         print("training loss: ", avg_training_loss)
@@ -268,6 +274,7 @@ if __name__ == "__main__":
                     val_loss.append(loss.detach().cpu().numpy())
             avg_val_loss = sum(val_loss)/len(val_loss)
             print("val loss: ", avg_val_loss)
+            wandb.log({"val_loss": avg_val_loss, "epoch": e+1})
             if avg_val_loss < best_loss:
                 print("save model")
                 best_loss = avg_val_loss
@@ -284,3 +291,4 @@ if __name__ == "__main__":
 
     end = time.time()
     print("time of training CBL:", (end - start) / 3600, "hours")
+    wandb.finish()

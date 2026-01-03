@@ -10,6 +10,8 @@ from modules import CBL, RobertaCBL, GPT2CBL
 from glm_saga.elasticnet import IndexedTensorDataset, glm_saga
 from torch.utils.data import DataLoader, TensorDataset
 from utils import normalize, eos_pooling
+import wandb
+from omegaconf import OmegaConf
 
 parser = argparse.ArgumentParser()
 
@@ -45,7 +47,9 @@ def build_loaders(texts, mode):
 if __name__ == "__main__":
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
     args = parser.parse_args()
-
+    wandb.init(project="CB-LLMs", config=OmegaConf.to_container(OmegaConf.from_argparse_args(args)),
+               name=f"glmsaga_CBL_{args.cbl_path}")
+    
     acs = args.cbl_path.split("/")[0]
     dataset = args.cbl_path.split("/")[1] if 'sst2' not in args.cbl_path.split("/")[1] else args.cbl_path.split("/")[1].replace('_', '/')
     backbone = args.cbl_path.split("/")[2]
@@ -244,6 +248,7 @@ if __name__ == "__main__":
                                test_loader=test_loader, do_zero=True,
                                n_classes=CFG.class_num[dataset])
 
+    wandb.log({"final_train_loss": output_proj['path'][-1]['metrics']['train_loss']})
     print("save weights with test acc:", output_proj['path'][-1]['metrics']['acc_test'])
     W_g = output_proj['path'][-1]['weight']
     b_g = output_proj['path'][-1]['bias']
@@ -256,6 +261,8 @@ if __name__ == "__main__":
         output_proj = glm_saga(linear, indexed_train_loader, STEP_SIZE, args.saga_epoch, ALPHA, epsilon=1, k=1,
                                test_loader=test_loader, do_zero=False,
                                n_classes=CFG.class_num[dataset], metadata=metadata, n_ex=train_c.shape[0])
+    
+    wandb.log({"sparse_final_train_loss": output_proj['path'][0]['metrics']['train_loss']})
     print("save the sparse weights with test acc:", output_proj['path'][0]['metrics']['acc_test'])
     W_g_sparse = output_proj['path'][0]['weight']
     b_g_sparse = output_proj['path'][0]['bias']
@@ -265,3 +272,4 @@ if __name__ == "__main__":
     torch.save(W_g_sparse, prefix + 'W_g_sparse' + model_name)
     torch.save(b_g_sparse, prefix + 'b_g_sparse' + model_name)
 
+    wandb.finish()
