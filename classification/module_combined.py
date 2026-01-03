@@ -66,9 +66,9 @@ class RobertaCBLResidual(nn.Module):
         x_residual = self.dropout(x_residual)
         feature_residual = x_residual + projected_residual
         
-        feature = torch.concat((feature, feature_residual), dim=-1)
+        feature_combined = torch.concat((feature, feature_residual), dim=-1)
         ### clf
-        x = F.relu(feature)
+        x = F.relu(feature_combined)
         x = self.clf(x)
         x = F.softmax(x, dim=-1)
         return feature, feature_residual, x
