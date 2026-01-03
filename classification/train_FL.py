@@ -47,7 +47,7 @@ def build_loaders(texts, mode):
 if __name__ == "__main__":
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
     args = parser.parse_args()
-    wandb.init(project="CB-LLMs", config=vars(args)),
+    wandb.init(project="CB-LLMs", config=vars(args),
                name=f"glmsaga_CBL_{args.cbl_path}")
     
     acs = args.cbl_path.split("/")[0]
