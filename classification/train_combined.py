@@ -194,7 +194,7 @@ if __name__ == "__main__":
     if args.dataset == 'SetFit/sst2':
         val_loader = build_loaders(encoded_val_dataset, val_similarity, mode="valid")
      ## dummy placeholder float numbers for test
-    test_similarity = np.zeros((len(encoded_test_dataset), len(concept_set)))
+    test_similarity = np.zeros((len(encoded_test_dataset["labels"]),))
     
     test_loader = build_loaders(encoded_test_dataset, test_similarity, mode="test")
 
