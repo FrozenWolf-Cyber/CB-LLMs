@@ -74,9 +74,9 @@ class ClassificationInferenceDataset(torch.utils.data.Dataset):
         return len(self.texts['input_ids'])
 
 
-def build_loaders(texts, mode):
+def build_inf_loaders(texts, mode):
     dataset = ClassificationInferenceDataset(texts)
-    dataloader = torch.utils.data.DataLoader(dataset, batch_size=args.batch_size, num_workers=args.num_workers,
+    dataloader = torch.utils.data.DataLoader(dataset, batch_size=args.saga_batch_size, num_workers=args.num_workers,
                                              shuffle=True if mode == "train" else False)
     return dataloader
 

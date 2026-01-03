@@ -248,7 +248,7 @@ if __name__ == "__main__":
                                test_loader=test_loader, do_zero=True,
                                n_classes=CFG.class_num[dataset])
 
-    wandb.log({"final_train_loss": output_proj['path'][-1]['metrics']['train_loss']})
+    wandb.log({"final_metrics": output_proj['path'][-1]['metrics']})
     print("save weights with test acc:", output_proj['path'][-1]['metrics']['acc_test'])
     W_g = output_proj['path'][-1]['weight']
     b_g = output_proj['path'][-1]['bias']
@@ -262,7 +262,7 @@ if __name__ == "__main__":
                                test_loader=test_loader, do_zero=False,
                                n_classes=CFG.class_num[dataset], metadata=metadata, n_ex=train_c.shape[0])
     
-    wandb.log({"sparse_final_train_loss": output_proj['path'][0]['metrics']['train_loss']})
+    wandb.log({"sparse_final_metrics": output_proj['path'][0]['metrics']})
     print("save the sparse weights with test acc:", output_proj['path'][0]['metrics']['acc_test'])
     W_g_sparse = output_proj['path'][0]['weight']
     b_g_sparse = output_proj['path'][0]['bias']
