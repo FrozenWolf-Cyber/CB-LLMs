@@ -90,6 +90,10 @@ def concept_activation_error_rate(feature, label):
                     error += 1
         if total != 0:
             error_rate.append(error/total)
+            
+    if len(error_rate) == 0:
+        return torch.nan
+    
     return sum(error_rate) / len(error_rate)
 
 @torch.no_grad()
@@ -110,6 +114,9 @@ def concept_contrib_error_rate(cbl_feature, weight, pred, label):
         if total != 0:
             error_rate.append(error/total)
             
+    if len(error_rate) == 0:
+        return torch.nan
+    
     return sum(error_rate)/len(error_rate)
       
 
