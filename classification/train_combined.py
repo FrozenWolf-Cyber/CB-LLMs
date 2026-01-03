@@ -94,7 +94,7 @@ def concept_activation_error_rate(feature, label):
 
 @torch.no_grad()
 def concept_contrib_error_rate(cbl_feature, weight, pred, label):
-    m = F.relu(torch.cat(cbl_feature, dim=0)) # shape: (num_samples, concept_dim)
+    m = F.relu(cbl_feature, dim=0) # shape: (num_samples, concept_dim)
     m = m.unsqueeze(1) * weight.unsqueeze(0) # shape: (num_samples, num_classes, concept_dim)
     correct_indices = np.where(pred == label)[0]
     error_rate = []
