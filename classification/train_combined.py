@@ -214,7 +214,7 @@ if __name__ == "__main__":
             if args.residual_ratio==0:
                 backbone_cbl = RobertaCBL(len(concept_set), args.dropout, CFG.class_num[args.dataset]).to(device)
             else:
-                residual_size = max(int(args.residual_ratio*CFG.class_num[args.dataset]), 1)
+                residual_size = max(int(args.residual_ratio*len(concept_set)), 1)
                 print("Residual Size", residual_size)
                 backbone_cbl = RobertaCBLResidual(len(concept_set), residual_size, args.dropout, CFG.class_num[args.dataset]).to(device)
             
