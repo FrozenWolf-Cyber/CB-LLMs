@@ -378,7 +378,7 @@ if __name__ == "__main__":
         metric.add_batch(predictions=torch.argmax(pred, dim=-1).cpu(), references=batch_text["label"].cpu())
     
     m = metric_eval(metric.compute(), prefix="test")
-    print("Test results: ", m['accuracy'])
+    print("Test results: ", m)
     wandb.log(m)
     
     wandb.finish()
