@@ -7,7 +7,8 @@ import numpy as np
 from transformers import RobertaTokenizerFast, RobertaModel, GPT2TokenizerFast, GPT2Model
 from datasets import load_dataset, concatenate_datasets
 import config as CFG
-from modules import CBL, RobertaCBL, GPT2CBL, RobertaCBLResidual
+# from modules import CBL, RobertaCBL, GPT2CBL, RobertaCBLResidual
+from module_combined import RobertaCBL, RobertaCBLResidual
 from utils import cos_sim_cubed, get_labels, eos_pooling
 import time
 import evaluate
@@ -28,6 +29,7 @@ parser.add_argument("--batch_size", type=int, default=16)
 parser.add_argument("--max_length", type=int, default=512)
 parser.add_argument("--num_workers", type=int, default=0)
 parser.add_argument("--dropout", type=float, default=0.1)
+parser.add_argument("--residual_ratio", type=float, default=0)
 
 class ClassificationDataset(torch.utils.data.Dataset):
     def __init__(self, encode_roberta, s):
@@ -194,7 +196,7 @@ if __name__ == "__main__":
     if args.dataset == 'SetFit/sst2':
         val_loader = build_loaders(encoded_val_dataset, val_similarity, mode="valid")
      ## dummy placeholder float numbers for test
-    test_similarity = np.zeros((len(encoded_test_dataset["labels"]),))
+    test_similarity = np.zeros((len(encoded_test_dataset["label"]),))
     
     test_loader = build_loaders(encoded_test_dataset, test_similarity, mode="test")
 
@@ -208,7 +210,13 @@ if __name__ == "__main__":
         else:
             print("preparing backbone(roberta)+CBL...")
             # backbone_cbl = RobertaCBL(len(concept_set), args.dropout).to(device)
-            backbone_cbl = RobertaCBLResidual(len(concept_set), args.dropout, CFG.class_num[args.dataset]).to(device)
+            if args.residual_ratio==0:
+                backbone_cbl = RobertaCBL(len(concept_set), args.dropout, CFG.class_num[args.dataset]).to(device)
+            else:
+                residual_size = max(int(args.residual_ratio*CFG.class_num[args.dataset]), 1)
+                print("Residual Size", residual_size)
+                backbone_cbl = RobertaCBLResidual(len(concept_set), residual_size, args.dropout, CFG.class_num[args.dataset]).to(device)
+            
             optimizer = torch.optim.Adam(backbone_cbl.parameters(), lr=5e-6)
     elif args.backbone == 'gpt2':
         if args.tune_cbl_only:
