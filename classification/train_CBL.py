@@ -59,7 +59,7 @@ if __name__ == "__main__":
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
     args = parser.parse_args()
     wandb.init(project="CB-LLMs", 
-               name=f"train_CBL_{args.dataset}_{args.backbone}_{args.labeling}_tunecblonly_{args.tune_cbl_only}_acc_{args.automatic_concept_correction}",
+               notes=f"train_CBL_{args.dataset}_{args.backbone}_{args.labeling}_tunecblonly_{args.tune_cbl_only}_acc_{args.automatic_concept_correction}",
                 config=vars(args))
     
     print("loading data...")
