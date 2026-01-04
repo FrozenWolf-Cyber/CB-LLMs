@@ -48,7 +48,7 @@ class RobertaCBLResidual(nn.Module):
         self.fc_residual = nn.Linear(residual_dim, residual_dim)
         
         
-        self.clf = nn.Linear(concept_dim+concept_dim, class_num)
+        self.clf = nn.Linear(concept_dim+residual_dim, class_num)
         self.dropout = nn.Dropout(dropout)
         
 
