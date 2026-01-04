@@ -482,6 +482,7 @@ if __name__ == "__main__":
     metric = init_metrics()
     FL_test_features = []
     predictions = []
+    cbl_labels = []
     for i, batch in enumerate(test_loader):
         batch_text, _ = batch[0], batch[1]
         batch_text = {k: v.to(device) for k, v in batch_text.items()}
@@ -507,17 +508,18 @@ if __name__ == "__main__":
         pred = torch.argmax(pred, dim=-1).detach().cpu()
         predictions.append(pred)
         FL_test_features.append(cbl_features)
+        cbl_labels.append(batch_text["label"].detach().cpu())
                     
         metric.add_batch(predictions=pred, references=batch_text["label"].cpu())
     
     
     m = metric_eval(metric.compute(), prefix="test")
     m["test_concept_activation_error_rate"] = concept_activation_error_rate(torch.cat(FL_test_features, dim=0).detach().cpu(),
-                                                                            encoded_test_dataset["label"])
+                                                                            torch.cat(cbl_labels, dim=0))
     m["test_concept_contrib_error_rate"] = concept_contrib_error_rate(torch.cat(FL_test_features, dim=0).detach().cpu(),
                                                                     backbone_cbl.clf.weight.detach().cpu(), 
                                                                     torch.cat(predictions, dim=0),
-                                                                    encoded_test_dataset["label"])
+                                                                    torch.cat(cbl_labels, dim=0))
     print("Test results: ", m)
     wandb.log(m)
     
