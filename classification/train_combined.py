@@ -124,7 +124,7 @@ if __name__ == "__main__":
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
     args = parser.parse_args()
     wandb.init(project="CB-LLMs", 
-               name=f"train_CBL_{args.dataset}_{args.backbone}_{args.labeling}_tunecblonly_{args.tune_cbl_only}_acc_{args.automatic_concept_correction}",
+               notes=f"train_CBL_{args.dataset}_{args.automatic_concept_correction}",
                 config=vars(args),
                 )
     run_name = wandb.run.id
@@ -430,7 +430,7 @@ if __name__ == "__main__":
                     if args.orthogonal_loss_weight>0: ## cosin similarity between concept features and residual features
                         orthogonal_loss = F.cosine_similarity(cbl_features, feature_residual, dim=-1).mean()
                     
-                    total_loss = loss + clf_loss + orthogonal_loss
+                    total_loss = loss + clf_loss + orthogonal_loss*args.orthogonal_loss_weight
                     val_loss["val_total_loss"] += total_loss.detach().cpu().numpy()
                     val_loss["val_clf_loss"] += clf_loss.detach().cpu().numpy()
                     val_loss["val_concept_similarity_loss"] += loss.detach().cpu().numpy()

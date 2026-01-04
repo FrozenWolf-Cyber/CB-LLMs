@@ -60,9 +60,9 @@ class RobertaCBLResidual(nn.Module):
         x = self.dropout(x)
         feature = x + projected
         
-        projected_residual = self.projection(text_features)
-        x_residual = self.gelu(projected_residual)
-        x_residual = self.fc(x_residual)
+        projected_residual = self.projection_residual(text_features)
+        x_residual = self.gelu_residual(projected_residual)
+        x_residual = self.fc_residual(x_residual)
         x_residual = self.dropout(x_residual)
         feature_residual = x_residual + projected_residual
         
