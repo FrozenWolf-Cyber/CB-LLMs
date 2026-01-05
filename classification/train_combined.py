@@ -419,10 +419,10 @@ if __name__ == "__main__":
                 cbl.eval()
             else:
                 backbone_cbl.eval()
-            val_loss = {"val_total_loss": 0,
-                        "val_clf_loss": 0,
-                        "val_concept_similarity_loss": 0,
-                        "val_orthogonal_loss": 0}
+            val_loss = {    "val_loss_total": 0,
+                            "val_loss_clf": 0,
+                            "val_loss_concept_similarity": 0,
+                            "val_loss_orthogonal": 0,}
             
             val_metrics = init_metrics()
             cbl_feature = []
@@ -452,7 +452,7 @@ if __name__ == "__main__":
                                                     residual_feature=feature_residual if args.residual_ratio!=0 else None,
                                                     prefix="val")
                     for k in val_loss.keys():
-                        val_loss[k] += loss_dict[f"val_loss_{k.split('_')[-1]}"]
+                        val_loss[k] += loss_dict[k]
                         
                     if args.residual_ratio != 0:
                         cbl_features = torch.cat([cbl_features, feature_residual], dim=-1)
