@@ -36,6 +36,8 @@ class RobertaCBLResidual(nn.Module):
     def __init__(self, concept_dim, residual_dim, dropout, class_num):
         super().__init__()
         self.preLM = RobertaModel.from_pretrained('roberta-base')
+        self.concept_dim = concept_dim
+        self.residual_dim = residual_dim
         for p in self.preLM.parameters():
             p.requires_grad = True
             
@@ -72,3 +74,9 @@ class RobertaCBLResidual(nn.Module):
         x = self.clf(x)
         x = F.softmax(x, dim=-1)
         return feature, feature_residual, x
+
+    def compute_residual_contrib(self, feature_residual):
+        w = self.clf.weight  # shape: (class_num, concept_dim + residual_dim)
+        w_non_concept = w[:, self.concept_dim:]  # shape: (class_num, residual_dim)
+        contrib = F.linear(feature_residual, w_non_concept)  # shape: (batch_size, class_num)
+        return contrib

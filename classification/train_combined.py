@@ -31,6 +31,7 @@ parser.add_argument("--num_workers", type=int, default=0)
 parser.add_argument("--dropout", type=float, default=0.1)
 parser.add_argument("--residual_ratio", type=float, default=0)
 parser.add_argument("--orthogonal_loss_weight", type=float, default=0)
+parser.add_argument("--residual_penalty_weight", type=float, default=0)
 
 class ClassificationDataset(torch.utils.data.Dataset):
     def __init__(self, encode_roberta, s):
@@ -74,6 +75,36 @@ def metric_eval(metrics, prefix="train"):
     metrics['TP'] = cm[1][1]
     metrics = {f"{prefix}_{k}": v for k, v in metrics.items()}
     return metrics
+
+
+def compute_loss(cbl_feature, batch_sim, pred, label, backbone_cbl, args, residual_feature=None, prefix="training"):
+    wandb_loss = {}
+    loss = 0
+    
+    sim_loss = -cos_sim_cubed(cbl_feature, batch_sim)
+    loss += sim_loss
+    wandb_loss["concept_similarity"] = sim_loss.detach().cpu().numpy()
+    
+    if args.orthogonal_loss_weight>0 and residual_feature is not None:
+        orthogonal_loss = F.cosine_similarity(cbl_feature, residual_feature, dim=-1).mean()
+        loss += args.orthogonal_loss_weight*orthogonal_loss
+        wandb_loss["orthogonal"] = orthogonal_loss.detach().cpu().numpy()
+        
+    if args.residual_penalty_weight>0 and residual_feature is not None:
+        residual_contrib = backbone_cbl.compute_residual_contrib(residual_feature)
+        residual_penalty = residual_contrib.abs().mean()
+        loss += args.residual_penalty_weight*residual_penalty
+        wandb_loss["residual"] = residual_penalty.detach().cpu().numpy()
+
+    clf_loss = F.cross_entropy(pred, label)
+    wandb_loss["clf"] = clf_loss.detach().cpu().numpy()
+    
+    loss += clf_loss
+    wandb_loss["total"] = loss.detach().cpu().numpy()
+    
+    wandb_loss = {f"{prefix}_loss_{k}": v for k, v in wandb_loss.items()}
+    
+    return loss, wandb_loss
 
 @torch.no_grad()
 def concept_activation_error_rate(feature, label):
@@ -339,17 +370,14 @@ if __name__ == "__main__":
                 else:
                     cbl_features, feature_residual, pred = backbone_cbl(batch_text)
             
-            loss = -cos_sim_cubed(cbl_features, batch_sim)
-            clf_loss = CE_criterion(pred, batch_text["label"])
-            orthogonal_loss = 0
-            if args.orthogonal_loss_weight>0: ## cosin similarity between concept features and residual features
-                orthogonal_loss = F.cosine_similarity(cbl_features, feature_residual, dim=-1).mean()
-                
+            loss, loss_dict = compute_loss(cbl_features, batch_sim, pred, batch_text["label"], backbone_cbl, args,
+                                             residual_feature=feature_residual if args.residual_ratio!=0 else None,
+                                             prefix="training")
+            
             pred = torch.argmax(pred, dim=-1).detach().cpu()
             predictions.append(pred)
             metrics.add_batch(predictions=pred, references=batch_text["label"].cpu())
-            total_loss = loss + clf_loss + args.orthogonal_loss_weight*orthogonal_loss
-            
+
 
             if args.residual_ratio != 0:
                 cbl_features = torch.cat([cbl_features, feature_residual], dim=-1)
@@ -357,28 +385,21 @@ if __name__ == "__main__":
             cbl_labels.append(batch_text["label"].detach().cpu())
 
             optimizer.zero_grad()
-            total_loss.backward()
+            loss.backward()
             optimizer.step()
             
-            wandb.log({"clf_loss": clf_loss.detach().cpu().numpy(),
-                       "concept_similarity_loss": loss.detach().cpu().numpy(),
-                       "batch_training_loss": total_loss.detach().cpu().numpy(),
-                       "orthogonal_loss": orthogonal_loss.detach().cpu().numpy() if args.orthogonal_loss_weight>0 else 0,
-                       "epoch": e+1, "batch": i})
+            wandb.log({**loss_dict,"epoch": e+1, "batch": i})
             
-            print(f"batch {i}/{len(train_loader)} total loss: ", total_loss.detach().cpu().numpy(),
-                  f" clf loss: {clf_loss.detach().cpu().numpy()}",
-                  f" concept similarity loss: {loss.detach().cpu().numpy()}", end="\r")
+            print(f"batch {i}/{len(train_loader)} {' '.join([f'{k}: {v:.4f}' for k, v in loss_dict.items()])}")
             
-            training_loss["training_loss_total"] += total_loss.detach().cpu().numpy()
-            training_loss["training_loss_clf"] += clf_loss.detach().cpu().numpy()
-            training_loss["training_loss_concept_similarity"] += loss.detach().cpu().numpy()
-            training_loss["training_loss_orthogonal"] += orthogonal_loss.detach().cpu().numpy() if args.orthogonal_loss_weight>0 else 0
-            
+            ## loss_dict -> training_loss_cosimilarity, training_loss_orthogonal, training_loss_residual, training_loss_clf, training_loss_total
+            for k in training_loss.keys():
+                training_loss[k] += loss_dict[k]
+                
         metrics_result = metric_eval(metrics.compute(), prefix="train")
         for k in training_loss.keys():
             training_loss[k] /= len(train_loader)
-            metrics_result[k] = training_loss[k]
+            metrics_result[k] = training_loss[k]/len(train_loader)
         
         metrics_result["train_concept_activation_error_rate"] =  concept_activation_error_rate(torch.cat(cbl_feature, dim=0), torch.cat(cbl_labels, dim=0))
         metrics_result["train_concept_contrib_error_rate"] = concept_contrib_error_rate(torch.cat(cbl_feature, dim=0),
@@ -424,18 +445,12 @@ if __name__ == "__main__":
                             cbl_features, pred = backbone_cbl(batch_text)
                         else:
                             cbl_features, feature_residual, pred = backbone_cbl(batch_text)
-                    loss = -cos_sim_cubed(cbl_features, batch_sim)
-                    clf_loss = CE_criterion(pred, batch_text["label"])
-                    orthogonal_loss = 0
-                    if args.orthogonal_loss_weight>0: ## cosin similarity between concept features and residual features
-                        orthogonal_loss = F.cosine_similarity(cbl_features, feature_residual, dim=-1).mean()
-                    
-                    total_loss = loss + clf_loss + orthogonal_loss*args.orthogonal_loss_weight
-                    val_loss["val_total_loss"] += total_loss.detach().cpu().numpy()
-                    val_loss["val_clf_loss"] += clf_loss.detach().cpu().numpy()
-                    val_loss["val_concept_similarity_loss"] += loss.detach().cpu().numpy()
-                    val_loss["val_orthogonal_loss"] += orthogonal_loss
-                    
+                    loss, loss_dict = compute_loss(cbl_features, batch_sim, pred, batch_text["label"], backbone_cbl, args,
+                                                    residual_feature=feature_residual if args.residual_ratio!=0 else None,
+                                                    prefix="val")
+                    for k in val_loss.keys():
+                        val_loss[k] += loss_dict[k]
+                        
                     if args.residual_ratio != 0:
                         cbl_features = torch.cat([cbl_features, feature_residual], dim=-1)
                     cbl_feature.append(cbl_features.detach().cpu())
