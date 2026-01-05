@@ -15,6 +15,15 @@ import evaluate
 import wandb
 from omegaconf import OmegaConf
 
+
+def set_seed(seed):
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    
+set_seed(42)
+
+
 parser = argparse.ArgumentParser()
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
