@@ -475,7 +475,7 @@ if __name__ == "__main__":
                                                                                               torch.cat(cbl_labels, dim=0))
             wandb.log(val_metrics_result)
             
-            avg_val_loss = val_loss["val_total_loss"]
+            avg_val_loss = val_loss["val_loss_total"]
             
             if avg_val_loss < best_loss:
                 print("save model")
