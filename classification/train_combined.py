@@ -78,9 +78,12 @@ def metric_eval(metrics, prefix="train"):
 
 
 def compute_loss(cbl_feature, batch_sim, pred, label, backbone_cbl, args, residual_feature=None, prefix="training"):
-    wandb_loss = {}
+    wandb_loss = {"concept_similarity": 0,
+                    "orthogonal": 0,
+                    "residual": 0,
+                    "clf": 0,
+                    "total": 0}
     loss = 0
-    
     sim_loss = -cos_sim_cubed(cbl_feature, batch_sim)
     loss += sim_loss
     wandb_loss["concept_similarity"] = sim_loss.detach().cpu().numpy()
@@ -392,7 +395,7 @@ if __name__ == "__main__":
             
             print(f"batch {i}/{len(train_loader)} {' '.join([f'{k}: {v:.4f}' for k, v in loss_dict.items()])}")
             
-            ## loss_dict -> training_loss_cosimilarity, training_loss_orthogonal, training_loss_residual, training_loss_clf, training_loss_total
+            
             for k in training_loss.keys():
                 training_loss[k] += loss_dict[k]
                 
@@ -449,7 +452,7 @@ if __name__ == "__main__":
                                                     residual_feature=feature_residual if args.residual_ratio!=0 else None,
                                                     prefix="val")
                     for k in val_loss.keys():
-                        val_loss[k] += loss_dict[k]
+                        val_loss[k] += loss_dict[f"val_loss_{k.split('_')[-1]}"]
                         
                     if args.residual_ratio != 0:
                         cbl_features = torch.cat([cbl_features, feature_residual], dim=-1)
