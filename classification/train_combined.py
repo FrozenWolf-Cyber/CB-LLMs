@@ -77,7 +77,7 @@ def metric_eval(metrics, prefix="train"):
     return metrics
 
 
-def compute_loss(cbl_feature, batch_sim, pred, label, backbone_cbl, args, residual_feature=None, prefix="training"):
+def compute_loss(cbl_feature, batch_sim, pred, label, backbone_cbl, args, residual_feature=None, feature_residual_matched=None, prefix="training"):
     wandb_loss = {"concept_similarity": 0,
                     "orthogonal": 0,
                     "residual": 0,
@@ -88,8 +88,8 @@ def compute_loss(cbl_feature, batch_sim, pred, label, backbone_cbl, args, residu
     loss += sim_loss
     wandb_loss["concept_similarity"] = sim_loss.detach().cpu().numpy()
     
-    if args.orthogonal_loss_weight>0 and residual_feature is not None:
-        orthogonal_loss = F.cosine_similarity(cbl_feature, residual_feature, dim=-1).mean()
+    if args.orthogonal_loss_weight>0 and feature_residual_matched is not None:
+        orthogonal_loss = F.cosine_similarity(cbl_feature, feature_residual_matched, dim=-1).mean()
         loss += args.orthogonal_loss_weight*orthogonal_loss
         wandb_loss["orthogonal"] = orthogonal_loss.detach().cpu().numpy()
         
@@ -371,10 +371,11 @@ if __name__ == "__main__":
                 if args.residual_ratio == 0:
                     cbl_features, pred = backbone_cbl(batch_text)
                 else:
-                    cbl_features, feature_residual, pred = backbone_cbl(batch_text)
+                    cbl_features, feature_residual, pred, feature_residual_matched = backbone_cbl(batch_text)
             
             loss, loss_dict = compute_loss(cbl_features, batch_sim, pred, batch_text["label"], backbone_cbl, args,
                                              residual_feature=feature_residual if args.residual_ratio!=0 else None,
+                                            feature_residual_matched=feature_residual_matched if args.residual_ratio!=0 else None,
                                              prefix="training")
             
             pred = torch.argmax(pred, dim=-1).detach().cpu()
@@ -445,11 +446,12 @@ if __name__ == "__main__":
                         cbl_features = cbl(LM_features)
                     else:
                         if args.residual_ratio == 0:
-                            cbl_features, pred = backbone_cbl(batch_text)
+                            cbl_features, predd = backbone_cbl(batch_text)
                         else:
-                            cbl_features, feature_residual, pred = backbone_cbl(batch_text)
+                            cbl_features, feature_residual, pred, feature_residual_matched = backbone_cbl(batch_text)
                     loss, loss_dict = compute_loss(cbl_features, batch_sim, pred, batch_text["label"], backbone_cbl, args,
                                                     residual_feature=feature_residual if args.residual_ratio!=0 else None,
+                                                    feature_residual_matched=feature_residual_matched if args.residual_ratio!=0 else None,
                                                     prefix="val")
                     for k in val_loss.keys():
                         val_loss[k] += loss_dict[k]
@@ -518,7 +520,7 @@ if __name__ == "__main__":
                 if args.residual_ratio == 0:
                     cbl_features, pred = backbone_cbl(batch_text)
                 else:
-                    cbl_features, feature_residual, pred = backbone_cbl(batch_text)
+                    cbl_features, feature_residual, pred, feature_residual_matched = backbone_cbl(batch_text)
                     
         if args.residual_ratio != 0:
             cbl_features = torch.cat([cbl_features, feature_residual], dim=-1)

@@ -33,7 +33,7 @@ class RobertaCBL(nn.Module):
 
 
 class RobertaCBLResidual(nn.Module):
-    def __init__(self, concept_dim, residual_dim, dropout, class_num):
+    def __init__(self, concept_dim, residual_dim, dropout, class_num, match=True):
         super().__init__()
         self.preLM = RobertaModel.from_pretrained('roberta-base')
         self.concept_dim = concept_dim
@@ -48,6 +48,13 @@ class RobertaCBLResidual(nn.Module):
         self.projection_residual = nn.Linear(768, residual_dim)
         self.gelu_residual = nn.GELU()
         self.fc_residual = nn.Linear(residual_dim, residual_dim)
+        
+        self.match = match
+        if self.match and concept_dim != residual_dim:
+            print("Warning: concept_dim and residual_dim are not equal so creating a linear layer to match dimensions.")
+            self.match_layer = nn.Linear(residual_dim, concept_dim)
+        else:
+            self.match_layer = None
         
         
         self.clf = nn.Linear(concept_dim+residual_dim, class_num)
@@ -69,11 +76,15 @@ class RobertaCBLResidual(nn.Module):
         feature_residual = x_residual + projected_residual
         
         feature_combined = torch.concat((feature, feature_residual), dim=-1)
+        
+        feature_residual_matched = feature_residual
+        if self.match_layer is not None:
+            feature_residual_matched = self.match_layer(feature_residual)
         ### clf
         x = F.relu(feature_combined)
         x = self.clf(x)
         x = F.softmax(x, dim=-1)
-        return feature, feature_residual, x
+        return feature, feature_residual, x, feature_residual_matched
 
     def compute_residual_contrib(self, feature_residual):
         w = self.clf.weight  # shape: (class_num, concept_dim + residual_dim)
