@@ -11,4 +11,4 @@ finetune_mlp_epoch = {'SetFit/sst2': 30, 'ag_news': 5, 'yelp_polarity': 3, 'dbpe
 # Config for CBM training
 concept_set = {'SetFit/sst2': concepts.sst2, 'yelp_polarity': concepts.yelpp, 'ag_news': concepts.agnews, 'dbpedia_14': concepts.dbpedia}
 #cbl_epochs = {'SetFit/sst2': 30, 'ag_news': 5, 'yelp_polarity': 3, 'dbpedia_14': 3}
-cbl_epochs = {'SetFit/sst2': 30, 'ag_news': 30, 'yelp_polarity': 30, 'dbpedia_14': 30}
+cbl_epochs = {'SetFit/sst2': 30, 'ag_news': 3, 'yelp_polarity': 2, 'dbpedia_14': 2}
