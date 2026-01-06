@@ -69,9 +69,9 @@ def build_loaders(encode_roberta, s, mode):
 def init_metrics():
     metrics = evaluate.combine([
         evaluate.load("accuracy"),
-        evaluate.load("f1", average="macro"),
-        evaluate.load("precision", average="macro"),
-        evaluate.load("recall", average="macro"),
+        # evaluate.load("f1", average="macro"),
+        # evaluate.load("precision", average="macro"),
+        # evaluate.load("recall", average="macro"),
         # evaluate.load("confusion_matrix"),
     ])
     return metrics
