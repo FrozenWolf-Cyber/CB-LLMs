@@ -69,19 +69,19 @@ def build_loaders(encode_roberta, s, mode):
 def init_metrics():
     metrics = evaluate.combine([
         evaluate.load("accuracy"),
-        evaluate.load("f1"),
-        evaluate.load("precision"),
-        evaluate.load("recall"),
-        evaluate.load("confusion_matrix"),
+        evaluate.load("f1", average="macro"),
+        evaluate.load("precision", average="macro"),
+        evaluate.load("recall", average="macro"),
+        # evaluate.load("confusion_matrix"),
     ])
     return metrics
 
 def metric_eval(metrics, prefix="train"):
-    cm = metrics.pop('confusion_matrix')
-    metrics['TN'] = cm[0][0]
-    metrics['FP'] = cm[0][1]
-    metrics['FN'] = cm[1][0]
-    metrics['TP'] = cm[1][1]
+    # cm = metrics.pop('confusion_matrix')
+    # metrics['TN'] = cm[0][0]
+    # metrics['FP'] = cm[0][1]
+    # metrics['FN'] = cm[1][0]
+    # metrics['TP'] = cm[1][1]
     metrics = {f"{prefix}_{k}": v for k, v in metrics.items()}
     return metrics
 
