@@ -21,7 +21,6 @@ def set_seed(seed):
     torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
     
-set_seed(42)
 
 
 parser = argparse.ArgumentParser()
@@ -41,6 +40,7 @@ parser.add_argument("--dropout", type=float, default=0.1)
 parser.add_argument("--residual_ratio", type=float, default=0)
 parser.add_argument("--orthogonal_loss_weight", type=float, default=0)
 parser.add_argument("--residual_penalty_weight", type=float, default=0)
+parser.add_argument("--seed", type=int, default=42)
 
 class ClassificationDataset(torch.utils.data.Dataset):
     def __init__(self, encode_roberta, s):
@@ -166,6 +166,7 @@ def concept_contrib_error_rate(cbl_feature, weight, pred, label):
 if __name__ == "__main__":
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
     args = parser.parse_args()
+    set_seed(args.seed)
     wandb.init(project="CB-LLMs", 
                notes=f"train_CBL_{args.dataset}_{args.automatic_concept_correction}",
                 config=vars(args),
