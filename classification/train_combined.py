@@ -40,6 +40,7 @@ parser.add_argument("--dropout", type=float, default=0.1)
 parser.add_argument("--residual_ratio", type=float, default=0)
 parser.add_argument("--orthogonal_loss_weight", type=float, default=0)
 parser.add_argument("--residual_penalty_weight", type=float, default=0)
+parser.add_argument("--concept_loss_weight", type=float, default=1.0)
 parser.add_argument("--seed", type=int, default=42)
 
 class ClassificationDataset(torch.utils.data.Dataset):
@@ -94,7 +95,7 @@ def compute_loss(cbl_feature, batch_sim, pred, label, backbone_cbl, args, residu
                     "total": 0}
     loss = 0
     sim_loss = -cos_sim_cubed(cbl_feature, batch_sim)
-    loss += sim_loss
+    loss += sim_loss*args.concept_loss_weight
     wandb_loss["concept_similarity"] = sim_loss.detach().cpu().numpy()
     
     if args.orthogonal_loss_weight>0 and feature_residual_matched is not None:
