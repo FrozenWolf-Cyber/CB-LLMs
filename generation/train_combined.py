@@ -319,13 +319,15 @@ if __name__ == "__main__":
                 val_losses["val_neg_entropy_loss"].append(neg_entropy_loss.detach().cpu().numpy())
                 val_losses["val_reg_loss"].append(reg.detach().cpu().numpy())
                 
+                if args.DEBUG and i >= 2:
+                    break
                 
             avg_val_loss = {}
             for key in val_losses.keys():
                 if len(val_losses[key]) > 0:
                     avg_val_loss[key] = sum(val_losses[key]) / len(val_losses[key])
             print("Epoch ", e + 1, " validation losses: ", avg_val_loss)
-            wandb.log({f"avg_{k}": avg_val_loss[k] for k in val_losses.keys()}, step=e + 1)
+            wandb.log({f"avg_{k}": avg_val_loss[k] for k in avg_val_loss.keys()}, step=e + 1)
             avg_val_concept_loss = avg_val_loss["val_concept_loss"]
             avg_val_word_loss = avg_val_loss["val_word_loss"]
 
@@ -354,7 +356,10 @@ if __name__ == "__main__":
     
     ## delete previous models to save space
     import gc
-    del preLM, cbl, classifier, opt_prelm, opt_cbl, opt_classifier
+    del preLM, cbl, classifier, opt_prelm, opt_cbl
+    
+    if args.discrimination_loss > 0:
+        del opt_classifier
     torch.cuda.empty_cache()
     gc.collect()
     
