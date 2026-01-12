@@ -381,41 +381,41 @@ if __name__ == "__main__":
     #### TEST STEERABILITY AFTER TRAINING
 
     
-    roberta_tokenizer = RobertaTokenizerFast.from_pretrained('roberta-base')
-    classifier_path = args.dataset.replace('/', '_') + "_classifier.pt"
-    classifier = Roberta_classifier(len(concept_set)).to(device)
-    classifier.load_state_dict(torch.load(classifier_path, map_location=device))
+    # roberta_tokenizer = RobertaTokenizerFast.from_pretrained('roberta-base')
+    # classifier_path = args.dataset.replace('/', '_') + "_classifier.pt"
+    # classifier = Roberta_classifier(len(concept_set)).to(device)
+    # classifier.load_state_dict(torch.load(classifier_path, map_location=device))
     
 
-    if args.dataset == "dbpedia_14":
-        intervention_value = 150
-    else:
-        intervention_value = 100
-    pred = []
-    text = []
-    acc = evaluate.load("accuracy")
-    with torch.no_grad():
-        for i in range(100 // len(concept_set)):
-            print("example", str(i), end="\r")
-            with torch.no_grad():
-                input_ids = torch.tensor([tokenizer.encode("")]).to(device)
-                for j in range(len(concept_set)):
-                    v = [0] * len(concept_set)
-                    v[j] = intervention_value
-                    text_ids, _ = cbl.generate(input_ids, preLM, intervene=v)
-                    decoded_text_ids = tokenizer.decode(text_ids[0][~torch.isin(text_ids[0], torch.tensor([128000, 128001]).to(device))])
-                    text.append(decoded_text_ids)
-                    roberta_text_ids = torch.tensor([roberta_tokenizer.encode(decoded_text_ids)]).to(device)
-                    roberta_input = {"input_ids": roberta_text_ids, "attention_mask": torch.tensor([[1]*roberta_text_ids.shape[1]]).to(device)}
-                    logits = classifier(roberta_input)
-                    pred.append(logits)
-        pred = torch.cat(pred, dim=0).detach().cpu()
-        pred = np.argmax(pred.numpy(), axis=-1)
-        acc.add_batch(predictions=pred, references=list(range(len(concept_set)))*(100 // len(concept_set)))
+    # if args.dataset == "dbpedia_14":
+    #     intervention_value = 150
+    # else:
+    #     intervention_value = 100
+    # pred = []
+    # text = []
+    # acc = evaluate.load("accuracy")
+    # with torch.no_grad():
+    #     for i in range(100 // len(concept_set)):
+    #         print("example", str(i), end="\r")
+    #         with torch.no_grad():
+    #             input_ids = torch.tensor([tokenizer.encode("")]).to(device)
+    #             for j in range(len(concept_set)):
+    #                 v = [0] * len(concept_set)
+    #                 v[j] = intervention_value
+    #                 text_ids, _ = cbl.generate(input_ids, preLM, intervene=v)
+    #                 decoded_text_ids = tokenizer.decode(text_ids[0][~torch.isin(text_ids[0], torch.tensor([128000, 128001]).to(device))])
+    #                 text.append(decoded_text_ids)
+    #                 roberta_text_ids = torch.tensor([roberta_tokenizer.encode(decoded_text_ids)]).to(device)
+    #                 roberta_input = {"input_ids": roberta_text_ids, "attention_mask": torch.tensor([[1]*roberta_text_ids.shape[1]]).to(device)}
+    #                 logits = classifier(roberta_input)
+    #                 pred.append(logits)
+    #     pred = torch.cat(pred, dim=0).detach().cpu()
+    #     pred = np.argmax(pred.numpy(), axis=-1)
+    #     acc.add_batch(predictions=pred, references=list(range(len(concept_set)))*(100 // len(concept_set)))
 
-    print("Steerability test accuracy:")
-    print(acc.compute())
-    wandb.log({"steerability_test_accuracy": acc.compute()})
+    # print("Steerability test accuracy:")
+    # acc = acc.compute()
+    # wandb.log({"steerability_test_accuracy": acc})
     
     
     
@@ -434,8 +434,9 @@ if __name__ == "__main__":
     pred = np.argmax(concept_predictions.numpy(), axis=-1)
     metric.add_batch(predictions=pred, references=encoded_test_dataset["label"])
     print("Concept prediction accuracy:")
-    print(metric.compute())
-    wandb.log({"concept_prediction_accuracy": metric.compute()})
+    acc = metric.compute()
+    print(acc)
+    wandb.log({"concept_prediction_accuracy": acc})
     
     
     
