@@ -204,9 +204,9 @@ if __name__ == "__main__":
             word_label = torch.where(batch["attention_mask"][:, :-1] == 0, -100, batch["input_ids"][:, 1:])
             features = preLM(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"]).last_hidden_state
             concepts, unsup, vocabs, matched_unsup = cbl(features.float())
-            print("concepts shape in training loop:", concepts.shape)
-            print("unsup shape in training loop:", unsup.shape)
-            print("vocabs shape in training loop:", vocabs.shape)
+            # print("concepts shape in training loop:", concepts.shape)
+            # print("unsup shape in training loop:", unsup.shape)
+            # print("vocabs shape in training loop:", vocabs.shape)
             
             concept_loss = torch.nn.CrossEntropyLoss()(concepts[:, :-1, :].reshape(-1, len(concept_set)), concept_label.reshape(-1))
             word_loss = torch.nn.CrossEntropyLoss()(vocabs[:, :-1, :].reshape(-1, config.vocab_size), word_label.reshape(-1))
@@ -272,7 +272,10 @@ if __name__ == "__main__":
                 break
             
             
-        avg_metrics = {k: sum(training_losses[k]) / len(training_losses[k]) for k in training_losses.keys()}
+        avg_metrics = {}
+        for key in training_losses.keys():
+            if len(training_losses[key]) > 0:
+                avg_metrics[key] = sum(training_losses[key]) / len(training_losses[key])
         print("Epoch ", e + 1, " training losses: ", avg_metrics)
         wandb.log({f"avg_{k}": avg_metrics[k] for k in training_losses.keys()}, step=e + 1)
 
@@ -319,7 +322,8 @@ if __name__ == "__main__":
                 
             avg_val_loss = {}
             for key in val_losses.keys():
-                avg_val_loss[key] = sum(val_losses[key]) / len(val_losses[key])
+                if len(val_losses[key]) > 0:
+                    avg_val_loss[key] = sum(val_losses[key]) / len(val_losses[key])
             print("Epoch ", e + 1, " validation losses: ", avg_val_loss)
             wandb.log({f"avg_{k}": avg_val_loss[k] for k in val_losses.keys()}, step=e + 1)
             avg_val_concept_loss = avg_val_loss["val_concept_loss"]

@@ -132,8 +132,8 @@ class CBLResidual(nn.Module):
     def forward(self, features):
         concepts = self.cbl(features)
         unsup_features = self.cbl_residual(features)
-        print("concepts shape:", concepts.shape)
-        print("unsup_features shape:", unsup_features.shape)
+        # print("concepts shape:", concepts.shape)
+        # print("unsup_features shape:", unsup_features.shape)
         e = torch.cat((self.relu(concepts), unsup_features), dim=-1)
         return self.relu(concepts), unsup_features, self.fc(e), self.match_layer(unsup_features) if self.match_layer else unsup_features
 
@@ -162,9 +162,9 @@ class CBLResidual(nn.Module):
     
     def compute_residual_contrib(self, unsup_features):
         w = self.fc.weight  # shape: (vocab_size, concept_dim + residual_dim)
-        print("fc weight shape:", w.shape)
+        # print("fc weight shape:", w.shape)
         w_non_concept = w[:, self.concept_dim:]  # shape: (vocab_size, residual_dim)
-        print("w_non_concept shape:", w_non_concept.shape)
+        # print("w_non_concept shape:", w_non_concept.shape)
         contrib = F.linear(unsup_features, w_non_concept)  # shape: (batch_size, vocab_size)
-        print("residual contrib shape:", contrib.shape)
+        # print("residual contrib shape:", contrib.shape)
         return contrib
