@@ -3,13 +3,14 @@ import os
 import torch
 import torch.nn.functional as F
 import numpy as np
+import evaluate
 from datasets import load_dataset, concatenate_datasets
 import config as CFG
-from transformers import LlamaConfig, LlamaModel, AutoTokenizer
+from transformers import LlamaConfig, LlamaModel, AutoTokenizer, RobertaTokenizerFast
 from peft import LoraConfig, TaskType, get_peft_model
-from modules import CBLResidual, CBL
+from modules import CBLResidual, CBL, Roberta_classifier
 import time
-from utils import elastic_net_penalty, mean_pooling
+from utils import elastic_net_penalty, mean_pooling, eos_pooling
 import wandb
 def set_seed(seed):
     torch.manual_seed(seed)
@@ -32,6 +33,8 @@ parser.add_argument("--elastic_net_alpha", type=float, default=1.0)
 parser.add_argument("--residual_dim", type=int, default=768)
 parser.add_argument("--orthogonal_loss_weight", type=float, default=0)
 parser.add_argument("--residual_penalty_weight", type=float, default=0)
+parser.add_argument("--DEBUG", action='store_true', help="If set, use a smaller subset of data for quick debugging.")
+
 
 class ClassificationDataset(torch.utils.data.Dataset):
     def __init__(self, encoded_text):
@@ -62,9 +65,10 @@ if __name__ == "__main__":
     wandb.init(project="cbm-generation", name=f"train-{args.dataset}-seed{args.seed}",
                config=vars(args))
     
-    
+    run_name = wandb.run.id
     print("loading data...")
     train_dataset = load_dataset(args.dataset, split='train')
+    test_dataset = load_dataset(args.dataset, split='test')
     if args.dataset == 'SetFit/sst2':
         val_dataset = load_dataset(args.dataset, split='validation')
 
@@ -116,6 +120,24 @@ if __name__ == "__main__":
             encoded_val_dataset = encoded_val_dataset.remove_columns(['title'])
         encoded_val_dataset = encoded_val_dataset[:len(encoded_val_dataset)]
 
+
+    if args.dataset == 'ag_news':
+        def replace_bad_string(example):
+            example["text"] = example["text"].replace("#36;", "")
+            example["text"] = example["text"].replace("#39;", "'")
+            return example
+        test_dataset = test_dataset.map(replace_bad_string)
+
+    encoded_test_dataset = test_dataset.map(
+        lambda e: tokenizer(e[CFG.example_name[args.dataset]], padding=True, truncation=True,
+                            max_length=args.max_length), batched=True, batch_size=len(test_dataset))
+    encoded_test_dataset = encoded_test_dataset.remove_columns([CFG.example_name[args.dataset]])
+    if args.dataset == 'SetFit/sst2':
+        encoded_test_dataset = encoded_test_dataset.remove_columns(['label_text'])
+    if args.dataset == 'dbpedia_14':
+        encoded_test_dataset = encoded_test_dataset.remove_columns(['title'])
+    encoded_test_dataset = encoded_test_dataset[:len(encoded_test_dataset)]
+
     concept_set = CFG.concepts_from_labels[args.dataset]
     print("concept len: ", len(concept_set))
 
@@ -123,7 +145,7 @@ if __name__ == "__main__":
     train_loader = build_loaders(encoded_train_dataset, mode="train")
     if args.dataset == 'SetFit/sst2':
         val_loader = build_loaders(encoded_val_dataset, mode="valid")
-
+    test_loader = build_loaders(encoded_test_dataset, mode="test")
 
     print("preparing backbone")
     preLM = LlamaModel.from_pretrained('meta-llama/Meta-Llama-3-8B', torch_dtype=torch.bfloat16).to(device)
@@ -148,7 +170,7 @@ if __name__ == "__main__":
     best_loss = float('inf')
     d_name = args.dataset.replace('/', '_')
     prefix = "./"
-    prefix += "./from_pretained_llama3_lora_cbm"
+    prefix += "./from_pretained_llama3_lora_cbm_" + run_name
     prefix += "/"
     prefix += d_name
     prefix += "/"
@@ -159,6 +181,7 @@ if __name__ == "__main__":
     cbl_name = "cbl"
 
     start = time.time()
+    best_epoch = -1
     epochs = CFG.epoch[args.dataset]
     for e in range(epochs):
         print("Epoch ", e+1, ":")
@@ -245,6 +268,9 @@ if __name__ == "__main__":
             log["batch"] = i + 1
             wandb.log(log)
             
+            if args.DEBUG and i >= 2:
+                break
+            
             
         avg_metrics = {k: sum(training_losses[k]) / len(training_losses[k]) for k in training_losses.keys()}
         print("Epoch ", e + 1, " training losses: ", avg_metrics)
@@ -302,6 +328,7 @@ if __name__ == "__main__":
 
             avg_val_loss = avg_val_concept_loss + avg_val_word_loss
             if avg_val_loss < best_loss:
+                best_epoch = e + 1
                 print("save model")
                 best_loss = avg_val_loss
                 preLM.save_pretrained(prefix + model_name + "_epoch_" + str(e + 1))
@@ -315,5 +342,150 @@ if __name__ == "__main__":
             preLM.save_pretrained(prefix + model_name + "_epoch_" + str(e + 1))
             torch.save(cbl.state_dict(), prefix + cbl_name + "_epoch_" + str(e + 1) + ".pt")
 
+        if args.DEBUG:
+            break
+
     end = time.time()
     print("time of training CBM:", (end - start) / 3600, "hours")
+    
+    ## delete previous models to save space
+    import gc
+    del preLM, cbl, classifier, opt_prelm, opt_cbl, opt_classifier
+    torch.cuda.empty_cache()
+    gc.collect()
+    
+    ## lOAD BEST MODEL AND
+    preLM = LlamaModel.from_pretrained('meta-llama/Meta-Llama-3-8B', torch_dtype=torch.bfloat16).to(device)
+    peft_path = prefix + model_name + "_epoch_" + str(best_epoch)
+    preLM.load_adapter(peft_path)
+    preLM.eval()
+    cbl = CBL(config, len(concept_set), tokenizer).to(device)
+    cbl.load_state_dict(torch.load(prefix + cbl_name + "_epoch_" + str(best_epoch) + ".pt", map_location=device))
+    cbl.eval()
+        
+    
+    
+    
+    #### TEST STEERABILITY AFTER TRAINING
+
+    
+    roberta_tokenizer = RobertaTokenizerFast.from_pretrained('roberta-base')
+    classifier_path = args.dataset.replace('/', '_') + "_classifier.pt"
+    classifier = Roberta_classifier(len(concept_set)).to(device)
+    classifier.load_state_dict(torch.load(classifier_path, map_location=device))
+    
+
+    if args.dataset == "dbpedia_14":
+        intervention_value = 150
+    else:
+        intervention_value = 100
+    pred = []
+    text = []
+    acc = evaluate.load("accuracy")
+    with torch.no_grad():
+        for i in range(100 // len(concept_set)):
+            print("example", str(i), end="\r")
+            with torch.no_grad():
+                input_ids = torch.tensor([tokenizer.encode("")]).to(device)
+                for j in range(len(concept_set)):
+                    v = [0] * len(concept_set)
+                    v[j] = intervention_value
+                    text_ids, _ = cbl.generate(input_ids, preLM, intervene=v)
+                    decoded_text_ids = tokenizer.decode(text_ids[0][~torch.isin(text_ids[0], torch.tensor([128000, 128001]).to(device))])
+                    text.append(decoded_text_ids)
+                    roberta_text_ids = torch.tensor([roberta_tokenizer.encode(decoded_text_ids)]).to(device)
+                    roberta_input = {"input_ids": roberta_text_ids, "attention_mask": torch.tensor([[1]*roberta_text_ids.shape[1]]).to(device)}
+                    logits = classifier(roberta_input)
+                    pred.append(logits)
+        pred = torch.cat(pred, dim=0).detach().cpu()
+        pred = np.argmax(pred.numpy(), axis=-1)
+        acc.add_batch(predictions=pred, references=list(range(len(concept_set)))*(100 // len(concept_set)))
+
+    print("Steerability test accuracy:")
+    print(acc.compute())
+    wandb.log({"steerability_test_accuracy": acc.compute()})
+    
+    
+    
+    
+    #### TEST CONCEPT PREDICTION AFTER TRAINING
+    print("eval concepts...")
+    metric = evaluate.load("accuracy")
+    concept_predictions = []
+    for batch in test_loader:
+        batch = {k: v.to(device) for k, v in batch.items()}
+        with torch.no_grad():
+            features = preLM(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"]).last_hidden_state
+            concepts, _, _, _ = cbl(features.float())
+        concept_predictions.append(eos_pooling(concepts, batch["attention_mask"]))
+    concept_predictions = torch.cat(concept_predictions, dim=0).detach().cpu()
+    pred = np.argmax(concept_predictions.numpy(), axis=-1)
+    metric.add_batch(predictions=pred, references=encoded_test_dataset["label"])
+    print("Concept prediction accuracy:")
+    print(metric.compute())
+    wandb.log({"concept_prediction_accuracy": metric.compute()})
+    
+    
+    
+    #### TEST WEIGHT
+    print("Top tokens for each concept neuron:")
+    w = cbl.fc.weight.data[:, :len(concept_set)].T
+    for i in range(len(concept_set)):
+        top_values, top_ids = torch.topk(w[i], k=10)
+        print("Neuron: ", concept_set[i])
+        print("Top 10 tokens with highest weight:")
+        for j in range(10):
+            print("Neuron:", concept_set[i], "[",round(float(top_values.detach().cpu()[j]), 3), "]", tokenizer.decode(top_ids[j]))
+
+    print("Sparsity of concept weight matrix:")
+    print((w > 1e-6).count_nonzero() / w.numel())
+    wandb.log({"concept_weight_sparsity": (w > 1e-6).count_nonzero() / w.numel()})
+    
+    
+    
+    #### TEST PERPLEXITY AFTER TRAINING
+    print("Test perplexity after training:")
+    set_seed(args.seed)
+    
+    pred = []
+    perplexity = evaluate.load("perplexity", module_type="metric")
+    input_ids = torch.tensor([tokenizer.encode("")]).to(device)
+    for i in range(100):
+        print("example", str(i), end="\r")
+        with torch.no_grad():
+            text_ids, _ = cbl.generate(input_ids, preLM)
+            pred.append(tokenizer.decode(text_ids[0]))
+            if len(pred[-1].split()) > 30:
+                continue
+            perplexity.add_batch(predictions=[pred[i]])
+
+        ## print some generated texts
+    print("Some generated texts:")
+    for i in range(5):
+        print(pred[i])
+    import pickle
+    if "perplexity_text" not in os.listdir("./"):
+        try:
+            os.mkdir("perplexity_text")
+        except:
+            pass
+    pickle.dump(pred, open(f"perplexity_text/{run_name}_generated_texts_{args.seed}.pkl", "wb"))
+    del preLM
+    del cbl
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    print("Perplexity: (under 30 tokens)")
+    perplexity = perplexity.compute(model_id='meta-llama/Meta-Llama-3-8B', max_length=100)['mean_perplexity']
+    print(perplexity)
+    wandb.log({"perplexity_under_30_tokens": perplexity})
+    
+    print("Now for all tokens:")
+    perplexity = evaluate.load("perplexity", module_type="metric")
+    for p in pred:
+        perplexity.add_batch(predictions=[p])
+    perplexity = perplexity.compute(model_id='meta-llama/Meta-Llama-3-8B', max_length=100)['mean_perplexity']
+    print(perplexity)
+    wandb.log({"perplexity_all_tokens": perplexity})
+        
+    
