@@ -88,7 +88,7 @@ class CBL(nn.Module):
         concepts = self.cbl(features)
         unsup_features = self.unsup(features)
         e = torch.cat((self.relu(concepts), unsup_features), dim=-1)
-        return self.relu(concepts), unsup_features, self.fc(e)
+        return self.relu(concepts), unsup_features, self.fc(e), None
 
     def generate(self, ids, preLM, intervene=None, length=100, temp=0.7, topk=100, topp=0.9, repetition_penalty=1.5, eos_token_id=128001):
         past_key_values = None
@@ -122,7 +122,12 @@ class CBLResidual(nn.Module):
         self.fc = nn.Linear(concept_dim + residual_dim, config.vocab_size)
         self.relu = nn.ReLU()
         self.concept_dim = concept_dim
+        self.residual_dim = residual_dim
         self.tokenizer = tokenizer
+        self.match_layer = None
+        if concept_dim != residual_dim:
+            print("Warning: concept_dim and residual_dim are not equal so creating a linear layer to match dimensions.")
+            self.match_layer = nn.Linear(residual_dim, concept_dim)
 
     def forward(self, features):
         concepts = self.cbl(features)
@@ -130,7 +135,7 @@ class CBLResidual(nn.Module):
         print("concepts shape:", concepts.shape)
         print("unsup_features shape:", unsup_features.shape)
         e = torch.cat((self.relu(concepts), unsup_features), dim=-1)
-        return self.relu(concepts), unsup_features, self.fc(e)
+        return self.relu(concepts), unsup_features, self.fc(e), self.match_layer(unsup_features) if self.match_layer else unsup_features
 
     def generate(self, ids, preLM, intervene=None, length=100, temp=0.7, topk=100, topp=0.9, repetition_penalty=1.5, eos_token_id=128001):
         past_key_values = None

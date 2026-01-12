@@ -180,7 +180,7 @@ if __name__ == "__main__":
             concept_label = torch.where(batch["attention_mask"][:, :-1] == 0, -100, batch["label"].view(-1, 1))
             word_label = torch.where(batch["attention_mask"][:, :-1] == 0, -100, batch["input_ids"][:, 1:])
             features = preLM(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"]).last_hidden_state
-            concepts, unsup, vocabs = cbl(features.float())
+            concepts, unsup, vocabs, matched_unsup = cbl(features.float())
             print("concepts shape in training loop:", concepts.shape)
             print("unsup shape in training loop:", unsup.shape)
             print("vocabs shape in training loop:", vocabs.shape)
@@ -190,10 +190,10 @@ if __name__ == "__main__":
             loss = args.concept_loss * concept_loss + word_loss
             reg = elastic_net_penalty(cbl.fc.weight[:, :len(concept_set)])
             
-            
-            orthogonal_loss = torch.cosine_similarity(concepts, unsup, dim=-1).mean() ## TODO: check shape
-            loss += args.orthogonal_loss_weight * orthogonal_loss
-            training_losses["orthogonal_loss"].append(orthogonal_loss.detach().cpu().numpy())
+            if matched_unsup is not None:
+                orthogonal_loss = torch.cosine_similarity(concepts, matched_unsup, dim=-1).mean() ## TODO: check shape
+                loss += args.orthogonal_loss_weight * orthogonal_loss
+                training_losses["orthogonal_loss"].append(orthogonal_loss.detach().cpu().numpy())
             
             if args.residual_penalty_weight > 0:
                 residual_contrib = cbl.compute_residual_contrib(unsup)
