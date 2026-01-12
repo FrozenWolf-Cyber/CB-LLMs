@@ -309,7 +309,7 @@ if __name__ == "__main__":
                     residual_penalty = torch.mean(torch.abs(residual_contrib)) ## TODO: check logic
                     val_losses["val_residual_penalty_loss"].append(residual_penalty.detach().cpu().numpy())
                     
-                orthogonal_loss = torch.cosine_similarity(matched_unsup, unsup, dim=-1).mean() ## TODO: check shape
+                orthogonal_loss = torch.cosine_similarity(concepts, matched_unsup, dim=-1).mean() ## TODO: check shape
                 val_losses["val_orthogonal_loss"].append(orthogonal_loss.detach().cpu().numpy())
                 
                 neg_entropy_loss = torch.sum(p * torch.log(p), dim=-1).mean()
