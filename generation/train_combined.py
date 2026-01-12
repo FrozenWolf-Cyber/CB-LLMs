@@ -233,12 +233,14 @@ if __name__ == "__main__":
             
             training_losses["reg_loss"].append(reg.detach().cpu().numpy())
             
+            log = {}
             for key in training_losses.keys():
                 if len(training_losses[key]) > 0:
                     print(f"{key}: {training_losses[key][-1]}", end=" ")
+                    log[key] = training_losses[key][-1]
             print(" | batch ", i+1, " / ", len(train_loader), end="\r")
             
-            log = {k: training_losses[k][-1] for k in training_losses.keys()}
+            
             log["epoch"] = e + 1
             log["batch"] = i + 1
             wandb.log(log)
