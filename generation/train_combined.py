@@ -219,7 +219,7 @@ if __name__ == "__main__":
                 opt_classifier.step()
 
             if args.neg_entropy_loss > 0:
-                _, unsup, _ = cbl(features.detach().float())
+                _, unsup, _, _ = cbl(features.detach().float())
                 classification = classifier(mean_pooling(unsup, batch["attention_mask"]))
                 p = F.softmax(classification, dim=-1)
                 neg_entropy_loss = torch.sum(p * torch.log(p), dim=-1).mean()
@@ -264,7 +264,7 @@ if __name__ == "__main__":
                 word_label = torch.where(batch["attention_mask"][:, :-1] == 0, -100, batch["input_ids"][:, 1:])
                 with torch.no_grad():
                     features = preLM(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"]).last_hidden_state
-                    concepts, unsup, vocabs = cbl(features.float())
+                    concepts, unsup, vocabs, _ = cbl(features.float())
                     classification = classifier(mean_pooling(unsup, batch["attention_mask"]))
                 concept_loss = torch.nn.CrossEntropyLoss()(concepts[:, :-1, :].reshape(-1, len(concept_set)), concept_label.reshape(-1))
                 word_loss = torch.nn.CrossEntropyLoss()(vocabs[:, :-1, :].reshape(-1, config.vocab_size), word_label.reshape(-1))
