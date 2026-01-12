@@ -277,7 +277,7 @@ if __name__ == "__main__":
             if len(training_losses[key]) > 0:
                 avg_metrics[key] = sum(training_losses[key]) / len(training_losses[key])
         print("Epoch ", e + 1, " training losses: ", avg_metrics)
-        wandb.log({f"avg_{k}": avg_metrics[k] for k in training_losses.keys()}, step=e + 1)
+        wandb.log({f"avg_{k}": avg_metrics[k] for k in avg_metrics.keys()}, step=e + 1)
 
 
         if args.dataset == 'SetFit/sst2':
