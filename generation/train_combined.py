@@ -234,7 +234,8 @@ if __name__ == "__main__":
             training_losses["reg_loss"].append(reg.detach().cpu().numpy())
             
             for key in training_losses.keys():
-                print(f"{key}: {training_losses[key][-1]}", end=" ")
+                if len(training_losses[key]) > 0:
+                    print(f"{key}: {training_losses[key][-1]}", end=" ")
             print(" | batch ", i+1, " / ", len(train_loader), end="\r")
             
             log = {k: training_losses[k][-1] for k in training_losses.keys()}
