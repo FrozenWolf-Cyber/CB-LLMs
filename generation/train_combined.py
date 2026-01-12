@@ -4,7 +4,7 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 import evaluate
-import tqdm
+from tqdm.auto import tqdm
 from datasets import load_dataset, concatenate_datasets
 import config as CFG
 from transformers import LlamaConfig, LlamaModel, AutoTokenizer, RobertaTokenizerFast
