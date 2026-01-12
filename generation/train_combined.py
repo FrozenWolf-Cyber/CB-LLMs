@@ -297,7 +297,7 @@ if __name__ == "__main__":
                 word_label = torch.where(batch["attention_mask"][:, :-1] == 0, -100, batch["input_ids"][:, 1:])
                 with torch.no_grad():
                     features = preLM(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"]).last_hidden_state
-                    concepts, unsup, vocabs, _ = cbl(features.float())
+                    concepts, unsup, vocabs, matched_unsup = cbl(features.float())
                     classification = classifier(mean_pooling(unsup, batch["attention_mask"]))
                 concept_loss = torch.nn.CrossEntropyLoss()(concepts[:, :-1, :].reshape(-1, len(concept_set)), concept_label.reshape(-1))
                 word_loss = torch.nn.CrossEntropyLoss()(vocabs[:, :-1, :].reshape(-1, config.vocab_size), word_label.reshape(-1))
@@ -309,7 +309,7 @@ if __name__ == "__main__":
                     residual_penalty = torch.mean(torch.abs(residual_contrib)) ## TODO: check logic
                     val_losses["val_residual_penalty_loss"].append(residual_penalty.detach().cpu().numpy())
                     
-                orthogonal_loss = torch.cosine_similarity(concepts, unsup, dim=-1).mean() ## TODO: check shape
+                orthogonal_loss = torch.cosine_similarity(matched_unsup, unsup, dim=-1).mean() ## TODO: check shape
                 val_losses["val_orthogonal_loss"].append(orthogonal_loss.detach().cpu().numpy())
                 
                 neg_entropy_loss = torch.sum(p * torch.log(p), dim=-1).mean()
