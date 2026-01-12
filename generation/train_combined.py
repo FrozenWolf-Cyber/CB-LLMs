@@ -4,6 +4,7 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 import evaluate
+import tqdm
 from datasets import load_dataset, concatenate_datasets
 import config as CFG
 from transformers import LlamaConfig, LlamaModel, AutoTokenizer, RobertaTokenizerFast
@@ -198,7 +199,7 @@ if __name__ == "__main__":
         }
 
         
-        for i, batch in enumerate(train_loader):
+        for i, batch in tqdm(enumerate(train_loader), total=len(train_loader)):
             batch = {k: v.to(device) for k, v in batch.items()}
             concept_label = torch.where(batch["attention_mask"][:, :-1] == 0, -100, batch["label"].view(-1, 1))
             word_label = torch.where(batch["attention_mask"][:, :-1] == 0, -100, batch["input_ids"][:, 1:])
@@ -261,7 +262,7 @@ if __name__ == "__main__":
                 if len(training_losses[key]) > 0:
                     print(f"{key}: {training_losses[key][-1]}", end=" ")
                     log[key] = training_losses[key][-1]
-            print(" | batch ", i+1, " / ", len(train_loader), end="\r")
+            # print(" | batch ", i+1, " / ", len(train_loader), end="\r")
             
             
             log["epoch"] = e + 1
@@ -291,7 +292,7 @@ if __name__ == "__main__":
                 "val_residual_penalty_loss": [],
                 "val_orthogonal_loss": [],
             }
-            for i, batch in enumerate(val_loader):
+            for i, batch in tqdm(enumerate(val_loader), total=len(val_loader)):
                 batch = {k: v.to(device) for k, v in batch.items()}
                 concept_label = torch.where(batch["attention_mask"][:, :-1] == 0, -100, batch["label"].view(-1, 1))
                 word_label = torch.where(batch["attention_mask"][:, :-1] == 0, -100, batch["input_ids"][:, 1:])
@@ -395,7 +396,7 @@ if __name__ == "__main__":
     # text = []
     # acc = evaluate.load("accuracy")
     # with torch.no_grad():
-    #     for i in range(100 // len(concept_set)):
+    #     for i in tqdm(range(100 // len(concept_set))):
     #         print("example", str(i), end="\r")
     #         with torch.no_grad():
     #             input_ids = torch.tensor([tokenizer.encode("")]).to(device)
@@ -424,7 +425,7 @@ if __name__ == "__main__":
     print("eval concepts...")
     metric = evaluate.load("accuracy")
     concept_predictions = []
-    for batch in test_loader:
+    for batch in tqdm(test_loader, total=len(test_loader)):
         batch = {k: v.to(device) for k, v in batch.items()}
         with torch.no_grad():
             features = preLM(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"]).last_hidden_state
@@ -443,7 +444,7 @@ if __name__ == "__main__":
     #### TEST WEIGHT
     print("Top tokens for each concept neuron:")
     w = cbl.fc.weight.data[:, :len(concept_set)].T
-    for i in range(len(concept_set)):
+    for i in tqdm(range(len(concept_set))):
         top_values, top_ids = torch.topk(w[i], k=10)
         print("Neuron: ", concept_set[i])
         print("Top 10 tokens with highest weight:")
@@ -463,7 +464,7 @@ if __name__ == "__main__":
     pred = []
     perplexity = evaluate.load("perplexity", module_type="metric")
     input_ids = torch.tensor([tokenizer.encode("")]).to(device)
-    for i in range(100):
+    for i in tqdm(range(100)):
         print("example", str(i), end="\r")
         with torch.no_grad():
             text_ids, _ = cbl.generate(input_ids, preLM)
