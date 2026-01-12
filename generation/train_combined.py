@@ -226,10 +226,11 @@ if __name__ == "__main__":
                 opt_cbl.zero_grad()
                 (args.neg_entropy_loss * neg_entropy_loss).backward(inputs=list(cbl.unsup.parameters()))
                 opt_cbl.step()
+                training_losses["neg_entropy_loss"].append(neg_entropy_loss.detach().cpu().numpy())
 
             training_losses["concept_loss"].append(concept_loss.detach().cpu().numpy())
             training_losses["word_loss"].append(word_loss.detach().cpu().numpy())
-            training_losses["neg_entropy_loss"].append(neg_entropy_loss.detach().cpu().numpy())
+            
             training_losses["reg_loss"].append(reg.detach().cpu().numpy())
             
             for key in training_losses.keys():
