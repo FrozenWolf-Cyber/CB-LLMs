@@ -368,7 +368,10 @@ if __name__ == "__main__":
     peft_path = prefix + model_name + "_epoch_" + str(best_epoch)
     preLM.load_adapter(peft_path)
     preLM.eval()
-    cbl = CBL(config, len(concept_set), tokenizer).to(device)
+    if args.discrimination_loss > 0:
+        cbl = CBL(config, len(concept_set), tokenizer).to(device)
+    else:
+        cbl = CBLResidual(config, len(concept_set), args.residual_dim, tokenizer).to(device)
     cbl.load_state_dict(torch.load(prefix + cbl_name + "_epoch_" + str(best_epoch) + ".pt", map_location=device))
     cbl.eval()
         
