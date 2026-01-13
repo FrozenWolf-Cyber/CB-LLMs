@@ -47,6 +47,21 @@ if __name__ == "__main__":
             wandb.log({"perplexity_under_30_tokens": perp})
             
 
+        import json
+        file = "perplexity_text/perplexity_wandb_log.json"
+        if "perplexity_wandb_log.json" in os.listdir("perplexity_text/"):
+            with open(file, "r") as f:
+                runs_done = json.load(f)
+        else:
+            runs_done = {}
+            
+        runs_done[run_name] = True
+        with open(file, "w") as f:
+            json.dump(runs_done, f)
+            print("Logged run to json.")
+            
+        print("Calculating perplexity for all lengths...")
+
     
         temp = []
         for p in pred_2:

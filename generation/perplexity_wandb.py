@@ -35,5 +35,5 @@ for run_file in runs_available:
     ## run python perplexity_calc.py --path perplexity_text/generated_texts_XXXX.pkl
     print("Processing file:", run_file)
     print("Command:", f"python perplexity_calc.py --path perplexity_text/{run_file}")
-    os.system(f"python perplexity_calc.py --path perplexity_text/{run_file}") ## wont stop until all are done
-    
+    result = os.system(f"python perplexity_calc.py --path perplexity_text/{run_file}")
+    print(f"Command output status: {result}")
