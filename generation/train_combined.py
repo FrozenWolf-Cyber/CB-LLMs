@@ -278,7 +278,7 @@ if __name__ == "__main__":
             if len(training_losses[key]) > 0:
                 avg_metrics[key] = sum(training_losses[key]) / len(training_losses[key])
         print("Epoch ", e + 1, " training losses: ", avg_metrics)
-        wandb.log({f"avg_{k}": avg_metrics[k] for k in avg_metrics.keys()}, step=e + 1)
+        wandb.log({f"avg_{k}": avg_metrics[k] for k in avg_metrics.keys()})
 
 
         if args.dataset == 'SetFit/sst2':
@@ -329,7 +329,7 @@ if __name__ == "__main__":
                 if len(val_losses[key]) > 0:
                     avg_val_loss[key] = sum(val_losses[key]) / len(val_losses[key])
             print("Epoch ", e + 1, " validation losses: ", avg_val_loss)
-            wandb.log({f"avg_{k}": avg_val_loss[k] for k in avg_val_loss.keys()}, step=e + 1)
+            wandb.log({f"avg_{k}": avg_val_loss[k] for k in avg_val_loss.keys()})
             avg_val_concept_loss = avg_val_loss["val_concept_loss"]
             avg_val_word_loss = avg_val_loss["val_word_loss"]
 
