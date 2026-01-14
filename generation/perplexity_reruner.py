@@ -1,6 +1,7 @@
 import wandb
 import argparse
 import os
+import tqdm
 os.environ["MKL_THREADING_LAYER"] = "GNU"
 parser = argparse.ArgumentParser()
 
@@ -41,11 +42,11 @@ for local_runs in os.listdir("."):
             print("Run already done, skipping:", run_name)
             continue
 
-        print("Checking run:", run_name)
+        # print("Checking run:", run_name)
         found = False
         for r in runs:
             if r.id == run_name:
-                print("Found matching wandb run, will be evaluated:", run_name)
+                # print("Found matching wandb run, will be evaluated:", run_name)
                 found = True
                 
                 ## best checkpoint will be one with largest epoch number but no "low_score" in the name
@@ -61,7 +62,7 @@ for local_runs in os.listdir("."):
                             best_epoch = epoch_num
                             
                 if best_epoch == -1:
-                    print("No valid checkpoint found for run, skipping:", run_name)
+                    # print("No valid checkpoint found for run, skipping:", run_name)
                     break
                 
                 ## get peft_path
@@ -77,12 +78,12 @@ for local_runs in os.listdir("."):
                 break
 
         if not found:
-            print("No matching wandb run found for, will be skipped:", run_name)
+            # print("No matching wandb run found for, will be skipped:", run_name)
             continue
 
-        
+print("Total number of chosen runs to be evaluated:", len(chosen_runs))
 ### need to run the inference for the chosen runs 1000 times and save it at perplexity_text/5uwsnbyp_generated_texts_<seed>_1000_runs.pkl
-for chosen_run in chosen_runs:
+for chosen_run in tqdm.tqdm(chosen_runs):
     print("Running inference for run:", chosen_run.id)
     hparam = chosen_run.config
     print("Hyperparameters:", hparam)
@@ -103,6 +104,5 @@ for chosen_run in chosen_runs:
     print("Calculating perplexity for run:", chosen_run.id)
     result = os.system(eval_cmd)
     print(f"Perplexity calculation command output status: {result}")
-    
-    break  # only do one run for testing TODO: remove this line to run all
+    print("Finished processing run:", chosen_run.id)
     
