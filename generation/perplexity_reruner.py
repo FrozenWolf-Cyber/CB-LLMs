@@ -1,7 +1,9 @@
 import wandb
 import argparse
 import os
+os.environ["MKL_THREADING_LAYER"] = "GNU"
 parser = argparse.ArgumentParser()
+
 
 parser.add_argument("--dataset", type=str, default="SetFit/sst2")
 parser.add_argument("--seed", type=int, default=42)
