@@ -10,7 +10,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 parser.add_argument("--dataset", type=str, default="SetFit/sst2")
 parser.add_argument("--max_length", type=int, default=1024)
 parser.add_argument("--path", type=str)
-
+parser.add_argument("--prefix", type=str, default="")
 
     
 
@@ -44,7 +44,7 @@ if __name__ == "__main__":
             perp = perplexity.compute(model_id='meta-llama/Meta-Llama-3-8B', max_length=100)['mean_perplexity']
             
             print("Perplexity under 30 tokens:", perp)
-            wandb.log({"perplexity_under_30_tokens": perp})
+            wandb.log({f"{args.prefix}perplexity_under_30_tokens": perp})
             
 
         import json
@@ -78,5 +78,5 @@ if __name__ == "__main__":
             perp = perplexity.compute(model_id='meta-llama/Meta-Llama-3-8B', max_length=100)['mean_perplexity']
             
             print("Perplexity all lengths:", perp)
-            wandb.log({"perplexity_all_tokens": perp})
+            wandb.log({f"{args.prefix}perplexity_all_tokens": perp})
     

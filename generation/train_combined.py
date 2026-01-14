@@ -206,7 +206,7 @@ if __name__ == "__main__":
             features = preLM(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"]).last_hidden_state
             concepts, unsup, vocabs, matched_unsup = cbl(features.float())
             # print("concepts shape in training loop:", concepts.shape)
-            # print("unsup shape in training loop:", unsup.shape)
+            # print("elastic_net_alphaunsup shape in training loop:", unsup.shape)
             # print("vocabs shape in training loop:", vocabs.shape)
             
             concept_loss = torch.nn.CrossEntropyLoss()(concepts[:, :-1, :].reshape(-1, len(concept_set)), concept_label.reshape(-1))
