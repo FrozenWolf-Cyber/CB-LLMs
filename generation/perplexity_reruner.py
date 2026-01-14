@@ -30,9 +30,13 @@ previously_done_runs = []
 for i in os.listdir("perplexity_text/"):
     if tag in i and i.endswith(".pkl"):
         run_name = i.split("_")[0]
+        
+        if f"{args.num_runs}_runs.pkl" not in i:
+            continue
+        
         previously_done_runs.append(run_name)
 ## get all available run in current dir:
-
+print("Previously done runs:", previously_done_runs)
 chosen_runs = []
 
 for local_runs in os.listdir("."):

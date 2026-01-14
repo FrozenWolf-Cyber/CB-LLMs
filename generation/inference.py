@@ -73,7 +73,7 @@ for i in range(args.num_runs):
         pred.append(tokenizer.decode(text_ids[0]))
 
 import pickle
-pickle.dump(pred, open(args.output_path.replace("XXXX", str(args.seed)), "wb"))
+pickle.dump(pred, open(args.output_path, "wb"))
 del preLM
 del cbl
 gc.collect()
