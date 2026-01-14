@@ -31,6 +31,7 @@ for i in os.listdir("perplexity_text/"):
 ## get all available run in current dir:
 
 chosen_runs = []
+
 for local_runs in os.listdir("."):
     if "from_pretained_llama3_lora_cbm_" in local_runs:
         run_name = local_runs.split("from_pretained_llama3_lora_cbm_")[1].split("/")[0]
@@ -44,6 +45,32 @@ for local_runs in os.listdir("."):
             if r.id == run_name:
                 print("Found matching wandb run, will be evaluated:", run_name)
                 found = True
+                
+                ## best checkpoint will be one with largest epoch number but no "low_score" in the name
+                subdir = local_runs + "/" + r.dataset.replace('/', '_')
+                best_epoch = -1
+                available_ckpt = os.listdir(subdir)
+                for ckpt in available_ckpt:
+                    if "low_score" in ckpt:
+                        continue
+                    if "epoch_" in ckpt:
+                        epoch_num = int(ckpt.split("epoch_")[1].split(".pt")[0])
+                        if epoch_num > best_epoch:
+                            best_epoch = epoch_num
+                            
+                if best_epoch == -1:
+                    print("No valid checkpoint found for run, skipping:", run_name)
+                    break
+                
+                ## get peft_path
+                peft_path = subdir + "/llama3_epoch_" + str(best_epoch)
+                r.config["peft_path"] = peft_path
+                
+                ## get cbl_path
+                cbl_path = subdir + "/cbl_epoch_" + str(best_epoch) + ".pt"
+                r.config["cbl_path"] = cbl_path
+                
+                
                 chosen_runs.append(r)
                 break
 
