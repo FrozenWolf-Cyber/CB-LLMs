@@ -102,3 +102,5 @@ for chosen_run in chosen_runs:
     result = os.system(eval_cmd)
     print(f"Perplexity calculation command output status: {result}")
     
+    break  # only do one run for testing TODO: remove this line to run all
+    
