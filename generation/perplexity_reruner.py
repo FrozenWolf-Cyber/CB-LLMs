@@ -47,7 +47,7 @@ for local_runs in os.listdir("."):
                 found = True
                 
                 ## best checkpoint will be one with largest epoch number but no "low_score" in the name
-                subdir = local_runs + "/" + r.dataset.replace('/', '_')
+                subdir = local_runs + "/" + r.config["dataset"].replace('/', '_')
                 best_epoch = -1
                 available_ckpt = os.listdir(subdir)
                 for ckpt in available_ckpt:
