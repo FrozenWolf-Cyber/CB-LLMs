@@ -82,8 +82,8 @@ for local_runs in os.listdir("."):
                 ## get peft_path
                 if args.last_epoch_only:
                     # cbl_low_score_epoch_3.pt
-                    cbl_path = subdir + "/cbl_low_score_epoch_" + best_epoch + ".pt"
-                    peft_path = subdir + "/llama3_low_score_epoch_" + best_epoch
+                    cbl_path = subdir + "/cbl_low_score_epoch_" + str(best_epoch) + ".pt"
+                    peft_path = subdir + "/llama3_low_score_epoch_" + str(best_epoch)
                 else:
                     # cbl_epoch_2.pt
                     cbl_path = subdir + "/cbl_epoch_" + str(best_epoch) + ".pt"
