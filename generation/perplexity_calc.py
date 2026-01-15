@@ -27,7 +27,7 @@ if __name__ == "__main__":
         pred_2 = pickle.load(open(args.path, "rb"))
         temp = []
         for p in pred_2:
-            if len(p.split()) < 30:
+            if len(p.split()) < 25:
                 temp.append(p)
     
         print("Filtered length:", len(temp))
