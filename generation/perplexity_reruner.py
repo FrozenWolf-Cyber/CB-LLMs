@@ -113,6 +113,8 @@ for chosen_run in tqdm.tqdm(chosen_runs):
     
 ## there ar some runs that have inference done but not perplexity calculation, need to check and run those as well
 unfinished_runs = []
+list(filter(lambda x: "1000_perplexity_under_30_tokens" in x.config, runs))
+
 for r in runs:
     if "1000_perplexity_under_30_tokens" not in r._attrs["summaryMetrics"]:
         unfinished_runs.append(r)
