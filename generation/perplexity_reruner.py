@@ -110,3 +110,20 @@ for chosen_run in tqdm.tqdm(chosen_runs):
     print(f"Perplexity calculation command output status: {result}")
     print("Finished processing run:", chosen_run.id)
     
+    
+## there ar some runs that have inference done but not perplexity calculation, need to check and run those as well
+unfinished_runs = []
+for r in runs:
+    if "1000_perplexity_under_30_tokens" not in r._attrs["summaryMetrics"]:
+        unfinished_runs.append(r)
+        
+print("Total number of unfinished runs to be evaluated for perplexity:", len(unfinished_runs))
+
+for unfinished_run in tqdm.tqdm(unfinished_runs):
+    print("Calculating perplexity for unfinished run:", unfinished_run.id)
+    eval_cmd = f"python perplexity_calc.py --path perplexity_text/{unfinished_run.id}_generated_texts_" + str(args.seed) + "_" + str(args.num_runs) + f"_runs.pkl --prefix {args.num_runs}_"
+    print("eval Command:", eval_cmd)
+    
+    result = os.system(eval_cmd)
+    print(f"Perplexity calculation command output status: {result}")
+    print("Finished processing unfinished run:", unfinished_run.id)
