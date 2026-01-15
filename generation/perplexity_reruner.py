@@ -2,6 +2,7 @@ import wandb
 import argparse
 import os
 import tqdm
+from config import epoch
 os.environ["MKL_THREADING_LAYER"] = "GNU"
 parser = argparse.ArgumentParser()
 
@@ -9,6 +10,7 @@ parser = argparse.ArgumentParser()
 parser.add_argument("--dataset", type=str, default="SetFit/sst2")
 parser.add_argument("--seed", type=int, default=42)
 parser.add_argument("--num_runs", type=int, default=1000)
+parser.add_argument("--last_epoch_only", action="store_true", default=False)
 args = parser.parse_args()
 api = wandb.Api()
 
@@ -29,6 +31,9 @@ tag = str(args.num_runs) + "_runs"
 previously_done_runs = []
 for i in os.listdir("perplexity_text/"):
     if tag in i and i.endswith(".pkl"):
+        if args.last_epoch_only:
+            if "last_epoch_only" not in i:
+                continue
         run_name = i.split("_")[0]
         
         if f"{args.num_runs}_runs.pkl" not in i:
@@ -52,22 +57,26 @@ for local_runs in os.listdir("."):
             if r.id == run_name:
                 # print("Found matching wandb run, will be evaluated:", run_name)
                 found = True
-                
-                ## best checkpoint will be one with largest epoch number but no "low_score" in the name
-                subdir = local_runs + "/" + r.config["dataset"].replace('/', '_')
                 best_epoch = -1
-                available_ckpt = os.listdir(subdir)
-                for ckpt in available_ckpt:
-                    if "low_score" in ckpt:
-                        continue
-                    if "epoch_" in ckpt:
-                        epoch_num = int(ckpt.split("epoch_")[1].split(".pt")[0])
-                        if epoch_num > best_epoch:
-                            best_epoch = epoch_num
-                            
-                if best_epoch == -1:
-                    # print("No valid checkpoint found for run, skipping:", run_name)
-                    break
+                if args.last_epoch_only:
+                    best_epoch = epoch[r.config["dataset"]]
+                    
+                else:
+                    ## best checkpoint will be one with largest epoch number but no "low_score" in the name
+                    subdir = local_runs + "/" + r.config["dataset"].replace('/', '_')
+                    best_epoch = -1
+                    available_ckpt = os.listdir(subdir)
+                    for ckpt in available_ckpt:
+                        if "low_score" in ckpt:
+                            continue
+                        if "epoch_" in ckpt:
+                            epoch_num = int(ckpt.split("epoch_")[1].split(".pt")[0])
+                            if epoch_num > best_epoch:
+                                best_epoch = epoch_num
+
+                    if best_epoch == -1:
+                        # print("No valid checkpoint found for run, skipping:", run_name)
+                        break
                 
                 ## get peft_path
                 peft_path = subdir + "/llama3_epoch_" + str(best_epoch)
@@ -96,10 +105,11 @@ for chosen_run in tqdm.tqdm(chosen_runs):
     hparam_str = ""
     for key in hparam.keys():
         hparam_str += " --" + str(key) + " " + str(hparam[key])
-    cmd = "python inference.py --seed " + str(args.seed) + " --num_runs " + str(args.num_runs) + f" --output_path perplexity_text/{chosen_run.id}_generated_texts_" + str(args.seed) + "_" + str(args.num_runs) + "_runs.pkl" + hparam_str
+    cmd = "python inference.py --seed " + str(args.seed) + " --num_runs " + str(args.num_runs) + f" --output_path perplexity_text/{chosen_run.id}_generated_texts_" + ("last_epoch_only" if args.last_epoch_only else "") + str(args.seed) + "_" + str(args.num_runs) + "_runs.pkl" + hparam_str
     print("inference Command:", cmd)
 
-    eval_cmd = f"python perplexity_calc.py --path perplexity_text/{chosen_run.id}_generated_texts_" + str(args.seed) + "_" + str(args.num_runs) + f"_runs.pkl --prefix {args.num_runs}_"
+    eval_cmd = f"python perplexity_calc.py --path perplexity_text/{chosen_run.id}_generated_texts_" + ("last_epoch_only" if args.last_epoch_only else "") + str(args.seed) + "_" + str(args.num_runs) + f"_runs.pkl --prefix {args.num_runs}_"
+    eval_cmd += "last_epoch_only" if args.last_epoch_only else "" ## prefix adjustment
     print("eval Command:", eval_cmd)
     
     os.system(cmd)
@@ -123,7 +133,8 @@ print("Total number of unfinished runs to be evaluated for perplexity:", len(unf
 
 for unfinished_run in tqdm.tqdm(unfinished_runs):
     print("Calculating perplexity for unfinished run:", unfinished_run.id)
-    eval_cmd = f"python perplexity_calc.py --path perplexity_text/{unfinished_run.id}_generated_texts_" + str(args.seed) + "_" + str(args.num_runs) + f"_runs.pkl --prefix {args.num_runs}_"
+    eval_cmd = f"python perplexity_calc.py --path perplexity_text/{unfinished_run.id}_generated_texts_" + ("last_epoch_only" if args.last_epoch_only else "") + str(args.seed) + "_" + str(args.num_runs) + f"_runs.pkl --prefix {args.num_runs}_"
+    eval_cmd += "last_epoch_only" if args.last_epoch_only else "" ## prefix adjustment
     print("eval Command:", eval_cmd)
     
     result = os.system(eval_cmd)
