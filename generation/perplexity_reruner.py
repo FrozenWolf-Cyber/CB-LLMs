@@ -80,18 +80,20 @@ for local_runs in os.listdir("."):
                         break
                 
                 ## get peft_path
-                if f"llama3_epoch_{best_epoch}" not in os.listdir(subdir):
-                    best_epoch = "low_score_epoch_" + str(best_epoch)
-                
-                peft_path = subdir + "/llama3_epoch_" + str(best_epoch)
+                if args.last_epoch_only:
+                    # cbl_low_score_epoch_3.pt
+                    cbl_path = subdir + "/cbl_low_score_epoch_" + best_epoch + ".pt"
+                    peft_path = subdir + "/llama3_low_score_epoch_" + best_epoch
+                else:
+                    # cbl_epoch_2.pt
+                    cbl_path = subdir + "/cbl_epoch_" + str(best_epoch) + ".pt"
+                    peft_path = subdir + "/llama3_epoch_" + str(best_epoch)
+                    
                 
                 r.config["peft_path"] = peft_path
-                
-                ## get cbl_path
-                cbl_path = subdir + "/cbl_epoch_" + str(best_epoch) + ".pt"
                 r.config["cbl_path"] = cbl_path
-                
-                
+                ## get cbl_path
+
                 chosen_runs.append(r)
                 print("Chosen run:", run_name, "cbl_path:", cbl_path, "peft_path:", peft_path)
                 break
