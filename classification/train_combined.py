@@ -99,7 +99,7 @@ def compute_loss(cbl_feature, batch_sim, pred, label, backbone_cbl, args, residu
     wandb_loss["concept_similarity"] = sim_loss.detach().cpu().numpy()
     
     if args.orthogonal_loss_weight>0 and feature_residual_matched is not None:
-        orthogonal_loss = F.cosine_similarity(cbl_feature, feature_residual_matched, dim=-1).mean()
+        orthogonal_loss = F.cosine_similarity(cbl_feature, feature_residual_matched, dim=-1).mean().abs()
         loss += args.orthogonal_loss_weight*orthogonal_loss
         wandb_loss["orthogonal"] = orthogonal_loss.detach().cpu().numpy()
         

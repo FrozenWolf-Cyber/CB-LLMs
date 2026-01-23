@@ -34,6 +34,9 @@ if __name__ == "__main__":
     print("preparing backbone")
     peft_path = "from_pretained_llama3_lora_cbm/" + args.dataset.replace('/', '_') + "/llama3"
     cbl_path = "from_pretained_llama3_lora_cbm/" + args.dataset.replace('/', '_') + "/cbl.pt"
+    
+    
+    
     preLM = LlamaModel.from_pretrained('meta-llama/Meta-Llama-3-8B', torch_dtype=torch.bfloat16).to(device)
     preLM.load_adapter(peft_path)
     preLM.eval()
@@ -41,24 +44,14 @@ if __name__ == "__main__":
     cbl.load_state_dict(torch.load(cbl_path, map_location=device))
     cbl.eval()
 
-    pred = []
     perplexity = evaluate.load("perplexity", module_type="metric")
     input_ids = torch.tensor([tokenizer.encode("")]).to(device)
     for i in range(100):
         print("example", str(i), end="\r")
         with torch.no_grad():
             text_ids, _ = cbl.generate(input_ids, preLM)
-            pred.append(tokenizer.decode(text_ids[0]))
-            if len(pred[-1].split()) > 30:
-                continue
-            perplexity.add_batch(predictions=[pred[i]])
+            perplexity.add_batch(predictions=[tokenizer.decode(text_ids[0])])
 
-
-    import pickle
-    pickle.dump(pred, open("generated_texts_3.pkl", "wb"))
-    del preLM
-    del cbl
-    gc.collect()
-    torch.cuda.empty_cache()
-
-    print(perplexity.compute(model_id='meta-llama/Meta-Llama-3-8B', max_length=100)['mean_perplexity'])
+    ## Here we use meta-llama/Meta-Llama-3-8B instead of base model
+    ## So just the text of trained model is used 
+    perplexity = perplexity.compute(model_id='meta-llama/Meta-Llama-3-8B', max_length=100)['mean_perplexity']

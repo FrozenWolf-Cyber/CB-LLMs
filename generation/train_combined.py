@@ -215,7 +215,7 @@ if __name__ == "__main__":
             reg = elastic_net_penalty(cbl.fc.weight[:, :len(concept_set)])
             
             if matched_unsup is not None:
-                orthogonal_loss = torch.cosine_similarity(concepts, matched_unsup, dim=-1).mean() ## TODO: check shape
+                orthogonal_loss = torch.cosine_similarity(concepts, matched_unsup, dim=-1).mean().abs() ## TODO: check shape
                 loss += args.orthogonal_loss_weight * orthogonal_loss
                 training_losses["orthogonal_loss"].append(orthogonal_loss.detach().cpu().numpy())
             
