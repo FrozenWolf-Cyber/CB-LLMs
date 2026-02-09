@@ -50,7 +50,7 @@ if __name__ == "__main__":
         print("example", str(i), end="\r")
         with torch.no_grad():
             text_ids, _ = cbl.generate(input_ids, preLM)
-            perplexity.add_batch(predictions=[tokenizer.decode(text_ids[0])])
+            perplexity.add_batch(predictions=[tokenizer.decode(text_ids[0], skip_special_tokens=True)])
 
     ## Here we use meta-llama/Meta-Llama-3-8B instead of base model
     ## So just the text of trained model is used 

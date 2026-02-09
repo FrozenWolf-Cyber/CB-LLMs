@@ -63,7 +63,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     set_seed(args.seed)
 
-    wandb.init(project="cbm-generation", name=f"train-{args.dataset}-seed{args.seed}",
+    wandb.init(project="cbm-generation-new", name=f"train-{args.dataset}-seed{args.seed}",
                config=vars(args))
     
     run_name = wandb.run.id
@@ -311,7 +311,7 @@ if __name__ == "__main__":
                     val_losses["val_residual_penalty_loss"].append(residual_penalty.detach().cpu().numpy())
                     
                 if matched_unsup is not None:
-                    orthogonal_loss = torch.cosine_similarity(concepts, matched_unsup, dim=-1).mean() ## TODO: check shape
+                    orthogonal_loss = torch.cosine_similarity(concepts, matched_unsup, dim=-1).mean().abs() ## TODO: check shape
                     val_losses["val_orthogonal_loss"].append(orthogonal_loss.detach().cpu().numpy())
                 
                 neg_entropy_loss = torch.sum(p * torch.log(p), dim=-1).mean()
