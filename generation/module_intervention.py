@@ -256,11 +256,11 @@ def test_llama3_custom_architecture():
     # Because 'intermediate' weights weren't in the checkpoint, they are currently RANDOM.
     # Random weights in the middle of a model = Gibberish.
     # We must initialize it to Identity so it doesn't break the pre-trained logic yet.
-    print(model.model.intermediate)
-    with torch.no_grad():
-        if isinstance(model.model.intermediate, torch.nn.Linear):
-            model.model.intermediate = nn.Identity()
-            print("[INFO] Initialized intermediate layer to Identity Matrix.")
+    # print(model.model.intermediate)
+    # with torch.no_grad():
+    #     if isinstance(model.model.intermediate, torch.nn.Linear):
+    #         model.model.intermediate = nn.Identity()
+    #         print("[INFO] Initialized intermediate layer to Identity Matrix.")
 
     # 4. Run Generation
     prompt = "The tallest mountain in the world is"
