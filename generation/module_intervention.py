@@ -116,7 +116,7 @@ class CustomLlamaModel(LlamaPreTrainedModel):
             for idx, decoder_layer in enumerate(self.layers[:self.where]):
                 if self.debug:
                     print(idx)
-                layer_outputs = decoder_layer(
+                hidden_states = decoder_layer(
                     hidden_states,
                     attention_mask=causal_mask,
                     position_ids=position_ids,
@@ -125,7 +125,6 @@ class CustomLlamaModel(LlamaPreTrainedModel):
                     position_embeddings=position_embeddings,
                     **kwargs,
                 )
-                hidden_states = layer_outputs[0]
 
 
         if self.debug:
@@ -138,7 +137,7 @@ class CustomLlamaModel(LlamaPreTrainedModel):
         # Subsequent layers (must track gradients to pass them backward)
         for idx in range(self.where, self.config.num_hidden_layers):
             decoder_layer = self.layers[idx]
-            layer_outputs = decoder_layer(
+            hidden_states = decoder_layer(
                 hidden_states,
                 attention_mask=causal_mask,
                 position_ids=position_ids,
@@ -147,7 +146,6 @@ class CustomLlamaModel(LlamaPreTrainedModel):
                 position_embeddings=position_embeddings,
                 **kwargs,
             )
-            hidden_states = layer_outputs[0]
 
         hidden_states = self.norm(hidden_states)
         return BaseModelOutputWithPast(
