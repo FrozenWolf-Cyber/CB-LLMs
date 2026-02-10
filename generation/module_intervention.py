@@ -36,7 +36,7 @@ class LlamaPreTrainedModel(PreTrainedModel):
 
 
 class CustomLlamaModel(LlamaPreTrainedModel):
-    def __init__(self, config: LlamaConfig, debug=True, where=24):
+    def __init__(self, config: LlamaConfig, debug=False, where=24):
         super().__init__(config)
         self.where = where
         self.debug = debug
@@ -114,8 +114,6 @@ class CustomLlamaModel(LlamaPreTrainedModel):
 
 
             for idx, decoder_layer in enumerate(self.layers[:self.where]):
-                if self.debug:
-                    print(idx)
                 hidden_states = decoder_layer(
                     hidden_states,
                     attention_mask=causal_mask,
@@ -267,7 +265,7 @@ def test_llama3_custom_architecture():
     print(model.model.intermediate)
     with torch.no_grad():
         if isinstance(model.model.intermediate, torch.nn.Linear):
-            model.model.intermediate = nn.Identity()
+            # model.model.intermediate = nn.Identity()
             print("[INFO] Initialized intermediate layer to Identity Matrix.")
 
     # 4. Run Generation
