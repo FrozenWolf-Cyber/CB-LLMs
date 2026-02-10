@@ -104,6 +104,8 @@ class CustomLlamaModel(LlamaModel):
 
         with torch.no_grad():
             for idx, decoder_layer in enumerate(self.layers[:self.where]):
+                if self.debug:
+                    print(idx)
                 layer_outputs = decoder_layer(
                     hidden_states,
                     attention_mask=causal_mask,
