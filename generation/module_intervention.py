@@ -228,48 +228,56 @@ class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
 
 
 import torch
-from transformers import LlamaConfig, AutoTokenizer
+from transformers import AutoTokenizer, LlamaConfig
 
-# Assuming your CustomLlamaModel and LlamaForCausalLM classes are defined above...
+# --- ASSUMING YOUR CustomLlamaModel AND LlamaForCausalLM CLASSES ARE DEFINED ABOVE ---
 
-def test_custom_model_debug():
-    print("--- Starting Test ---")
+def test_llama3_custom_architecture():
+    model_id = 'meta-llama/Meta-Llama-3-8B'
     
-    # 1. Setup a tiny configuration to save memory/time
-    config = LlamaConfig(
-        vocab_size=32000,
-        hidden_size=512,
-        intermediate_size=1024,
-        num_hidden_layers=4, # Small number of layers
-        num_attention_heads=8,
-        num_key_value_heads=4,
+    print(f"Loading tokenizer for {model_id}...")
+    tokenizer = AutoTokenizer.from_pretrained(model_id)
+    
+    # 1. Load the model using YOUR custom class
+    # We use strict=False so it ignores the fact that 'model.intermediate' is missing in Meta's weights
+    print("Loading custom model with pretrained weights (this may take a minute)...")
+    model = LlamaForCausalLM.from_pretrained(
+        model_id,
+        torch_dtype=torch.bfloat16,
+        device_map="auto",
+        strict=False 
     )
-    
-    # 2. Initialize the model with debug=True
-    # We set 'where=2' so it triggers in the middle of our 4 layers
-    model = LlamaForCausalLM(config)
+
+    # 2. Setup Debugging
     model.model.debug = True
-    model.model.where = 2
-    model.eval() # Generation usually happens in eval mode
+    model.model.where = 16  # Place the intermediate layer in the middle (Llama-3-8B has 32 layers)
+    model.eval()
 
-    # 3. Prepare a dummy input
-    # Note: In a real scenario, you'd use a tokenizer, 
-    # but for a shape test, raw tensors work.
-    input_ids = torch.randint(0, config.vocab_size, (1, 10)) 
-    
-    print(f"Running generate() with debug=True and where={model.model.where}...")
-    
-    # 4. Run generate
-    # max_new_tokens=2 will trigger the forward pass twice
-    output = model.generate(
-        input_ids, 
-        max_new_tokens=2, 
+    # 3. INITIALIZATION CRITICAL STEP
+    # Because 'intermediate' weights weren't in the checkpoint, they are currently RANDOM.
+    # Random weights in the middle of a model = Gibberish.
+    # We must initialize it to Identity so it doesn't break the pre-trained logic yet.
+    print(model.model.intermediate)
+    with torch.no_grad():
+        if isinstance(model.model.intermediate, torch.nn.Linear):
+            model.model.intermediate = nn.Identity()
+            print("[INFO] Initialized intermediate layer to Identity Matrix.")
+
+    # 4. Run Generation
+    prompt = "The tallest mountain in the world is"
+    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+
+    print("\n--- Starting Generation ---")
+    output_tokens = model.generate(
+        **inputs,
+        max_new_tokens=15,
         do_sample=False,
-        use_cache=True # This tests if your cache logic in forward holds up
+        use_cache=True
     )
 
-    print("--- Test Completed ---")
-    print(f"Output shape: {output.shape}")
+    result = tokenizer.decode(output_tokens[0], skip_special_tokens=True)
+    print(f"\nResult: {result}")
+    print("--- Test Finished ---")
 
 if __name__ == "__main__":
-    test_custom_model_debug()
+    test_llama3_custom_architecture()
