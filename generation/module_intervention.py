@@ -68,67 +68,35 @@ class CustomLlamaModel(LlamaModel):
         use_cache: Optional[bool] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> BaseModelOutputWithPast:
-        if (input_ids is None) ^ (inputs_embeds is not None):
-            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
+        if inputs_embeds is None:
+            inputs_embeds: torch.Tensor = self.embed_tokens(input_ids)
 
-        with torch.no_grad():
-            if inputs_embeds is None:
-                inputs_embeds: torch.Tensor = self.embed_tokens(input_ids)
+        if use_cache and past_key_values is None:
+            past_key_values = DynamicCache()
 
-            if use_cache and past_key_values is None:
-                past_key_values = DynamicCache()
-
-            if cache_position is None:
-                past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
-                cache_position: torch.Tensor = torch.arange(
-                    past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
-                )
-
-            if position_ids is None:
-                position_ids = cache_position.unsqueeze(0)
-
-            causal_mask = create_causal_mask(
-                config=self.config,
-                input_embeds=inputs_embeds,
-                attention_mask=attention_mask,
-                cache_position=cache_position,
-                past_key_values=past_key_values,
-                position_ids=position_ids,
+        if cache_position is None:
+            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+            cache_position: torch.Tensor = torch.arange(
+                past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
             )
 
-            hidden_states = inputs_embeds
-            position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        if position_ids is None:
+            position_ids = cache_position.unsqueeze(0)
 
+        causal_mask = create_causal_mask(
+            config=self.config,
+            input_embeds=inputs_embeds,
+            attention_mask=attention_mask,
+            cache_position=cache_position,
+            past_key_values=past_key_values,
+            position_ids=position_ids,
+        )
 
+        hidden_states = inputs_embeds
+        position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
-
-        with torch.no_grad():
-            for idx, decoder_layer in enumerate(self.layers[:self.where]):
-                if self.debug:
-                    print(idx)
-                layer_outputs = decoder_layer(
-                    hidden_states,
-                    attention_mask=causal_mask,
-                    position_ids=position_ids,
-                    past_key_value=past_key_values,
-                    cache_position=cache_position,
-                    position_embeddings=position_embeddings,
-                    **kwargs,
-                )
-                hidden_states = layer_outputs[0]
-
-
-        if self.debug:
-            print(f"[LOG] TRIGGERED INTERMEDIATE AT LAYER {self.where}")
-            print(hidden_states.shape)
-
-        # Trainable layer
-        hidden_states = self.intermediate(hidden_states)
-
-        # Subsequent layers (must track gradients to pass them backward)
-        for idx in range(self.where, self.config.num_hidden_layers):
-            decoder_layer = self.layers[idx]
-            layer_outputs = decoder_layer(
+        for decoder_layer in self.layers[: self.config.num_hidden_layers]:
+            hidden_states = decoder_layer(
                 hidden_states,
                 attention_mask=causal_mask,
                 position_ids=position_ids,
@@ -137,14 +105,12 @@ class CustomLlamaModel(LlamaModel):
                 position_embeddings=position_embeddings,
                 **kwargs,
             )
-            hidden_states = layer_outputs[0]
 
         hidden_states = self.norm(hidden_states)
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=past_key_values,
         )
-
 
 
 class CustomLlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
@@ -241,7 +207,7 @@ def test_llama3_custom_architecture():
     # 1. Load the model using YOUR custom class
     # We use strict=False so it ignores the fact that 'model.intermediate' is missing in Meta's weights
     print("Loading custom model with pretrained weights (this may take a minute)...")
-    model = LlamaForCausalLM.from_pretrained(
+    model = CustomLlamaForCausalLM.from_pretrained(
         model_id,
         torch_dtype=torch.bfloat16,
         device_map="auto",
@@ -256,11 +222,11 @@ def test_llama3_custom_architecture():
     # Because 'intermediate' weights weren't in the checkpoint, they are currently RANDOM.
     # Random weights in the middle of a model = Gibberish.
     # We must initialize it to Identity so it doesn't break the pre-trained logic yet.
-    # print(model.model.intermediate)
-    # with torch.no_grad():
-    #     if isinstance(model.model.intermediate, torch.nn.Linear):
-    #         model.model.intermediate = nn.Identity()
-    #         print("[INFO] Initialized intermediate layer to Identity Matrix.")
+    print(model.model.intermediate)
+    with torch.no_grad():
+        if isinstance(model.model.intermediate, torch.nn.Linear):
+            model.model.intermediate = nn.Identity()
+            print("[INFO] Initialized intermediate layer to Identity Matrix.")
 
     # 4. Run Generation
     prompt = "The tallest mountain in the world is"
