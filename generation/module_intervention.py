@@ -14,7 +14,7 @@ from transformers.utils import TransformersKwargs, can_return_tuple
 from transformers.masking_utils import create_causal_mask
 from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.models.llama.configuration_llama import LlamaConfig
-from transformers.models.llama.modeling_llama import LlamaDecoderLayer, LlamaAttention
+from transformers.models.llama.modeling_llama import LlamaDecoderLayer, LlamaAttention, LlamaRMSNorm, LlamaRotaryEmbedding
 from transformers.generation import GenerationMixin
 
 class LlamaPreTrainedModel(PreTrainedModel):
@@ -35,8 +35,8 @@ class LlamaPreTrainedModel(PreTrainedModel):
     }
 
 
-class CustomLlamaModel(LlamaModel):
-    def __init__(self, config, debug=False, where=24):
+class CustomLlamaModel(LlamaPreTrainedModel):
+    def __init__(self, config: LlamaConfig, debug=True, where=24):
         super().__init__(config)
         self.where = where
         self.debug = debug
@@ -49,6 +49,18 @@ class CustomLlamaModel(LlamaModel):
             config.hidden_size,
             bias=False
         )
+        self.padding_idx = config.pad_token_id
+        self.vocab_size = config.vocab_size
+
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
+        self.layers = nn.ModuleList(
+            [LlamaDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
+        )
+        self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.rotary_emb = LlamaRotaryEmbedding(config=config)
+        self.gradient_checkpointing = False
+
+        self.post_init()
 
         # freeze everything except new layer
         for p in self.parameters():
@@ -68,35 +80,64 @@ class CustomLlamaModel(LlamaModel):
         use_cache: Optional[bool] = None,
         **kwargs: Unpack[TransformersKwargs],
     ) -> BaseModelOutputWithPast:
-        if inputs_embeds is None:
-            inputs_embeds: torch.Tensor = self.embed_tokens(input_ids)
+        if (input_ids is None) ^ (inputs_embeds is not None):
+            raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
-        if use_cache and past_key_values is None:
-            past_key_values = DynamicCache()
+        with torch.no_grad():
+            if inputs_embeds is None:
+                inputs_embeds: torch.Tensor = self.embed_tokens(input_ids)
 
-        if cache_position is None:
-            past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
-            cache_position: torch.Tensor = torch.arange(
-                past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
+            if use_cache and past_key_values is None:
+                past_key_values = DynamicCache()
+
+            if cache_position is None:
+                past_seen_tokens = past_key_values.get_seq_length() if past_key_values is not None else 0
+                cache_position: torch.Tensor = torch.arange(
+                    past_seen_tokens, past_seen_tokens + inputs_embeds.shape[1], device=inputs_embeds.device
+                )
+
+            if position_ids is None:
+                position_ids = cache_position.unsqueeze(0)
+
+            causal_mask = create_causal_mask(
+                config=self.config,
+                input_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                cache_position=cache_position,
+                past_key_values=past_key_values,
+                position_ids=position_ids,
             )
 
-        if position_ids is None:
-            position_ids = cache_position.unsqueeze(0)
+            hidden_states = inputs_embeds
+            position_embeddings = self.rotary_emb(hidden_states, position_ids)
 
-        causal_mask = create_causal_mask(
-            config=self.config,
-            input_embeds=inputs_embeds,
-            attention_mask=attention_mask,
-            cache_position=cache_position,
-            past_key_values=past_key_values,
-            position_ids=position_ids,
-        )
 
-        hidden_states = inputs_embeds
-        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+            for idx, decoder_layer in enumerate(self.layers[:self.where]):
+                if self.debug:
+                    print(idx)
+                layer_outputs = decoder_layer(
+                    hidden_states,
+                    attention_mask=causal_mask,
+                    position_ids=position_ids,
+                    past_key_value=past_key_values,
+                    cache_position=cache_position,
+                    position_embeddings=position_embeddings,
+                    **kwargs,
+                )
+                hidden_states = layer_outputs[0]
 
-        for decoder_layer in self.layers[: self.config.num_hidden_layers]:
-            hidden_states = decoder_layer(
+
+        if self.debug:
+            print(f"[LOG] TRIGGERED INTERMEDIATE AT LAYER {self.where}")
+            print(hidden_states.shape)
+
+        # Trainable layer
+        hidden_states = self.intermediate(hidden_states)
+
+        # Subsequent layers (must track gradients to pass them backward)
+        for idx in range(self.where, self.config.num_hidden_layers):
+            decoder_layer = self.layers[idx]
+            layer_outputs = decoder_layer(
                 hidden_states,
                 attention_mask=causal_mask,
                 position_ids=position_ids,
@@ -105,12 +146,14 @@ class CustomLlamaModel(LlamaModel):
                 position_embeddings=position_embeddings,
                 **kwargs,
             )
+            hidden_states = layer_outputs[0]
 
         hidden_states = self.norm(hidden_states)
         return BaseModelOutputWithPast(
             last_hidden_state=hidden_states,
             past_key_values=past_key_values,
         )
+
 
 
 class CustomLlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
