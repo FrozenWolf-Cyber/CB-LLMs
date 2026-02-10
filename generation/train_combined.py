@@ -469,7 +469,7 @@ if __name__ == "__main__":
         print("example", str(i), end="\r")
         with torch.no_grad():
             text_ids, _ = cbl.generate(input_ids, preLM)
-            pred.append(tokenizer.decode(text_ids[0]))
+            pred.append(tokenizer.decode(text_ids[0], skip_special_tokens=True ))
             if len(pred[-1].split()) > 30:
                 continue
             perplexity.add_batch(predictions=[pred[i]])
