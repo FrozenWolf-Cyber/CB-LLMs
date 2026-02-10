@@ -6,7 +6,7 @@ from utils import top_k_top_p_filtering
 from typing import Callable, Optional, Union
 import torch
 import torch.nn as nn
-from transformers.models.llama.modeling_llama import LlamaModel
+from transformers.models.llama.modeling_llama import LlamaModel, LlamaForCausalLM
 from transformers.modeling_outputs import BaseModelOutputWithPast
 from transformers.cache_utils import Cache, DynamicCache
 from transformers.processing_utils import Unpack
@@ -147,7 +147,7 @@ class CustomLlamaModel(LlamaModel):
 
 
 
-class LlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
+class CustomLlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
     _tied_weights_keys = ["lm_head.weight"]
     _tp_plan = {"lm_head": "colwise_rep"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
