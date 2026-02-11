@@ -18,7 +18,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     run_name = args.path.split("/")[-1].split("_")[0]
     print("Run name:", run_name)
-    with wandb.init(entity="frozenwolf", project="cbm-generation", id=run_name, resume="must") as run:
+    with wandb.init(entity="frozenwolf", project="cbm-generation-new", id=run_name, resume="must") as run:
         os.environ["TOKENIZERS_PARALLELISM"] = "false"
     
     
