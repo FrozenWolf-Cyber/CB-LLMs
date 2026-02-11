@@ -14,7 +14,7 @@ parser.add_argument("--last_epoch_only", action="store_true", default=False)
 args = parser.parse_args()
 api = wandb.Api()
 
-run = api.runs("frozenwolf/cbm-generation")
+run = api.runs("frozenwolf/cbm-generation-new")
 runs = list(run)
 
 # >>> r[0].config
