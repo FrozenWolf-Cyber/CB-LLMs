@@ -70,7 +70,7 @@ for i in range(args.num_runs):
     print("example", str(i), end="\r")
     with torch.no_grad():
         text_ids, _ = cbl.generate(input_ids, preLM)
-        pred.append(tokenizer.decode(text_ids[0]))
+        pred.append(tokenizer.decode(text_ids[0], skip_special_tokens=True))
 
 import pickle
 pickle.dump(pred, open(args.output_path, "wb"))
