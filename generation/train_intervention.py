@@ -341,13 +341,13 @@ if __name__ == "__main__":
                 best_epoch = e + 1
                 print("save model")
                 best_loss = avg_val_loss
-                preLM.save_pretrained(prefix + model_name + "_epoch_" + str(e + 1))
+                torch.save(preLM.intermediate.state_dict(), prefix + model_name + "_epoch_" + str(e + 1))
                 wandb.log({"best_model_epoch": e + 1})
             else:
-                preLM.save_pretrained(prefix + model_name + "_low_score_epoch_" + str(e + 1))
+                torch.save(preLM.intermediate.state_dict(), prefix + model_name + "_low_score_epoch_" + str(e + 1))
         else:
             print("save model")
-            preLM.save_pretrained(prefix + model_name + "_epoch_" + str(e + 1))
+            torch.save(preLM.intermediate.state_dict(), prefix + model_name + "_epoch_" + str(e + 1))
 
         if args.DEBUG:
             break
@@ -365,7 +365,8 @@ if __name__ == "__main__":
     
     ## lOAD BEST MODEL AND
     best_path = prefix + model_name + "_epoch_" + str(best_epoch)
-    preLM = CustomLlamaModel.from_pretrained(best_path, torch_dtype=torch.bfloat16).to(device)
+    state_dict = torch.load(best_path, map_location=device)  # or "cuda" if needed
+    preLM.intermediate.load_state_dict(state_dict)
     preLM.eval()
     preLM_generator.model = preLM
     preLM_generator.eval()
