@@ -41,7 +41,7 @@ parser.add_argument("--generation_recon_loss", type=float, default=1.0)
 
 parser.add_argument("--cyclic_loss", type=float, default=1.0)
 parser.add_argument("--intervention_gen_loss", type=float, default=1.0)
-
+parser.add_argument("--epoch", type=int, default=10)
 parser.add_argument("--intervention_margin", type=float, default=10.0)
 parser.add_argument("--intervention_spread", type=float, default=2.0)
 
@@ -197,7 +197,7 @@ if __name__ == "__main__":
 
     start = time.time()
     best_epoch = -1
-    epochs = CFG.epoch[args.dataset]
+    epochs = args.epoch
     
     
     reconstr_crit = torch.nn.MSELoss()
