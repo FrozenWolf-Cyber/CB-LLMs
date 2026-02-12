@@ -387,56 +387,56 @@ if __name__ == "__main__":
 
     acc_metric = evaluate.load("accuracy")
 
-    # with torch.no_grad():
-    #     for i in tqdm(range(100 // len(concept_set))):
-    #         print("example", str(i), end="\r")
-    #         input_ids = torch.tensor([tokenizer.encode("")]).to(device)
-    #         attention_mask = (input_ids != tokenizer.pad_token_id).long()
-    #         for j in range(len(concept_set)):
-    #             # original vector: one-hot for the concept
-    #             v = [0] * len(concept_set)  # all concepts suppressed
-    #             v[j] = 1                    # activate target concept j
-    #             B, T = input_ids.shape
-    #             intervene_tensor = torch.tensor(v, device=device).view(1, 1, -1).expand(B, T, len(concept_set))
+    with torch.no_grad():
+        for i in tqdm(range(100 // len(concept_set))):
+            print("example", str(i), end="\r")
+            input_ids = torch.tensor([tokenizer.encode("")]).to(device)
+            attention_mask = (input_ids != tokenizer.pad_token_id).long()
+            for j in range(len(concept_set)):
+                # original vector: one-hot for the concept
+                v = [0] * len(concept_set)  # all concepts suppressed
+                v[j] = 1                    # activate target concept j
+                B, T = input_ids.shape
+                intervene_tensor = torch.tensor(v, device=device).view(1, 1, -1).expand(B, T, len(concept_set))
 
-    #             preLM_generator.model.intervene = intervene_tensor
-    #             preLM_generator.model.intervention_margin = args.intervention_margin
-    #             preLM_generator.model.intervention_spread = args.intervention_spread
-    #             print("Gen")
-    #             with torch.amp.autocast(device_type=device_str, dtype=torch.bfloat16):
-    #                 output_tokens = preLM_generator.generate(
-    #                                     input_ids,
-    #                                     attention_mask=attention_mask,       # must pass if padding exists
-    #                                     use_cache=True,
-    #                                     max_new_tokens=100,                  # instead of length
-    #                                     temperature=0.7,                     # temp -> temperature
-    #                                     top_k=100,                           # topk -> top_k
-    #                                     top_p=0.9,                           # topp -> top_p
-    #                                     repetition_penalty=1.5,
-    #                                     pad_token_id=128001                   # set pad_token_id to avoid warnings
-    #                                 )
-    #             preLM_generator.model.intervene = None
-    #             decoded_text = tokenizer.decode(output_tokens[0], skip_special_tokens=True)
-    #             print(f"Class {concept_set[j]}: {decoded_text}")
-    #             text.append(decoded_text)
+                preLM_generator.model.intervene = intervene_tensor
+                preLM_generator.model.intervention_margin = args.intervention_margin
+                preLM_generator.model.intervention_spread = args.intervention_spread
+                print("Gen")
+                with torch.amp.autocast(device_type=device_str, dtype=torch.bfloat16):
+                    output_tokens = preLM_generator.generate(
+                                        input_ids,
+                                        attention_mask=attention_mask,       # must pass if padding exists
+                                        use_cache=True,
+                                        max_new_tokens=100,                  # instead of length
+                                        temperature=0.7,                     # temp -> temperature
+                                        top_k=100,                           # topk -> top_k
+                                        top_p=0.9,                           # topp -> top_p
+                                        repetition_penalty=1.5,
+                                        pad_token_id=128001                   # set pad_token_id to avoid warnings
+                                    )
+                preLM_generator.model.intervene = None
+                decoded_text = tokenizer.decode(output_tokens[0], skip_special_tokens=True)
+                print(f"Class {concept_set[j]}: {decoded_text}")
+                text.append(decoded_text)
 
-    #             roberta_text_ids = torch.tensor([roberta_tokenizer.encode(decoded_text)]).to(device)
-    #             roberta_attention_mask = torch.ones_like(roberta_text_ids)
-    #             roberta_input = {"input_ids": roberta_text_ids, "attention_mask": roberta_attention_mask}
+                roberta_text_ids = torch.tensor([roberta_tokenizer.encode(decoded_text)]).to(device)
+                roberta_attention_mask = torch.ones_like(roberta_text_ids)
+                roberta_input = {"input_ids": roberta_text_ids, "attention_mask": roberta_attention_mask}
 
-    #             logits = classifier(roberta_input)
-    #             pred.append(logits)
+                logits = classifier(roberta_input)
+                pred.append(logits)
 
 
-    # pred = torch.cat(pred, dim=0).detach().cpu()
-    # pred_labels = np.argmax(pred.numpy(), axis=-1)
+    pred = torch.cat(pred, dim=0).detach().cpu()
+    pred_labels = np.argmax(pred.numpy(), axis=-1)
 
-    # refs = list(range(len(concept_set))) * (100 // len(concept_set))
-    # acc_metric.add_batch(predictions=pred_labels, references=refs)
-    # accuracy = acc_metric.compute()
+    refs = list(range(len(concept_set))) * (100 // len(concept_set))
+    acc_metric.add_batch(predictions=pred_labels, references=refs)
+    accuracy = acc_metric.compute()
 
-    # print("Steerability test accuracy:", accuracy)
-    # wandb.log({"steerability_test_accuracy": accuracy})
+    print("Steerability test accuracy:", accuracy)
+    wandb.log({"steerability_test_accuracy": accuracy})
 
     
     
