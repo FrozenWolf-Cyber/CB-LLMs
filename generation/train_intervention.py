@@ -395,7 +395,7 @@ if __name__ == "__main__":
                 # original vector: one-hot for the concept
                 v = [0] * len(concept_set)  # all concepts suppressed
                 v[j] = 1                    # activate target concept j
-                B, T, _ = input_ids.shape
+                B, T = input_ids.shape
                 intervene_tensor = torch.tensor(v, device=device).view(1, 1, -1).expand(B, T, len(concept_set))
 
                 preLM_generator.model.intervene = intervene_tensor
