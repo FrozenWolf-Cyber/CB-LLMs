@@ -168,7 +168,7 @@ if __name__ == "__main__":
     # preLM = get_peft_model(preLM, lora_config)
     # preLM.print_trainable_parameters()
     # lora_layers = filter(lambda p: p.requires_grad, preLM.parameters())
-    opt_prelm = torch.optim.Adam(preLM.intermediate, lr=5e-5)
+    opt_prelm = torch.optim.Adam(preLM.intermediate.parameters(), lr=5e-5)
     
     # if args.discrimination_loss > 0:
     #     cbl = CBL(config, len(concept_set), tokenizer).to(device)
