@@ -28,6 +28,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 device_str = "cuda" if torch.cuda.is_available() else "cpu"
 parser.add_argument("--dataset", type=str, default="SetFit/sst2")
 parser.add_argument("--batch_size", type=int, default=4)
+parser.add_argument("--lr", type=float, default=1e-4)
 parser.add_argument("--max_length", type=int, default=350)
 parser.add_argument("--num_workers", type=int, default=0)
 parser.add_argument("--seed", type=int, default=42)
@@ -171,7 +172,7 @@ if __name__ == "__main__":
     # preLM = get_peft_model(preLM, lora_config)
     # preLM.print_trainable_parameters()
     # lora_layers = filter(lambda p: p.requires_grad, preLM.parameters())
-    opt_prelm = torch.optim.Adam(preLM.intermediate.parameters(), lr=5e-5)
+    opt_prelm = torch.optim.Adam(preLM.intermediate.parameters(), lr=args.lr)
     
     # if args.discrimination_loss > 0:
     #     cbl = CBL(config, len(concept_set), tokenizer).to(device)
