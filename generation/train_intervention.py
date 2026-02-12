@@ -71,7 +71,7 @@ if __name__ == "__main__":
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
     args = parser.parse_args()
     set_seed(args.seed)
-    scaler = GradScaler()
+    scaler = torch.amp.GradScaler(device_str)
 
     wandb.init(project="cbm-generation-new", name=f"train-{args.dataset}-seed{args.seed}",
                config=vars(args))
@@ -243,7 +243,7 @@ if __name__ == "__main__":
                                    args=args,
                                )
                 
-                scaler.scale(loss_dict["loss"]).backward()
+                scaler.scale(training_losses["loss"]).backward()
                 scaler.step(opt_prelm)
                 scaler.update()
                 opt_prelm.zero_grad()
