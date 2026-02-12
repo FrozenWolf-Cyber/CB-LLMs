@@ -357,12 +357,14 @@ if __name__ == "__main__":
     
     ## delete previous models to save space
     import gc
-    del preLM, opt_prelm
+    del preLM, opt_prelm, loss_dict
     
 
     torch.cuda.empty_cache()
     gc.collect()
-    
+    preLM = CustomLlamaModel.from_pretrained('meta-llama/Meta-Llama-3-8B', torch_dtype=torch.bfloat16)
+    preLM.create_intermediate(args.intermediate_loc, len(concept_set))
+    preLM.to(device)
     ## lOAD BEST MODEL AND
     best_path = prefix + model_name + "_epoch_" + str(best_epoch)
     state_dict = torch.load(best_path, map_location=device)  # or "cuda" if needed
