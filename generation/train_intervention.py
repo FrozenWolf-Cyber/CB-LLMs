@@ -73,7 +73,7 @@ if __name__ == "__main__":
     set_seed(args.seed)
     scaler = torch.amp.GradScaler("cuda")
 
-    wandb.init(project="cbm-generation-new", name=f"train-{args.dataset}-seed{args.seed}",
+    wandb.init(project="cbm-generation-new", name=f"intervention-{args.dataset}-{args.seed}",
                config=vars(args))
     
     run_name = wandb.run.id
