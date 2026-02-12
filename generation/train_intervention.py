@@ -298,7 +298,8 @@ if __name__ == "__main__":
                 )
 
                 with torch.no_grad():
-                    loss_dict = compute_training_losses(
+                    with autocast(device_type="cuda", dtype=torch.bfloat16):
+                        loss_dict = compute_training_losses(
                         batch=batch,
                         preLM=preLM,
                         preLM_generator=preLM_generator,
