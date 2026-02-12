@@ -417,8 +417,8 @@ class CustomLlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
 
 def compute_training_losses(
     batch,
-    preLM:CustomLlamaModel,
-    preLM_generator:CustomLlamaForCausalLM,
+    preLM: CustomLlamaModel,
+    preLM_generator: CustomLlamaForCausalLM,
     reconstr_crit,
     CSE_crit,
     concept_label,
@@ -429,188 +429,113 @@ def compute_training_losses(
 ):
     """
     Computes all training losses for the concept-intervention model.
-
-    Expected tensor shapes:
-        input_ids          : (B, T)
-        attention_mask     : (B, T)
-        concept_label      : (B, T-1)
-        word_label         : (B, T-1)
     """
 
     # ============================================================
     # 1. FIRST HALF FORWARD (encoder side)
     # ============================================================
 
-    # pre_hidden_states : (B, T, H)
-    # concepts          : (B, T, C)
-    # skips             : model dependent
-    # causal_mask       : (B, 1, T, T) or compatible
-    # position_embeddings : (B, T, H)
     pre_hidden_states, causal_mask, position_embeddings = (
         preLM.firsthalf_forward(
             input_ids=batch["input_ids"],
             attention_mask=batch["attention_mask"],
         )
     )
+    print("pre_hidden_states:", pre_hidden_states.shape)
+    print("causal_mask:", causal_mask.shape)
+    print("position_embeddings:", position_embeddings.shape)
 
     # Encode into concept space
-    # concepts : (B, T, C)
     concepts, skips = preLM.intermediate.encode(pre_hidden_states)
+    print("concepts:", concepts.shape)
+    print("skips:", [s.shape for s in skips] if isinstance(skips, (list, tuple)) else skips.shape)
 
     # Decode back to hidden space
-    # post_hidden_states : (B, T, H)
-    post_hidden_states = preLM.intermediate.decode(
-        pre_hidden_states, concepts, skips
-    )
+    post_hidden_states = preLM.intermediate.decode(pre_hidden_states, concepts, skips)
+    print("post_hidden_states:", post_hidden_states.shape)
 
     # ============================================================
     # 2. CONCEPT LOSS
     # ============================================================
 
-    # concepts[:, :-1, :] : (B, T-1, C)
-    # reshape -> (B*(T-1), C)
-    # concept_label -> (B*(T-1))
     concept_loss = CSE_crit(
         concepts[:, :-1, :].reshape(-1, len(concept_set)),
         concept_label.reshape(-1),
     )
+    print("concept_label:", concept_label.shape)
+    print("concept_loss input:", concepts[:, :-1, :].shape)
 
     # ============================================================
     # 3. RECONSTRUCTION LOSSES
     # ============================================================
 
-    # ------------------------------------------------------------
-    # 3.1 Encoder-decoder reconstruction
-    # ------------------------------------------------------------
-    # both tensors : (B, T-1, H)
     intermediate_reconstruction_loss = reconstr_crit(
         post_hidden_states[:, :-1, :],
         pre_hidden_states[:, :-1, :].detach(),
     )
+    print("intermediate_reconstruction_loss input:", post_hidden_states[:, :-1, :].shape)
 
-    # ------------------------------------------------------------
-    # 3.2 Generation reconstruction (KL divergence)
-    # ------------------------------------------------------------
-
-    # hidden states after decoder
-    # (B, T, H)
     vocabs_reconstr = preLM.secondhalf_forward(
-        post_hidden_states,
-        causal_mask,
-        position_embeddings,
+        post_hidden_states, causal_mask, position_embeddings
     ).last_hidden_state
-
-    # original hidden states
-    # (B, T, H)
     vocabs_org = preLM.secondhalf_forward(
-        pre_hidden_states,
-        causal_mask,
-        position_embeddings,
-    ).last_hidden_state
+        pre_hidden_states, causal_mask, position_embeddings
+    ).last_hidden_state.detach()
+    print("vocabs_reconstr:", vocabs_reconstr.shape)
+    print("vocabs_org:", vocabs_org.shape)
 
-    vocabs_org = vocabs_org.detach()
+    log_probs_org = F.log_softmax(preLM_generator.lm_head(vocabs_org), dim=-1)
+    log_probs_reconstr = F.log_softmax(preLM_generator.lm_head(vocabs_reconstr), dim=-1)
+    print("log_probs_org:", log_probs_org.shape)
+    print("log_probs_reconstr:", log_probs_reconstr.shape)
 
-    # logits -> log probs
-    # (B, T, V)
-    log_probs_org = F.log_softmax(
-        preLM_generator.lm_head(vocabs_org), dim=-1
-    )
-    log_probs_reconstr = F.log_softmax(
-        preLM_generator.lm_head(vocabs_reconstr), dim=-1
-    )
-
-    # KL over vocabulary dimension
-    # input shapes : (B, T-1, V)
     generation_reconstruction_loss = F.kl_div(
         log_probs_reconstr[:, :-1, :],
         log_probs_org[:, :-1, :],
         log_target=True,
         reduction="batchmean",
     )
+    print("generation_reconstruction_loss input:", log_probs_reconstr[:, :-1, :].shape)
 
     # ============================================================
     # 4. INTERVENTION LOSSES
     # ============================================================
 
-    # ------------------------------------------------------------
-    # 4.0 Prepare labels for intervention
-    # ------------------------------------------------------------
-
-    # concept_label_expanded : (B, T-1, 1)
     concept_label_expanded = concept_label.unsqueeze(-1)
+    pad = torch.full((concept_label_expanded.size(0), 1, 1), -100, device=concept_label_expanded.device)
+    concept_label_expanded = torch.cat([concept_label_expanded, pad], dim=1)
+    print("concept_label_expanded:", concept_label_expanded.shape)
 
-    # pad last timestep so shapes match concepts
-    # pad : (B, 1, 1)
-    pad = torch.full(
-        (concept_label_expanded.size(0), 1, 1),
-        -100,
-        device=concept_label_expanded.device,
-        dtype=concept_label_expanded.dtype,
-    )
-
-    # (B, T, 1)
-    concept_label_expanded = torch.cat(
-        [concept_label_expanded, pad], dim=1
-    )
-
-    # ------------------------------------------------------------
-    # 4.1 Apply intervention in concept space
-    # ------------------------------------------------------------
-
-    # intervened_concept : (B, T, C)
     intervened_concept = amplify_intervention(
         concepts,
         concept_label_expanded,
         margin=args.intervention_margin,
         spread=args.intervention_spread,
     )
+    print("intervened_concept:", intervened_concept.shape)
 
-    # ------------------------------------------------------------
-    # 4.2 Cyclic consistency loss
-    # ------------------------------------------------------------
-
-    # decode intervened concepts
-    # (B, T, H)
     post_hidden_states_interven = preLM.intermediate.decode(
-        pre_hidden_states,
-        intervened_concept,
-        skips,
+        pre_hidden_states, intervened_concept, skips
     )
-
-    # re-encode
-    # cyclic_concepts : (B, T, C)
-    cyclic_concepts, skips = preLM.intermediate.encode(
-        post_hidden_states_interven
-    )
-
-    # MSE between intervened and re-encoded concepts
-    # both : (B, T-1, C)
+    cyclic_concepts, skips = preLM.intermediate.encode(post_hidden_states_interven)
     cyclic_concept_loss = reconstr_crit(
         cyclic_concepts[:, :-1, :],
         intervened_concept[:, :-1, :],
     )
+    print("cyclic_concepts:", cyclic_concepts.shape)
+    print("post_hidden_states_interven:", post_hidden_states_interven.shape)
 
-    # ------------------------------------------------------------
-    # 4.3 Intervention generation loss
-    # ------------------------------------------------------------
-
-    # hidden states after intervention
-    # (B, T, H)
     vocabs_intervened = preLM.secondhalf_forward(
-        post_hidden_states_interven,
-        causal_mask,
-        position_embeddings,
+        post_hidden_states_interven, causal_mask, position_embeddings
     ).last_hidden_state
-
-    # logits : (B, T, V)
     vocabs_intervened = preLM_generator.lm_head(vocabs_intervened)
+    print("vocabs_intervened:", vocabs_intervened.shape)
 
-    # CE loss
-    # reshape -> (B*(T-1), V)
     intervened_generation_loss = CSE_crit(
         vocabs_intervened[:, :-1, :].reshape(-1, config.vocab_size),
         word_label.reshape(-1),
     )
+    print("word_label:", word_label.shape)
 
     # ============================================================
     # 5. TOTAL LOSS
