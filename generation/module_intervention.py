@@ -443,7 +443,6 @@ def compute_training_losses(
     )
     print("pre_hidden_states:", pre_hidden_states.shape)
     print("causal_mask:", causal_mask.shape)
-    print("position_embeddings:", position_embeddings.shape)
 
     # Encode into concept space
     concepts, skips = preLM.intermediate.encode(pre_hidden_states)
