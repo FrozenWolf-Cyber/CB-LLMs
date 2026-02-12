@@ -25,6 +25,7 @@ def set_seed(seed):
 parser = argparse.ArgumentParser()
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+device_str = "cuda" if torch.cuda.is_available() else "cpu"
 parser.add_argument("--dataset", type=str, default="SetFit/sst2")
 parser.add_argument("--batch_size", type=int, default=4)
 parser.add_argument("--max_length", type=int, default=350)
@@ -228,7 +229,7 @@ if __name__ == "__main__":
             concept_label = torch.where(batch["attention_mask"][:, :-1] == 0, -100, batch["label"].view(-1, 1))
             word_label = torch.where(batch["attention_mask"][:, :-1] == 0, -100, batch["input_ids"][:, 1:])
             
-            with torch.autocast(device_type=device, dtype=torch.bfloat16):
+            with torch.autocast(device_type=device_str, dtype=torch.bfloat16):
                 training_losses = compute_training_losses(
                                    batch=batch,
                                    preLM=preLM,
@@ -298,7 +299,7 @@ if __name__ == "__main__":
                 )
 
                 with torch.no_grad():
-                    with torch.autocast(device=device, dtype=torch.bfloat16):
+                    with torch.autocast(device=device_str, dtype=torch.bfloat16):
                         loss_dict = compute_training_losses(
                         batch=batch,
                         preLM=preLM,
