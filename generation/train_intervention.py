@@ -299,7 +299,7 @@ if __name__ == "__main__":
                 )
 
                 with torch.no_grad():
-                    with torch.amp.autocast(device=device_str, dtype=torch.bfloat16):
+                    with torch.amp.autocast(device_type=device_str, dtype=torch.bfloat16):
                         loss_dict = compute_training_losses(
                         batch=batch,
                         preLM=preLM,
