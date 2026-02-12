@@ -446,7 +446,7 @@ def compute_training_losses(
     # skips             : model dependent
     # causal_mask       : (B, 1, T, T) or compatible
     # position_embeddings : (B, T, H)
-    pre_hidden_states, concepts, skips, causal_mask, position_embeddings = (
+    pre_hidden_states, causal_mask, position_embeddings = (
         preLM.firsthalf_forward(
             input_ids=batch["input_ids"],
             attention_mask=batch["attention_mask"],
