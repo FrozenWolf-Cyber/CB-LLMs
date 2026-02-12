@@ -448,13 +448,14 @@ if __name__ == "__main__":
     for batch in tqdm(test_loader, total=len(test_loader)):
         batch = {k: v.to(device) for k, v in batch.items()}
         with torch.no_grad():
-            pre_hidden_states, causal_mask, position_embeddings = (
-                preLM.firsthalf_forward(
-                    input_ids=batch["input_ids"],
-                    attention_mask=batch["attention_mask"],
+            with torch.amp.autocast(device_type=device_str, dtype=torch.bfloat16):
+                pre_hidden_states, causal_mask, position_embeddings = (
+                    preLM.firsthalf_forward(
+                        input_ids=batch["input_ids"],
+                        attention_mask=batch["attention_mask"],
+                    )
                 )
-            )
-            concepts, skips = preLM.intermediate.encode(pre_hidden_states)
+                concepts, skips = preLM.intermediate.encode(pre_hidden_states)
 
         concept_predictions.append(eos_pooling(concepts, batch["attention_mask"]))
     concept_predictions = torch.cat(concept_predictions, dim=0).detach().cpu()
