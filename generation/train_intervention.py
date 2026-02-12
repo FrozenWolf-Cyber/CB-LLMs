@@ -230,7 +230,7 @@ if __name__ == "__main__":
             word_label = torch.where(batch["attention_mask"][:, :-1] == 0, -100, batch["input_ids"][:, 1:])
             
             with torch.amp.autocast(device_type=device_str, dtype=torch.bfloat16):
-                training_losses = compute_training_losses(
+                loss_dict = compute_training_losses(
                                    batch=batch,
                                    preLM=preLM,
                                    preLM_generator=preLM_generator,
@@ -243,18 +243,17 @@ if __name__ == "__main__":
                                    args=args,
                                )
                 
-                scaler.scale(training_losses["loss"]).backward()
+                scaler.scale(loss_dict["loss"]).backward()
                 scaler.step(opt_prelm)
                 scaler.update()
                 opt_prelm.zero_grad()
 
 
             log = {}
-            for key in training_losses.keys():
-                print(key, training_losses[key])
-                if len(training_losses[key]) > 0:
-                    print(f"{key}: {training_losses[key][-1]}", end=" ")
-                    log[key] = training_losses[key][-1]
+
+            for k, v in loss_dict.items():
+                training_losses[k].append(v.detach().cpu().item())
+                log[key]  = training_losses[k][-1]
             
             log["epoch"] = e + 1
             log["batch"] = i + 1
