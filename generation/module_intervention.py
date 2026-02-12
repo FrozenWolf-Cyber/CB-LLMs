@@ -34,24 +34,86 @@ class LlamaPreTrainedModel(PreTrainedModel):
         "attentions": LlamaAttention,
     }
 
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
+import torch
+import torch.nn as nn
+
+class LlamaUNetBottleneck(nn.Module):
+    ## TODO: Improve this skipping. See if good balance be found
+    def __init__(self, hidden_size=4096, intermediate_sizes=[1024, 512, 256], concept_size=14, skip_dropout=0.3):
+        super().__init__()
+        self.act = nn.SiLU()
+        self.concept_size = concept_size
+        self.encoders = nn.ModuleList()
+        self.enc_norms = nn.ModuleList()
+        self.skip_dropout = nn.Dropout(p=skip_dropout)
+        
+        current_dim = hidden_size
+        for next_dim in intermediate_sizes:
+            self.encoders.append(nn.Linear(current_dim, next_dim))
+            self.enc_norms.append(nn.LayerNorm(next_dim))
+            current_dim = next_dim
+            
+        # Final bridge to the concept bottleneck
+        self.concept_enc = nn.Linear(current_dim, concept_size)
+        self.concept_norm = nn.LayerNorm(concept_size)
+        
+        # --- Expansive Path (Decoder Stack) ---
+        self.decoders = nn.ModuleList()
+        self.dec_norms = nn.ModuleList()
+        self.gates = nn.ParameterList() # Gates for hierarchical skip connections
+        
+        # Reverse the intermediate sizes for the upward path
+        reversed_sizes = list(reversed(intermediate_sizes))
+        
+        current_dim = concept_size
+        for next_dim in reversed_sizes:
+            self.decoders.append(nn.Linear(current_dim, next_dim))
+            self.dec_norms.append(nn.LayerNorm(next_dim))
+            self.gates.append(nn.Parameter(torch.zeros(1)))
+            current_dim = next_dim
+            
+        self.final_proj = nn.Linear(current_dim, hidden_size)
+        self.final_gate = nn.Parameter(torch.zeros(1))
+        
+
+    def encode(self, x):
+        skips = []
+        h = x
+        for enc, norm in zip(self.encoders, self.enc_norms):
+            h = norm(self.act(enc(h)))
+            skips.append(h)
+            
+        concepts = self.concept_norm(self.concept_enc(h))
+        return concepts, skips
+
+    def decode(self, x_original, concepts, skips):
+        skips = skips[::-1] 
+        h = concepts
+        
+        for i, (dec, norm, gate) in enumerate(zip(self.decoders, self.dec_norms, self.gates)):
+            h_up = self.act(dec(h))
+            h = norm(h_up + (gate * skips[i]))
+            
+        x_reconstructed = self.final_proj(h)
+        output = x_original + (self.final_gate * x_reconstructed)
+        
+        return output
+
+    def forward(self, x):
+        concepts, skips = self.encode(x)
+        return self.decode(x, concepts, skips)
+        
+    
 class CustomLlamaModel(LlamaPreTrainedModel):
-    def __init__(self, config: LlamaConfig, debug=False, where=24):
+    def __init__(self, config: LlamaConfig):
         super().__init__(config)
-        self.where = where
-        self.debug = debug
-        # your intermediate layer
-        if debug:
-            self.intermediate = nn.Identity()
-        else:
-            self.intermediate = nn.Linear(
-            config.hidden_size,
-            config.hidden_size,
-            bias=False
-        )
+        self.config = config
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
-
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.layers = nn.ModuleList(
             [LlamaDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
@@ -60,17 +122,32 @@ class CustomLlamaModel(LlamaPreTrainedModel):
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.rotary_emb = LlamaRotaryEmbedding(config=config)
         self.gradient_checkpointing = False
-
+        self.intervene = None
+        self.skip_first_half = False
         self.post_init()
 
         # freeze everything except new layer
         for p in self.parameters():
             p.requires_grad = False
 
+    def create_intermediate(self, where, concept_size, intermediate_size=[1024, 512, 256], debug=False):
+        self.where = where
+        self.debug = debug
+        self.concept_size = concept_size
+        hidden_size = self.config.hidden_size
+        # your intermediate layer
+        if debug:
+            self.intermediate = nn.Identity()
+        else:
+            self.intermediate = LlamaUNetBottleneck(hidden_size=hidden_size,
+                                                    intermediate_size=intermediate_size, #4096/8 = 512
+                                                    concept_size=concept_size
+                                                    )
+
         for p in self.intermediate.parameters():
             p.requires_grad = True
 
-    def forward(
+    def firsthalf_forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
@@ -80,7 +157,7 @@ class CustomLlamaModel(LlamaPreTrainedModel):
         cache_position: Optional[torch.LongTensor] = None,
         use_cache: Optional[bool] = None,
         **kwargs: Unpack[TransformersKwargs],
-    ) -> BaseModelOutputWithPast:
+    ):
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
@@ -129,9 +206,72 @@ class CustomLlamaModel(LlamaPreTrainedModel):
             print(f"[LOG] TRIGGERED INTERMEDIATE AT LAYER {self.where}")
             print(hidden_states.shape)
 
-        # Trainable layer
-        hidden_states = self.intermediate(hidden_states)
+        # hidden_states, concepts = self.intermediate(hidden_states)
+        
+        
+        return hidden_states, causal_mask, position_embeddings
 
+    def forward(
+        self,
+        input_ids: Optional[torch.LongTensor] = None,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Cache] = None,
+        inputs_embeds: Optional[torch.FloatTensor] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        use_cache: Optional[bool] = None,
+        multiple_intervene = False,
+        **kwargs: Unpack[TransformersKwargs],
+    ) -> BaseModelOutputWithPast:
+        
+        # Trainable layer
+        hidden_states, causal_mask, position_embeddings = \
+        self.firsthalf_forward(input_ids,
+                               attention_mask,
+                               position_ids,
+                               past_key_values,
+                               inputs_embeds,
+                               cache_position,
+                               use_cache)
+        
+        concepts, skips = self.intermediate.encode(hidden_states)
+        
+        if self.intervene is not None:
+            concepts = amplify_intervention(
+                    concepts,
+                    self.intervene,
+                    margin=self.intervention_margin,
+                    spread=self.intervention_spread,
+                )
+
+        hidden_states = self.intermediate.decode(hidden_states, concepts, skips)
+        
+        output = self.secondhalf_forward(hidden_states,
+        causal_mask,
+        position_embeddings,
+        position_ids,
+        past_key_values,
+        cache_position,
+        **kwargs
+        )
+        
+        output.concepts = concepts ### TODO: IS THIS THE BEST WAY TO SHARE CONCEPTS?
+        
+        return output
+        
+    
+    def secondhalf_forward(
+        self,
+        hidden_states,
+        causal_mask,
+        position_embeddings,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_values: Optional[Cache] = None,
+        cache_position: Optional[torch.LongTensor] = None,
+        **kwargs: Unpack[TransformersKwargs],
+    ):
+        
+        
         # Subsequent layers (must track gradients to pass them backward)
         for idx in range(self.where, self.config.num_hidden_layers):
             decoder_layer = self.layers[idx]
@@ -151,6 +291,49 @@ class CustomLlamaModel(LlamaPreTrainedModel):
             past_key_values=past_key_values,
         )
 
+def amplify_intervention(original_concepts, labels, margin=10.0, spread=2.0):
+    """
+    Applies per-concept intervention while preserving original values for
+    padding or untargeted tokens.
+
+    Args:
+        original_concepts : Tensor (B, T, C)
+        labels            : Tensor (B, T, 1)
+                            values in {1, 0, -100}
+        margin            : float, distance added beyond observed extrema
+        spread            : float, minimum absolute magnitude for extrema
+
+    Returns:
+        intervened_concepts : Tensor (B, T, C)
+    """
+
+    # ---- 1. Compute per-concept extrema (no gradients) ----
+    with torch.no_grad():
+        # per-concept max/min across batch and time
+        v_max = original_concepts.amax(dim=(0, 1), keepdim=True)
+        v_min = original_concepts.amin(dim=(0, 1), keepdim=True)
+
+        # ensure minimum activation spread
+        v_max = torch.clamp(v_max, min=spread)
+        v_min = torch.clamp(v_min, max=-spread)
+
+        high_target = v_max + margin   # (1, 1, C)
+        low_target  = v_min - margin   # (1, 1, C)
+
+    # ---- 2. Start from original concepts ----
+    intervened = original_concepts.clone().detach()
+
+    # ---- 3. Apply intervention only where labels specify ----
+    pos_mask = (labels == 1)   # (B, T, 1)
+    neg_mask = (labels == 0)   # (B, T, 1)
+
+    intervened = torch.where(pos_mask, high_target, intervened)
+    intervened = torch.where(neg_mask, low_target, intervened)
+
+    # ---- 4. Return detached tensor (intervention treated as constant) ----
+    return intervened.detach()
+
+
 
 
 class CustomLlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
@@ -158,9 +341,9 @@ class CustomLlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
     _tp_plan = {"lm_head": "colwise_rep"}
     _pp_plan = {"lm_head": (["hidden_states"], ["logits"])}
 
-    def __init__(self, config):
+    def __init__(self, config, model=None):
         super().__init__(config)
-        self.model = CustomLlamaModel(config)
+        self.model = CustomLlamaModel(config) if model is None else model 
         self.vocab_size = config.vocab_size
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
@@ -232,7 +415,224 @@ class CustomLlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
             attentions=outputs.attentions,
         )
 
+def compute_training_losses(
+    batch,
+    preLM:CustomLlamaModel,
+    preLM_generator:CustomLlamaForCausalLM,
+    reconstr_crit,
+    CSE_crit,
+    concept_label,
+    word_label,
+    concept_set,
+    config,
+    args,
+):
+    """
+    Computes all training losses for the concept-intervention model.
 
+    Expected tensor shapes:
+        input_ids          : (B, T)
+        attention_mask     : (B, T)
+        concept_label      : (B, T-1)
+        word_label         : (B, T-1)
+    """
+
+    # ============================================================
+    # 1. FIRST HALF FORWARD (encoder side)
+    # ============================================================
+
+    # pre_hidden_states : (B, T, H)
+    # concepts          : (B, T, C)
+    # skips             : model dependent
+    # causal_mask       : (B, 1, T, T) or compatible
+    # position_embeddings : (B, T, H)
+    pre_hidden_states, concepts, skips, causal_mask, position_embeddings = (
+        preLM.firsthalf_forward(
+            input_ids=batch["input_ids"],
+            attention_mask=batch["attention_mask"],
+        )
+    )
+
+    # Encode into concept space
+    # concepts : (B, T, C)
+    concepts, skips = preLM.intermediate.encode(pre_hidden_states)
+
+    # Decode back to hidden space
+    # post_hidden_states : (B, T, H)
+    post_hidden_states = preLM.intermediate.decode(
+        pre_hidden_states, concepts, skips
+    )
+
+    # ============================================================
+    # 2. CONCEPT LOSS
+    # ============================================================
+
+    # concepts[:, :-1, :] : (B, T-1, C)
+    # reshape -> (B*(T-1), C)
+    # concept_label -> (B*(T-1))
+    concept_loss = CSE_crit(
+        concepts[:, :-1, :].reshape(-1, len(concept_set)),
+        concept_label.reshape(-1),
+    )
+
+    # ============================================================
+    # 3. RECONSTRUCTION LOSSES
+    # ============================================================
+
+    # ------------------------------------------------------------
+    # 3.1 Encoder-decoder reconstruction
+    # ------------------------------------------------------------
+    # both tensors : (B, T-1, H)
+    intermediate_reconstruction_loss = reconstr_crit(
+        post_hidden_states[:, :-1, :],
+        pre_hidden_states[:, :-1, :].detach(),
+    )
+
+    # ------------------------------------------------------------
+    # 3.2 Generation reconstruction (KL divergence)
+    # ------------------------------------------------------------
+
+    # hidden states after decoder
+    # (B, T, H)
+    vocabs_reconstr = preLM.secondhalf_forward(
+        post_hidden_states,
+        causal_mask,
+        position_embeddings,
+    ).last_hidden_state
+
+    # original hidden states
+    # (B, T, H)
+    vocabs_org = preLM.secondhalf_forward(
+        pre_hidden_states,
+        causal_mask,
+        position_embeddings,
+    ).last_hidden_state
+
+    vocabs_org = vocabs_org.detach()
+
+    # logits -> log probs
+    # (B, T, V)
+    log_probs_org = F.log_softmax(
+        preLM_generator.lm_head(vocabs_org), dim=-1
+    )
+    log_probs_reconstr = F.log_softmax(
+        preLM_generator.lm_head(vocabs_reconstr), dim=-1
+    )
+
+    # KL over vocabulary dimension
+    # input shapes : (B, T-1, V)
+    generation_reconstruction_loss = F.kl_div(
+        log_probs_reconstr[:, :-1, :],
+        log_probs_org[:, :-1, :],
+        log_target=True,
+        reduction="batchmean",
+    )
+
+    # ============================================================
+    # 4. INTERVENTION LOSSES
+    # ============================================================
+
+    # ------------------------------------------------------------
+    # 4.0 Prepare labels for intervention
+    # ------------------------------------------------------------
+
+    # concept_label_expanded : (B, T-1, 1)
+    concept_label_expanded = concept_label.unsqueeze(-1)
+
+    # pad last timestep so shapes match concepts
+    # pad : (B, 1, 1)
+    pad = torch.full(
+        (concept_label_expanded.size(0), 1, 1),
+        -100,
+        device=concept_label_expanded.device,
+        dtype=concept_label_expanded.dtype,
+    )
+
+    # (B, T, 1)
+    concept_label_expanded = torch.cat(
+        [concept_label_expanded, pad], dim=1
+    )
+
+    # ------------------------------------------------------------
+    # 4.1 Apply intervention in concept space
+    # ------------------------------------------------------------
+
+    # intervened_concept : (B, T, C)
+    intervened_concept = amplify_intervention(
+        concepts,
+        concept_label_expanded,
+        margin=args.intervention_margin,
+        spread=args.intervention_spread,
+    )
+
+    # ------------------------------------------------------------
+    # 4.2 Cyclic consistency loss
+    # ------------------------------------------------------------
+
+    # decode intervened concepts
+    # (B, T, H)
+    post_hidden_states_interven = preLM.intermediate.decode(
+        pre_hidden_states,
+        intervened_concept,
+        skips,
+    )
+
+    # re-encode
+    # cyclic_concepts : (B, T, C)
+    cyclic_concepts, skips = preLM.intermediate.encode(
+        post_hidden_states_interven
+    )
+
+    # MSE between intervened and re-encoded concepts
+    # both : (B, T-1, C)
+    cyclic_concept_loss = reconstr_crit(
+        cyclic_concepts[:, :-1, :],
+        intervened_concept[:, :-1, :],
+    )
+
+    # ------------------------------------------------------------
+    # 4.3 Intervention generation loss
+    # ------------------------------------------------------------
+
+    # hidden states after intervention
+    # (B, T, H)
+    vocabs_intervened = preLM.secondhalf_forward(
+        post_hidden_states_interven,
+        causal_mask,
+        position_embeddings,
+    ).last_hidden_state
+
+    # logits : (B, T, V)
+    vocabs_intervened = preLM_generator.lm_head(vocabs_intervened)
+
+    # CE loss
+    # reshape -> (B*(T-1), V)
+    intervened_generation_loss = CSE_crit(
+        vocabs_intervened[:, :-1, :].reshape(-1, config.vocab_size),
+        word_label.reshape(-1),
+    )
+
+    # ============================================================
+    # 5. TOTAL LOSS
+    # ============================================================
+
+    loss = (
+        args.concept_loss * concept_loss
+        + args.intermediate_recon_loss * intermediate_reconstruction_loss
+        + args.generation_recon_loss * generation_reconstruction_loss
+        + args.cyclic_loss * cyclic_concept_loss
+        + args.intervention_gen_loss * intervened_generation_loss
+    )
+
+    return {
+        "loss": loss,
+        "concept_loss": concept_loss,
+        "intermediate_reconstruction_loss": intermediate_reconstruction_loss,
+        "generation_reconstruction_loss": generation_reconstruction_loss,
+        "cyclic_concept_loss": cyclic_concept_loss,
+        "intervened_generation_loss": intervened_generation_loss,
+    }
+    
 import torch
 from transformers import AutoTokenizer, LlamaConfig
 
@@ -265,7 +665,7 @@ def test_llama3_custom_architecture():
     print(model.model.intermediate)
     with torch.no_grad():
         if isinstance(model.model.intermediate, torch.nn.Linear):
-            # model.model.intermediate = nn.Identity()
+            model.model.intermediate = nn.Identity()
             print("[INFO] Initialized intermediate layer to Identity Matrix.")
 
     # 4. Run Generation
