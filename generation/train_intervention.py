@@ -401,6 +401,7 @@ if __name__ == "__main__":
                 preLM_generator.model.intervene = intervene_tensor
                 preLM_generator.model.intervention_margin = args.intervention_margin
                 preLM_generator.model.intervention_spread = args.intervention_spread
+                print("Gen")
                 with torch.amp.autocast(device_type=device_str, dtype=torch.bfloat16):
                     output_tokens = preLM_generator.generate(
                     input_ids,
@@ -408,6 +409,7 @@ if __name__ == "__main__":
                 )
                 preLM_generator.model.intervene = None
                 decoded_text = tokenizer.decode(output_tokens[0], skip_special_tokens=True)
+                print(f"Class {concept_set[j]}: {decoded_text}")
                 text.append(decoded_text)
 
                 roberta_text_ids = torch.tensor([roberta_tokenizer.encode(decoded_text)]).to(device)
