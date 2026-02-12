@@ -35,7 +35,6 @@ parser.add_argument("--seed", type=int, default=42)
 parser.add_argument("--intermediate_loc", type=int, default=24)
 parser.add_argument("--DEBUG", action='store_true', help="If set, use a smaller subset of data for quick debugging.")
 parser.add_argument("--concept_loss", type=float, default=1.0)
-parser.add_argument("--word_loss", type=float, default=1.0)
 
 parser.add_argument("--intermediate_recon_loss", type=float, default=1.0)
 parser.add_argument("--generation_recon_loss", type=float, default=1.0)
