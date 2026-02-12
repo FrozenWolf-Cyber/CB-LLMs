@@ -391,6 +391,7 @@ if __name__ == "__main__":
         for i in tqdm(range(100 // len(concept_set))):
             print("example", str(i), end="\r")
             input_ids = torch.tensor([tokenizer.encode("")]).to(device)
+            attention_mask = (input_ids != tokenizer.pad_token_id).long()
             for j in range(len(concept_set)):
                 # original vector: one-hot for the concept
                 v = [0] * len(concept_set)  # all concepts suppressed
@@ -404,9 +405,16 @@ if __name__ == "__main__":
                 print("Gen")
                 with torch.amp.autocast(device_type=device_str, dtype=torch.bfloat16):
                     output_tokens = preLM_generator.generate(
-                    input_ids,
-                    use_cache=True
-                )
+                                        input_ids,
+                                        attention_mask=attention_mask,       # must pass if padding exists
+                                        use_cache=True,
+                                        max_new_tokens=100,                  # instead of length
+                                        temperature=0.7,                     # temp -> temperature
+                                        top_k=100,                           # topk -> top_k
+                                        top_p=0.9,                           # topp -> top_p
+                                        repetition_penalty=1.5,
+                                        # pad_token_id=128001                   # set pad_token_id to avoid warnings
+                                    )
                 preLM_generator.model.intervene = None
                 decoded_text = tokenizer.decode(output_tokens[0], skip_special_tokens=True)
                 print(f"Class {concept_set[j]}: {decoded_text}")
@@ -466,11 +474,22 @@ if __name__ == "__main__":
     pred = []
     perplexity = evaluate.load("perplexity", module_type="metric")
     input_ids = torch.tensor([tokenizer.encode("")]).to(device)
+    attention_mask = (input_ids != tokenizer.pad_token_id).long()
     for i in tqdm(range(100)):
         print("example", str(i), end="\r")
         with torch.no_grad():
             with torch.amp.autocast(device_type=device_str, dtype=torch.bfloat16):
-                text_ids = preLM_generator.generate(input_ids)
+                text_ids = preLM_generator.generate(
+                                        input_ids,
+                                        attention_mask=attention_mask,       # must pass if padding exists
+                                        use_cache=True,
+                                        max_new_tokens=100,                  # instead of length
+                                        temperature=0.7,                     # temp -> temperature
+                                        top_k=100,                           # topk -> top_k
+                                        top_p=0.9,                           # topp -> top_p
+                                        repetition_penalty=1.5,
+                                        # pad_token_id=128001                   # set pad_token_id to avoid warnings
+                                    )
             pred.append(tokenizer.decode(text_ids[0], skip_special_tokens=True ))
             if len(pred[-1].split()) > 30:
                 continue
