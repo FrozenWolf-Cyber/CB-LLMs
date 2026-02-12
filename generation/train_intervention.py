@@ -399,7 +399,8 @@ if __name__ == "__main__":
                 intervene_tensor = torch.tensor(v, device=device).view(1, 1, -1).expand(B, T, len(concept_set))
 
                 preLM_generator.model.intervene = intervene_tensor
-                output_tokens = preLM_generator.generate(
+                with torch.amp.autocast(device_type=device_str, dtype=torch.bfloat16):
+                    output_tokens = preLM_generator.generate(
                     input_ids,
                     use_cache=True
                 )
@@ -464,7 +465,8 @@ if __name__ == "__main__":
     for i in tqdm(range(100)):
         print("example", str(i), end="\r")
         with torch.no_grad():
-            text_ids = preLM_generator.generate(input_ids)
+            with torch.amp.autocast(device_type=device_str, dtype=torch.bfloat16):
+                text_ids = preLM_generator.generate(input_ids)
             pred.append(tokenizer.decode(text_ids[0], skip_special_tokens=True ))
             if len(pred[-1].split()) > 30:
                 continue
