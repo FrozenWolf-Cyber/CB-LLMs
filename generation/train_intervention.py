@@ -399,6 +399,8 @@ if __name__ == "__main__":
                 intervene_tensor = torch.tensor(v, device=device).view(1, 1, -1).expand(B, T, len(concept_set))
 
                 preLM_generator.model.intervene = intervene_tensor
+                preLM_generator.model.intervention_margin = args.intervention_margin
+                preLM_generator.model.intervention_spread = args.intervention_spread
                 with torch.amp.autocast(device_type=device_str, dtype=torch.bfloat16):
                     output_tokens = preLM_generator.generate(
                     input_ids,
