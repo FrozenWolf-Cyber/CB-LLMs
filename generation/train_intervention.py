@@ -161,7 +161,7 @@ if __name__ == "__main__":
     preLM.create_intermediate(args.intermediate_loc, len(concept_set))
     preLM.to(device)
     
-    preLM_generator = CustomLlamaForCausalLM.from_pretrained('meta-llama/Meta-Llama-3-8B', torch_dtype=torch.bfloat16, device="cpu")
+    preLM_generator = CustomLlamaForCausalLM.from_pretrained('meta-llama/Meta-Llama-3-8B', torch_dtype=torch.bfloat16)
     preLM_generator.model = preLM
     preLM_generator.lm_head.to(device)
     
