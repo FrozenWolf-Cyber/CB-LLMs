@@ -253,7 +253,7 @@ if __name__ == "__main__":
 
             for k, v in loss_dict.items():
                 training_losses[k].append(v.detach().cpu().item())
-                log[key]  = training_losses[k][-1]
+                log[k]  = training_losses[k][-1]
             
             log["epoch"] = e + 1
             log["batch"] = i + 1
