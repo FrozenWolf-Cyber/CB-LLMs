@@ -13,6 +13,7 @@ from modules import CBLResidual, CBL, Roberta_classifier
 from module_intervention import CustomLlamaModel, CustomLlamaForCausalLM, amplify_intervention, compute_training_losses
 import time
 import random
+from torch.cuda.amp import autocast, GradScaler
 from utils import elastic_net_penalty, mean_pooling, eos_pooling
 import wandb
 def set_seed(seed):
@@ -69,6 +70,7 @@ if __name__ == "__main__":
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
     args = parser.parse_args()
     set_seed(args.seed)
+    scaler = GradScaler()
 
     wandb.init(project="cbm-generation-new", name=f"train-{args.dataset}-seed{args.seed}",
                config=vars(args))
@@ -225,8 +227,9 @@ if __name__ == "__main__":
             batch = {k: v.to(device) for k, v in batch.items()}
             concept_label = torch.where(batch["attention_mask"][:, :-1] == 0, -100, batch["label"].view(-1, 1))
             word_label = torch.where(batch["attention_mask"][:, :-1] == 0, -100, batch["input_ids"][:, 1:])
-
-            training_losses = compute_training_losses(
+            
+            with autocast(device_type="cuda", dtype=torch.bfloat16):
+                training_losses = compute_training_losses(
                                    batch=batch,
                                    preLM=preLM,
                                    preLM_generator=preLM_generator,
@@ -238,11 +241,12 @@ if __name__ == "__main__":
                                    config=config,
                                    args=args,
                                )
-            
+                
+                scaler.scale(loss_dict["loss"]).backward()
+                scaler.step(opt_prelm)
+                scaler.update()
+                opt_prelm.zero_grad()
 
-            opt_prelm.zero_grad()
-            loss_dict["loss"].backward()
-            opt_prelm.step()
 
             log = {}
             for key in training_losses.keys():
