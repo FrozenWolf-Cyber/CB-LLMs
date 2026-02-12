@@ -251,6 +251,7 @@ if __name__ == "__main__":
 
             log = {}
             for key in training_losses.keys():
+                print(key, training_losses[key])
                 if len(training_losses[key]) > 0:
                     print(f"{key}: {training_losses[key][-1]}", end=" ")
                     log[key] = training_losses[key][-1]
