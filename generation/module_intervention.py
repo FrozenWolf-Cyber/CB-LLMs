@@ -144,6 +144,7 @@ class CustomLlamaModel(LlamaPreTrainedModel):
                                                     concept_size=concept_size
                                                     )
 
+        self.add_module("intermediate", self.intermediate)
         for p in self.intermediate.parameters():
             p.requires_grad = True
 
