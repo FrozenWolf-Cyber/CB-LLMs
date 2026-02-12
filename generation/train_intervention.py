@@ -71,7 +71,7 @@ if __name__ == "__main__":
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
     args = parser.parse_args()
     set_seed(args.seed)
-    scaler = torch.amp.GradScaler(device_str)
+    scaler = GradScaler()
 
     wandb.init(project="cbm-generation-new", name=f"train-{args.dataset}-seed{args.seed}",
                config=vars(args))
@@ -229,7 +229,7 @@ if __name__ == "__main__":
             concept_label = torch.where(batch["attention_mask"][:, :-1] == 0, -100, batch["label"].view(-1, 1))
             word_label = torch.where(batch["attention_mask"][:, :-1] == 0, -100, batch["input_ids"][:, 1:])
             
-            with torch.autocast(device_type=device_str, dtype=torch.bfloat16):
+            with autocast(device_type=device_str, dtype=torch.bfloat16):
                 training_losses = compute_training_losses(
                                    batch=batch,
                                    preLM=preLM,
@@ -299,7 +299,7 @@ if __name__ == "__main__":
                 )
 
                 with torch.no_grad():
-                    with torch.autocast(device=device_str, dtype=torch.bfloat16):
+                    with autocast(device=device_str, dtype=torch.bfloat16):
                         loss_dict = compute_training_losses(
                         batch=batch,
                         preLM=preLM,
