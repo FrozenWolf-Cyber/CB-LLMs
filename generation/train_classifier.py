@@ -9,7 +9,6 @@ from datasets import load_dataset, concatenate_datasets
 import config as CFG
 from modules import Roberta_classifier
 import wandb
-from langdetect import detect
 import copy
 
 parser = argparse.ArgumentParser()
