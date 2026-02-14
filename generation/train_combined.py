@@ -366,6 +366,8 @@ if __name__ == "__main__":
     gc.collect()
     
     ## lOAD BEST MODEL AND
+    if best_epoch == -1:
+        best_epoch = epochs
     preLM = LlamaModel.from_pretrained('meta-llama/Meta-Llama-3-8B', torch_dtype=torch.bfloat16).to(device)
     peft_path = prefix + model_name + "_epoch_" + str(best_epoch)
     preLM.load_adapter(peft_path)
