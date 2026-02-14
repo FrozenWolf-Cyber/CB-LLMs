@@ -1,11 +1,10 @@
 import argparse
 import os
-import gc
 import torch
 import torch.nn.functional as F
 import numpy as np
-from transformers import RobertaTokenizerFast, RobertaModel, GPT2TokenizerFast, GPT2Model
-from datasets import load_dataset, concatenate_datasets
+from transformers import RobertaTokenizerFast, RobertaModel
+from datasets import load_dataset
 import config as CFG
 from modules import Roberta_classifier
 import wandb
@@ -50,14 +49,12 @@ if __name__ == "__main__":
 
     print("loading data...")
     train_dataset = load_dataset(args.dataset, split='train')
-    val_dataset = load_dataset(args.dataset, split='validation' if args.dataset == 'SetFit/sst2' else 'test')
 
     if args.dataset == 'ag_news':
         def replace_bad_string(example):
             example["text"] = example["text"].replace("#36;", "").replace("#39;", "'")
             return example
         train_dataset = train_dataset.map(replace_bad_string)
-        val_dataset = val_dataset.map(replace_bad_string)
 
     tokenizer = RobertaTokenizerFast.from_pretrained('roberta-base')
 
@@ -65,20 +62,15 @@ if __name__ == "__main__":
         return tokenizer(e[CFG.example_name[args.dataset]], padding=True, truncation=True, max_length=args.max_length)
 
     encoded_train_dataset = train_dataset.map(tokenize_fn, batched=True, batch_size=len(train_dataset))
-    encoded_val_dataset = val_dataset.map(tokenize_fn, batched=True, batch_size=len(val_dataset))
-
-    for ds in [encoded_train_dataset, encoded_val_dataset]:
-        ds.remove_columns([CFG.example_name[args.dataset]])
-        if args.dataset == 'SetFit/sst2': ds.remove_columns(['label_text'])
-        if args.dataset == 'dbpedia_14': ds.remove_columns(['title'])
+    encoded_train_dataset.remove_columns([CFG.example_name[args.dataset]])
+    if args.dataset == 'SetFit/sst2': encoded_train_dataset.remove_columns(['label_text'])
+    if args.dataset == 'dbpedia_14': encoded_train_dataset.remove_columns(['title'])
 
     d_name = args.dataset.replace('/', '_')
     prefix = f"./{args.labeling}_acs/{d_name}/"
     train_similarity = np.load(os.path.join(prefix, "concept_labels_train.npy"))
-    val_similarity = np.load(os.path.join(prefix, "concept_labels_val.npy"))
 
     train_loader = build_loaders(encoded_train_dataset, train_similarity, mode="train")
-    val_loader = build_loaders(encoded_val_dataset, val_similarity, mode="val")
 
     concept_set = CFG.concept_set[args.dataset]
     classifier = Roberta_classifier(len(concept_set)).to(device)
@@ -86,7 +78,6 @@ if __name__ == "__main__":
     criterion = torch.nn.CrossEntropyLoss()
 
     epochs = CFG.epoch[args.dataset]
-    best_val_acc = -1
     for e in range(epochs):
         classifier.train()
         training_loss, training_acc = [], []
@@ -104,29 +95,13 @@ if __name__ == "__main__":
             training_acc.append(acc.item())
             print(f"batch {i} loss: {loss.item():.4f} acc: {acc.item():.4f}", end="\r")
 
-        classifier.eval()
-        val_loss, val_acc = [], []
-        with torch.no_grad():
-            for batch, targets in val_loader:
-                batch = {k: v.to(device) for k, v in batch.items()}
-                targets = targets.to(device)
-                logits = classifier(batch)
-                loss = criterion(logits, F.softmax(targets, dim=1))
-                acc = get_accuracy(logits, targets)
-                val_loss.append(loss.item())
-                val_acc.append(acc.item())
-
         metrics = {
             "train_loss": np.mean(training_loss),
             "train_acc": np.mean(training_acc),
-            "val_loss": np.mean(val_loss),
-            "val_acc": np.mean(val_acc),
             "epoch": e + 1
         }
-        print(f"\nEpoch {e+1}: Train Loss {metrics['train_loss']:.4f} Val Acc {metrics['val_acc']:.4f}")
+        print(f"\nEpoch {e+1}: Train Loss {metrics['train_loss']:.4f} Train Acc {metrics['train_acc']:.4f}")
         wandb.log(metrics)
-        if metrics['val_acc'] > best_val_acc:
-            best_val_acc = metrics['val_acc']
-            torch.save(classifier.state_dict(), f"{d_name}_finegrained_classifier.pt")
 
+    torch.save(classifier.state_dict(), f"{d_name}_finegrained_classifier.pt")
     wandb.finish()

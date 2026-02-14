@@ -1,11 +1,9 @@
 import argparse
 import os
-import gc
 import torch
-import torch.nn.functional as F
 import numpy as np
-from transformers import RobertaTokenizerFast, RobertaModel, GPT2TokenizerFast, GPT2Model
-from datasets import load_dataset, concatenate_datasets
+from transformers import RobertaTokenizerFast, RobertaModel
+from datasets import load_dataset
 import config as CFG
 from modules import Roberta_classifier
 import wandb
@@ -46,14 +44,12 @@ if __name__ == "__main__":
 
     print("loading data...")
     train_dataset = load_dataset(args.dataset, split='train')
-    val_dataset = load_dataset(args.dataset, split='validation' if args.dataset == 'SetFit/sst2' else 'test')
 
     if args.dataset == 'ag_news':
         def replace_bad_string(example):
             example["text"] = example["text"].replace("#36;", "").replace("#39;", "'")
             return example
         train_dataset = train_dataset.map(replace_bad_string)
-        val_dataset = val_dataset.map(replace_bad_string)
 
     tokenizer = RobertaTokenizerFast.from_pretrained('roberta-base')
     def tokenize_fn(e):
@@ -61,16 +57,13 @@ if __name__ == "__main__":
 
     print("tokenizing...")
     encoded_train_dataset = train_dataset.map(tokenize_fn, batched=True, batch_size=len(train_dataset))
-    encoded_val_dataset = val_dataset.map(tokenize_fn, batched=True, batch_size=len(val_dataset))
 
-    for ds in [encoded_train_dataset, encoded_val_dataset]:
-        ds.remove_columns([CFG.example_name[args.dataset]])
-        if args.dataset == 'SetFit/sst2': ds.remove_columns(['label_text'])
-        if args.dataset == 'dbpedia_14': ds.remove_columns(['title'])
+    encoded_train_dataset.remove_columns([CFG.example_name[args.dataset]])
+    if args.dataset == 'SetFit/sst2': encoded_train_dataset.remove_columns(['label_text'])
+    if args.dataset == 'dbpedia_14': encoded_train_dataset.remove_columns(['title'])
 
     print("creating loaders...")
     train_loader = build_loaders(encoded_train_dataset, mode="train")
-    val_loader = build_loaders(encoded_val_dataset, mode="val")
 
     concept_set = CFG.concepts_from_labels[args.dataset]
     classifier = Roberta_classifier(len(concept_set)).to(device)
@@ -78,7 +71,6 @@ if __name__ == "__main__":
 
     print("start training...")
     epochs = CFG.epoch[args.dataset]
-    best_val_acc = -1
     for e in range(epochs):
         print("Epoch ", e+1, ":")
         classifier.train()
@@ -95,23 +87,9 @@ if __name__ == "__main__":
             training_loss.append(loss.item()); training_acc.append(acc.item())
             print(f"batch {i} loss: {loss.item():.4f} acc: {acc.item():.4f}", end="\r")
 
-        classifier.eval()
-        val_loss, val_acc = [], []
-        with torch.no_grad():
-            for batch in val_loader:
-                batch = {k: v.to(device) for k, v in batch.items()}
-                logits = classifier(batch)
-                v_loss = torch.nn.CrossEntropyLoss()(logits, batch["label"])
-                v_acc = get_accuracy(logits, batch["label"])
-                val_loss.append(v_loss.item()); val_acc.append(v_acc.item())
-
-        metrics = {"train_loss": np.mean(training_loss), "train_acc": np.mean(training_acc),
-                   "val_loss": np.mean(val_loss), "val_acc": np.mean(val_acc), "epoch": e+1}
-        print(f"\ntrain loss: {metrics['train_loss']:.4f} | val acc: {metrics['val_acc']:.4f}")
+        metrics = {"train_loss": np.mean(training_loss), "train_acc": np.mean(training_acc), "epoch": e+1}
+        print(f"\ntrain loss: {metrics['train_loss']:.4f} | train acc: {metrics['train_acc']:.4f}")
         wandb.log(metrics)
-
-        if metrics['val_acc'] > best_val_acc:
-            best_val_acc = metrics['val_acc']
-            torch.save(classifier.state_dict(), args.dataset.replace('/', '_') + "_classifier.pt")
+        torch.save(classifier.state_dict(), args.dataset.replace('/', '_') + "_classifier.pt")
     
     wandb.finish()
