@@ -161,6 +161,14 @@ if __name__ == "__main__":
         cbl = CBLResidual(config, len(concept_set), args.residual_dim, tokenizer).to(device)
     opt_cbl = torch.optim.Adam(cbl.parameters(), lr=5e-5)
     print("preparing classifier")
+    total_params = sum(p.numel() for p in preLM.parameters())
+    trainable_params = sum(p.numel() for p in preLM.parameters() if p.requires_grad)
+    cbl_params = sum(p.numel() for p in cbl.parameters())
+    trainable_params += cbl_params
+    total_params += cbl_params
+    print(f"Total parameters: {total_params}")
+    print(f"Trainable parameters: {trainable_params} = {trainable_params/total_params:.4f} of total")
+    wandb.log({"trainable_parameters": trainable_params, "trainable_ratio": trainable_params/total_params})
     
     classifier = torch.nn.Linear(args.residual_dim, len(concept_set)).to(device)
     

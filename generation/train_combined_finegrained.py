@@ -11,7 +11,7 @@ from transformers import LlamaConfig, LlamaModel, AutoTokenizer, RobertaTokenize
 from peft import LoraConfig, TaskType, get_peft_model
 from modules import CBLResidual, CBL, Roberta_classifier
 import time
-from utils import elastic_net_penalty, mean_pooling, eos_pooling
+from utils import elastic_net_penalty, mean_pooling, eos_pooling, get_labels, cos_sim_cubed
 import wandb
 def set_seed(seed):
     torch.manual_seed(seed)
@@ -36,22 +36,23 @@ parser.add_argument("--orthogonal_loss_weight", type=float, default=0)
 parser.add_argument("--residual_penalty_weight", type=float, default=0)
 parser.add_argument("--DEBUG", action='store_true', help="If set, use a smaller subset of data for quick debugging.")
 
-
 class ClassificationDataset(torch.utils.data.Dataset):
-    def __init__(self, encoded_text):
+    def __init__(self, encoded_text, s):
         self.encoded_text = encoded_text
 
+        self.s = s
 
     def __getitem__(self, idx):
         t = {key: torch.tensor(values[idx]) for key, values in self.encoded_text.items()}
-        return t
+        y = torch.FloatTensor(self.s[idx])
+        return t, y
 
     def __len__(self):
         return len(self.encoded_text['input_ids'])
 
 
-def build_loaders(encoded_text, mode):
-    dataset = ClassificationDataset(encoded_text)
+def build_loaders(encoded_text, s, mode):
+    dataset = ClassificationDataset(encoded_text, s)
     dataloader = torch.utils.data.DataLoader(dataset, batch_size=args.batch_size, num_workers=args.num_workers,
                                              shuffle=True if mode == "train" else False)
     return dataloader
@@ -63,7 +64,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     set_seed(args.seed)
 
-    wandb.init(project="cbm-generation-new", name=f"train-{args.dataset}-seed{args.seed}",
+    wandb.init(project="cbm-generation-new", name=f"finegrained-{args.dataset}-seed{args.seed}",
                config=vars(args))
     
     run_name = wandb.run.id
@@ -139,15 +140,59 @@ if __name__ == "__main__":
         encoded_test_dataset = encoded_test_dataset.remove_columns(['title'])
     encoded_test_dataset = encoded_test_dataset[:len(encoded_test_dataset)]
 
-    concept_set = CFG.concepts_from_labels[args.dataset]
+    concept_set = CFG.concept_set[args.dataset]
     print("concept len: ", len(concept_set))
 
-    print("creating loader...")
-    train_loader = build_loaders(encoded_train_dataset, mode="train")
-    if args.dataset == 'SetFit/sst2':
-        val_loader = build_loaders(encoded_val_dataset, mode="valid")
-    test_loader = build_loaders(encoded_test_dataset, mode="test")
+    d_name = args.dataset.replace('/', '_')
+    prefix = "./"
+    if args.labeling == 'mpnet':
+        prefix += "mpnet_acs"
+    elif args.labeling == 'simcse':
+        prefix += "simcse_acs"
+    elif args.labeling == 'angle':
+        prefix += "angle_acs"
+    elif args.labeling == 'llm':
+        prefix += "llm_labeling"
 
+    prefix += "/"
+    prefix += d_name
+    prefix += "/"
+    
+    print(f"Loading concept labels from: {prefix}")
+    train_similarity = np.load(prefix + "/concept_labels_train.npy")
+    if args.dataset == 'SetFit/sst2':
+        val_similarity = np.load(prefix + "/concept_labels_val.npy")
+
+    if args.automatic_concept_correction:
+        start = time.time()
+        print("training intervention...")
+        for i in range(train_similarity.shape[0]):
+            for j in range(len(concept_set)):
+                if get_labels(j, args.dataset) != encoded_train_dataset["label"][i]:
+                    train_similarity[i][j] = 0.0
+                else:
+                    if train_similarity[i][j] < 0.0:
+                        train_similarity[i][j] = 0.0
+        
+        if args.dataset == 'SetFit/sst2':
+            for i in range(val_similarity.shape[0]):
+                for j in range(len(concept_set)):
+                    if get_labels(j, args.dataset) != encoded_val_dataset["label"][i]:
+                        val_similarity[i][j] = 0.0
+                    else:
+                        if val_similarity[i][j] < 0.0:
+                            val_similarity[i][j] = 0.0
+        end = time.time()
+        print("time of training intervention:", (end - start) / 3600, "hours")
+
+    print("creating loader...")
+    train_loader = build_loaders(encoded_train_dataset, train_similarity, mode="train")
+    
+    if args.dataset == 'SetFit/sst2':
+        val_loader = build_loaders(encoded_val_dataset, val_similarity, mode="valid")
+    
+    test_similarity = np.zeros((len(encoded_test_dataset["label"]), 1))
+    test_loader = build_loaders(encoded_test_dataset, test_similarity, mode="test")
     print("preparing backbone")
     preLM = LlamaModel.from_pretrained('meta-llama/Meta-Llama-3-8B', torch_dtype=torch.bfloat16).to(device)
     preLM = get_peft_model(preLM, lora_config)
@@ -161,6 +206,14 @@ if __name__ == "__main__":
         cbl = CBLResidual(config, len(concept_set), args.residual_dim, tokenizer).to(device)
     opt_cbl = torch.optim.Adam(cbl.parameters(), lr=5e-5)
     print("preparing classifier")
+    total_params = sum(p.numel() for p in preLM.parameters())
+    trainable_params = sum(p.numel() for p in preLM.parameters() if p.requires_grad)
+    cbl_params = sum(p.numel() for p in cbl.parameters())
+    trainable_params += cbl_params
+    total_params += cbl_params
+    print(f"Total parameters: {total_params}")
+    print(f"Trainable parameters: {trainable_params} = {trainable_params/total_params:.4f} of total")
+    wandb.log({"trainable_parameters": trainable_params, "trainable_ratio": trainable_params/total_params})
     
     classifier = torch.nn.Linear(args.residual_dim, len(concept_set)).to(device)
     
@@ -199,7 +252,7 @@ if __name__ == "__main__":
         }
 
         
-        for i, batch in tqdm(enumerate(train_loader), total=len(train_loader)):
+        for i, (batch, batch_sim) in tqdm(enumerate(train_loader), total=len(train_loader)):
             batch = {k: v.to(device) for k, v in batch.items()}
             concept_label = torch.where(batch["attention_mask"][:, :-1] == 0, -100, batch["label"].view(-1, 1))
             word_label = torch.where(batch["attention_mask"][:, :-1] == 0, -100, batch["input_ids"][:, 1:])
@@ -209,11 +262,16 @@ if __name__ == "__main__":
             # print("elastic_net_alphaunsup shape in training loop:", unsup.shape)
             # print("vocabs shape in training loop:", vocabs.shape)
             
-            concept_loss = torch.nn.CrossEntropyLoss()(concepts[:, :-1, :].reshape(-1, len(concept_set)), concept_label.reshape(-1))
+            # concept_loss = torch.nn.CrossEntropyLoss()(concepts[:, :-1, :].reshape(-1, len(concept_set)), concept_label.reshape(-1))
             word_loss = torch.nn.CrossEntropyLoss()(vocabs[:, :-1, :].reshape(-1, config.vocab_size), word_label.reshape(-1))
             loss = args.concept_loss * concept_loss + word_loss
             reg = elastic_net_penalty(cbl.fc.weight[:, :len(concept_set)])
             
+            batch_sim = batch_sim.to(device) # (B, C)
+            batch_sim = batch_sim.unsqueeze(1).expand(-1, concepts.shape[1], -1) # (B, seq_len, C)
+            concepts = concepts.view(-1, concepts.shape[-1]) # (B*seq_len, C)
+            batch_sim = batch_sim.contiguous().view(-1, batch_sim.shape[-1]) # (B*seq_len, C)
+            concept_loss = cos_sim_cubed(concepts, batch_sim)
             if matched_unsup is not None:
                 orthogonal_loss = torch.cosine_similarity(concepts, matched_unsup, dim=-1).mean().abs() ## TODO: check shape
                 loss += args.orthogonal_loss_weight * orthogonal_loss
