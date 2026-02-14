@@ -76,8 +76,10 @@ if __name__ == "__main__":
     train_similarity = np.load(os.path.join(prefix, "concept_labels_train.npy"))
 
     train_loader = build_loaders(encoded_train_dataset, train_similarity, mode="train")
-
+    print("concept len: ", len(CFG.concept_set[args.dataset]))
+    print("Test batch: ", next(iter(train_loader)))
     concept_set = CFG.concept_set[args.dataset]
+    print("concept are: ", concept_set)
     classifier = Roberta_classifier(len(concept_set)).to(device)
     optimizer = torch.optim.Adam(classifier.parameters(), lr=5e-6)
     criterion = torch.nn.CrossEntropyLoss()
