@@ -444,7 +444,7 @@ if __name__ == "__main__":
 
     
     roberta_tokenizer = RobertaTokenizerFast.from_pretrained('roberta-base')
-    classifier_path = args.dataset.replace('/', '_') + "_classifier.pt"
+    classifier_path = args.dataset.replace('/', '_') + "_finegrained_classifier_best.pt"
     classifier = Roberta_classifier(len(concept_set)).to(device)
     classifier.load_state_dict(torch.load(classifier_path, map_location=device))
     
