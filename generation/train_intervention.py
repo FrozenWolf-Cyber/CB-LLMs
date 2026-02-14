@@ -399,7 +399,7 @@ if __name__ == "__main__":
     torch.cuda.empty_cache()
     gc.collect()
     preLM = CustomLlamaModel.from_pretrained('meta-llama/Meta-Llama-3-8B', torch_dtype=torch.bfloat16)
-    preLM.create_intermediate(args.intermediate_loc, len(concept_set))
+    preLM.create_intermediate(args.intermediate_loc, len(concept_set), intermediate_sizes=args.intermediate_sizes, skip_dropout=args.skip_dropout)
     preLM.to(device)
     ## lOAD BEST MODEL AND
     best_path = prefix + model_name + "_epoch_" + str(best_epoch)
