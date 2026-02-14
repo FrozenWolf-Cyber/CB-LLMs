@@ -46,7 +46,7 @@ if __name__ == "__main__":
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
     args = parser.parse_args()
     
-    wandb.init(project="CB-LLM-steer", name=f"{args.dataset}_{args.labeling}", config=vars(args))
+    wandb.init(project="CB-LLM-steer", name=f"{args.dataset}_finegrained", config=vars(args))
 
     print("loading data...")
     train_dataset = load_dataset(args.dataset, split='train')
@@ -127,6 +127,6 @@ if __name__ == "__main__":
         wandb.log(metrics)
         if metrics['val_acc'] > best_val_acc:
             best_val_acc = metrics['val_acc']
-            torch.save(classifier.state_dict(), f"{d_name}_finegrained_classifier_best.pt")
+            torch.save(classifier.state_dict(), f"{d_name}_finegrained_classifier.pt")
 
     wandb.finish()
