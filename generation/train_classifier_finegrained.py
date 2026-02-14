@@ -58,13 +58,18 @@ if __name__ == "__main__":
 
     tokenizer = RobertaTokenizerFast.from_pretrained('roberta-base')
 
-    def tokenize_fn(e):
-        return tokenizer(e[CFG.example_name[args.dataset]], padding=True, truncation=True, max_length=args.max_length)
 
-    encoded_train_dataset = train_dataset.map(tokenize_fn, batched=True, batch_size=len(train_dataset))
-    encoded_train_dataset.remove_columns([CFG.example_name[args.dataset]])
-    if args.dataset == 'SetFit/sst2': encoded_train_dataset.remove_columns(['label_text'])
-    if args.dataset == 'dbpedia_14': encoded_train_dataset.remove_columns(['title'])
+
+    encoded_train_dataset = train_dataset.map(
+        lambda e: tokenizer(e[CFG.example_name[args.dataset]], padding=True, truncation=True,
+                            max_length=args.max_length), batched=True,
+        batch_size=len(train_dataset))
+    encoded_train_dataset = encoded_train_dataset.remove_columns([CFG.example_name[args.dataset]])
+    if args.dataset == 'SetFit/sst2':
+        encoded_train_dataset = encoded_train_dataset.remove_columns(['label_text'])
+    if args.dataset == 'dbpedia_14':
+        encoded_train_dataset = encoded_train_dataset.remove_columns(['title'])
+    encoded_train_dataset = encoded_train_dataset[:len(encoded_train_dataset)]
 
     d_name = args.dataset.replace('/', '_')
     prefix = f"./{args.labeling}_acs/{d_name}/"
