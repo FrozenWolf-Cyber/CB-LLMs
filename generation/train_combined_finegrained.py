@@ -35,6 +35,8 @@ parser.add_argument("--residual_dim", type=int, default=768)
 parser.add_argument("--orthogonal_loss_weight", type=float, default=0)
 parser.add_argument("--residual_penalty_weight", type=float, default=0)
 parser.add_argument("--DEBUG", action='store_true', help="If set, use a smaller subset of data for quick debugging.")
+parser.add_argument("--automatic_concept_correction", action='store_true', help="If set, automatically set concept labels to 0 for concepts that are not present in the example according to the ground truth label. This is a form of training intervention to correct mislabeled concepts.")
+parser.add_argument("--labeling", type=str, default="mpnet", help="mpnet, angle, simcse, llm")
 
 class ClassificationDataset(torch.utils.data.Dataset):
     def __init__(self, encoded_text, s):

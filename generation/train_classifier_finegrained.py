@@ -45,7 +45,7 @@ if __name__ == "__main__":
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
     args = parser.parse_args()
     
-    wandb.init(project="CB-LLM-steer", name=f"{args.dataset}_finegrained", config=vars(args))
+    wandb.init(project="CB-LLMs-steer", name=f"{args.dataset}_finegrained", config=vars(args))
 
     print("loading data...")
     train_dataset = load_dataset(args.dataset, split='train')
@@ -71,6 +71,7 @@ if __name__ == "__main__":
         encoded_train_dataset = encoded_train_dataset.remove_columns(['title'])
     encoded_train_dataset = encoded_train_dataset[:len(encoded_train_dataset)]
 
+    print("Len of dataset: ", len(encoded_train_dataset))
     d_name = args.dataset.replace('/', '_')
     prefix = f"./{args.labeling}_acs/{d_name}/"
     train_similarity = np.load(os.path.join(prefix, "concept_labels_train.npy"))
@@ -85,7 +86,7 @@ if __name__ == "__main__":
     criterion = torch.nn.CrossEntropyLoss()
 
     epochs = CFG.epoch[args.dataset]
-    for e in range(epochs):
+    for e in range(min(epochs, 10)):  # Limit to 10 epochs for debugging
         classifier.train()
         training_loss, training_acc = [], []
         for i, (batch, targets) in enumerate(train_loader):
