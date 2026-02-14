@@ -7,10 +7,20 @@ import evaluate
 from tqdm.auto import tqdm
 from datasets import load_dataset, concatenate_datasets
 import config as CFG
-from transformers import LlamaConfig, AutoTokenizer, RobertaTokenizerFast
-from modules import Roberta_classifier
-from module_intervention import CustomLlamaModel, CustomLlamaForCausalLM, eos_pooling
+from transformers import LlamaConfig, LlamaModel, AutoTokenizer, RobertaTokenizerFast
+from peft import LoraConfig, TaskType, get_peft_model
+from modules import CBLResidual, CBL, Roberta_classifier
+from module_intervention import CustomLlamaModel, CustomLlamaForCausalLM, amplify_intervention, compute_training_losses
+import time
+import random
+# from torch.cuda.amp import autocast, GradScaler
+from utils import elastic_net_penalty, mean_pooling, eos_pooling
 import wandb
+def set_seed(seed):
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    random.seed(seed)
 import glob
 import pickle
 import gc
