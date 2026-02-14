@@ -44,7 +44,19 @@ parser.add_argument("--intervention_gen_loss", type=float, default=1.0)
 parser.add_argument("--epoch", type=int, default=10)
 parser.add_argument("--intervention_margin", type=float, default=10.0)
 parser.add_argument("--intervention_spread", type=float, default=2.0)
-
+parser.add_argument(
+    "--intermediate_sizes", 
+    type=int, 
+    nargs="+", 
+    default=[2048, 1024, 512, 128],
+    help="List of hidden dimensions for the U-Net bottleneck"
+)
+parser.add_argument(
+    "--skip_dropout", 
+    type=float, 
+    default=0.0, 
+    help="Dropout rate for skip connections in the U-Net"
+)
 
 class ClassificationDataset(torch.utils.data.Dataset):
     def __init__(self, encoded_text):
@@ -161,12 +173,20 @@ if __name__ == "__main__":
     print("preparing backbone")
     # preLM = LlamaModel.from_pretrained('meta-llama/Meta-Llama-3-8B', torch_dtype=torch.bfloat16).to(device)
     preLM = CustomLlamaModel.from_pretrained('meta-llama/Meta-Llama-3-8B', torch_dtype=torch.bfloat16)
-    preLM.create_intermediate(args.intermediate_loc, len(concept_set))
+    preLM.create_intermediate(args.intermediate_loc, len(concept_set), intermediate_sizes=args.intermediate_sizes, skip_dropout=args.skip_dropout)
     preLM.to(device)
     
     preLM_generator = CustomLlamaForCausalLM.from_pretrained('meta-llama/Meta-Llama-3-8B', torch_dtype=torch.bfloat16)
     preLM_generator.model = preLM
     preLM_generator.lm_head.to(device)
+    
+    ## print numel
+    total_params = sum(p.numel() for p in preLM.parameters())
+    trainable_params = sum(p.numel() for p in preLM.parameters() if p.requires_grad)
+    print(f"Total parameters: {total_params}")
+    print(f"Trainable parameters: {trainable_params} = {trainable_params/total_params:.4f} of total")
+    wandb.log({"trainable_parameters": trainable_params, "trainable_ratio": trainable_params/total_params})
+    
     
     # preLM = get_peft_model(preLM, lora_config)
     # preLM.print_trainable_parameters()
@@ -213,6 +233,8 @@ if __name__ == "__main__":
     for e in range(epochs):
         print("Epoch ", e+1, ":")
         preLM.train()
+        preLM_generator.train()
+        preLM.intermediate.train()
         # cbl.train()
         training_losses = {
                 "loss": [],
@@ -225,6 +247,15 @@ if __name__ == "__main__":
 
         
         for i, batch in tqdm(enumerate(train_loader), total=len(train_loader)):
+            gate_logs = {}
+            for i, gate_param in enumerate(preLM.intermediate.gates):
+                    # .item() is crucial to get the scalar value
+                    gate_logs[f"gates/skip_layer_{i}"] = gate_param.item()
+
+                # Log the final output gate (how much the whole bottleneck affects Llama)
+            gate_logs["gates/final_residual_gate"] = preLM.intermediate.final_gate.item()
+
+
             batch = {k: v.to(device) for k, v in batch.items()}
             concept_label = torch.where(batch["attention_mask"][:, :-1] == 0, -100, batch["label"].view(-1, 1))
             word_label = torch.where(batch["attention_mask"][:, :-1] == 0, -100, batch["input_ids"][:, 1:])
@@ -257,6 +288,9 @@ if __name__ == "__main__":
             
             log["epoch"] = e + 1
             log["batch"] = i + 1
+            
+            log = {**log, **gate_logs}
+            
             wandb.log(log)
             
             if args.DEBUG and i >= 2:
@@ -273,6 +307,8 @@ if __name__ == "__main__":
 
         if args.dataset == 'SetFit/sst2':
             preLM.eval()
+            preLM_generator.eval()
+            preLM.intermediate.eval()
 
             val_losses = {
                 "val_loss": [],
@@ -370,6 +406,7 @@ if __name__ == "__main__":
     state_dict = torch.load(best_path, map_location=device)  # or "cuda" if needed
     preLM.intermediate.load_state_dict(state_dict)
     preLM.eval()
+    preLM.intermediate.eval()
     preLM_generator.model = preLM
     preLM_generator.eval()
 
@@ -420,9 +457,17 @@ if __name__ == "__main__":
                 print(f"Class {concept_set[j]}: {decoded_text}")
                 text.append(decoded_text)
 
-                roberta_text_ids = torch.tensor([roberta_tokenizer.encode(decoded_text)]).to(device)
-                roberta_attention_mask = torch.ones_like(roberta_text_ids)
-                roberta_input = {"input_ids": roberta_text_ids, "attention_mask": roberta_attention_mask}
+                encoded_input = roberta_tokenizer(
+                    decoded_text, 
+                    return_tensors='pt', 
+                    truncation=True, 
+                    max_length=512
+                ).to(device)
+
+                roberta_input = {
+                    "input_ids": encoded_input["input_ids"], 
+                    "attention_mask": encoded_input["attention_mask"]
+                }
 
                 logits = classifier(roberta_input)
                 pred.append(logits)

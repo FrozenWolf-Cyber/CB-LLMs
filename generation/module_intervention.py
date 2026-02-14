@@ -96,7 +96,10 @@ class LlamaUNetBottleneck(nn.Module):
         
         for i, (dec, norm, gate) in enumerate(zip(self.decoders, self.dec_norms, self.gates)):
             h_up = self.act(dec(h))
-            h = norm(h_up + (gate * skips[i]))
+            
+            skip_connection = self.skip_dropout(skips[i])
+            
+            h = norm(h_up + (gate * skip_connection))
             
         x_reconstructed = self.final_proj(h)
         output = x_original + (self.final_gate * x_reconstructed)
@@ -453,6 +456,8 @@ def compute_training_losses(
             attention_mask=batch["attention_mask"],
         )
     )
+    pre_hidden_states = pre_hidden_states.detach() 
+    ## technically pre_hidden_states wouldn't need detach since firsthalf is no_grad 
 
     # Encode into concept space
     # concepts : (B, T, C)
