@@ -133,7 +133,7 @@ class CustomLlamaModel(LlamaPreTrainedModel):
         for p in self.parameters():
             p.requires_grad = False
 
-    def create_intermediate(self, where, concept_size, intermediate_sizes=[1024, 512, 256], debug=False):
+    def create_intermediate(self, where, concept_size, intermediate_sizes=[1024, 512, 256], debug=False, skip_dropout=0.0):
         self.where = where
         self.debug = debug
         self.concept_size = concept_size
@@ -144,7 +144,8 @@ class CustomLlamaModel(LlamaPreTrainedModel):
         else:
             self.intermediate = LlamaUNetBottleneck(hidden_size=hidden_size,
                                                     intermediate_sizes=intermediate_sizes, #4096/8 = 512
-                                                    concept_size=concept_size
+                                                    concept_size=concept_size,
+                                                    skip_dropout=skip_dropout
                                                     )
 
         self.add_module("intermediate", self.intermediate)
