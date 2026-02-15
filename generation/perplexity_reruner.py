@@ -55,7 +55,7 @@ for local_runs in os.listdir("."):
         found = False
         for r in runs:
             if "intervention" in r.displayName:
-                print("Skipping intervention run:", r.displayName)
+                # print("Skipping intervention run:", r.displayName)
                 continue
             if r.id == run_name:
                 # print("Found matching wandb run, will be evaluated:", run_name)
