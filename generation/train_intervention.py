@@ -57,6 +57,11 @@ parser.add_argument(
     default=0.0, 
     help="Dropout rate for skip connections in the U-Net"
 )
+parser.add_argument(
+    "--gate", 
+    action='store_true', 
+    help="Whether to use a learnable gate for the skip connections in the U-Net"
+)
 
 class ClassificationDataset(torch.utils.data.Dataset):
     def __init__(self, encoded_text):
@@ -173,7 +178,7 @@ if __name__ == "__main__":
     print("preparing backbone")
     # preLM = LlamaModel.from_pretrained('meta-llama/Meta-Llama-3-8B', torch_dtype=torch.bfloat16).to(device)
     preLM = CustomLlamaModel.from_pretrained('meta-llama/Meta-Llama-3-8B', torch_dtype=torch.bfloat16)
-    preLM.create_intermediate(args.intermediate_loc, len(concept_set), intermediate_sizes=args.intermediate_sizes, skip_dropout=args.skip_dropout)
+    preLM.create_intermediate(args.intermediate_loc, len(concept_set), intermediate_sizes=args.intermediate_sizes, skip_dropout=args.skip_dropout, gate=args.gate)
     preLM.to(device)
     
     preLM_generator = CustomLlamaForCausalLM.from_pretrained('meta-llama/Meta-Llama-3-8B', torch_dtype=torch.bfloat16)
@@ -399,7 +404,7 @@ if __name__ == "__main__":
     torch.cuda.empty_cache()
     gc.collect()
     preLM = CustomLlamaModel.from_pretrained('meta-llama/Meta-Llama-3-8B', torch_dtype=torch.bfloat16)
-    preLM.create_intermediate(args.intermediate_loc, len(concept_set), intermediate_sizes=args.intermediate_sizes, skip_dropout=args.skip_dropout)
+    preLM.create_intermediate(args.intermediate_loc, len(concept_set), intermediate_sizes=args.intermediate_sizes, skip_dropout=args.skip_dropout, gate=args.gate)
     preLM.to(device)
     ## lOAD BEST MODEL AND
     best_path = prefix + model_name + "_epoch_" + str(best_epoch)

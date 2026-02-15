@@ -43,13 +43,14 @@ import torch.nn as nn
 
 class LlamaUNetBottleneck(nn.Module):
     ## TODO: Improve this skipping. See if good balance be found
-    def __init__(self, hidden_size=4096, intermediate_sizes=[1024, 512, 256], concept_size=14, skip_dropout=0.3):
+    def __init__(self, hidden_size=4096, intermediate_sizes=[1024, 512, 256], concept_size=14, skip_dropout=0.3, gate=True):
         super().__init__()
         self.act = nn.SiLU()
         self.concept_size = concept_size
         self.encoders = nn.ModuleList()
         self.enc_norms = nn.ModuleList()
         self.skip_dropout = nn.Dropout(p=skip_dropout)
+        self.gate = gate
         
         current_dim = hidden_size
         for next_dim in intermediate_sizes:
@@ -99,10 +100,17 @@ class LlamaUNetBottleneck(nn.Module):
             
             skip_connection = self.skip_dropout(skips[i])
             
-            h = norm(h_up + (gate * skip_connection))
+            if self.gate:
+                h = norm(h_up + (gate * skip_connection))
+            else:
+                h = norm(h_up + skip_connection)
             
         x_reconstructed = self.final_proj(h)
-        output = x_original + (self.final_gate * x_reconstructed)
+        
+        if not self.gate:
+            output = x_original + x_reconstructed
+        else:
+            output = x_original + (self.final_gate * x_reconstructed)
         
         return output
 
@@ -133,7 +141,7 @@ class CustomLlamaModel(LlamaPreTrainedModel):
         for p in self.parameters():
             p.requires_grad = False
 
-    def create_intermediate(self, where, concept_size, intermediate_sizes=[1024, 512, 256], debug=False, skip_dropout=0.0):
+    def create_intermediate(self, where, concept_size, intermediate_sizes=[1024, 512, 256], debug=False, skip_dropout=0.0, gate=True):
         self.where = where
         self.debug = debug
         self.concept_size = concept_size
@@ -145,7 +153,8 @@ class CustomLlamaModel(LlamaPreTrainedModel):
             self.intermediate = LlamaUNetBottleneck(hidden_size=hidden_size,
                                                     intermediate_sizes=intermediate_sizes, #4096/8 = 512
                                                     concept_size=concept_size,
-                                                    skip_dropout=skip_dropout
+                                                    skip_dropout=skip_dropout,
+                                                    gate=gate
                                                     )
 
         self.add_module("intermediate", self.intermediate)

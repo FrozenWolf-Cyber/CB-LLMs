@@ -123,7 +123,8 @@ def main():
         args.intermediate_loc, 
         len(concept_set), 
         intermediate_sizes=args.intermediate_sizes, 
-        skip_dropout=args.skip_dropout
+        skip_dropout=args.skip_dropout,
+        gate=args.gate
     )
     preLM.to(cmd_args.device)
     
