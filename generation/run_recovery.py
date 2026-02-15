@@ -93,7 +93,6 @@ def main():
     print("Loading test dataset...")
     test_dataset = load_dataset(args.dataset, split='test')
     
-    # Preprocessing logic from original script
     if args.dataset == 'ag_news':
         def replace_bad_string(example):
             example["text"] = example["text"].replace("#36;", "")
@@ -104,15 +103,16 @@ def main():
     encoded_test_dataset = test_dataset.map(
         lambda e: tokenizer(e[CFG.example_name[args.dataset]], padding=True, truncation=True,
                             max_length=args.max_length), batched=True, batch_size=len(test_dataset))
-    
-    # Remove columns
-    cols_to_remove = [CFG.example_name[args.dataset]]
-    if args.dataset == 'SetFit/sst2': cols_to_remove.append('label_text')
-    if args.dataset == 'dbpedia_14': cols_to_remove.append('title')
-    encoded_test_dataset = encoded_test_dataset.remove_columns(cols_to_remove)
-    
+    encoded_test_dataset = encoded_test_dataset.remove_columns([CFG.example_name[args.dataset]])
+    if args.dataset == 'SetFit/sst2':
+        encoded_test_dataset = encoded_test_dataset.remove_columns(['label_text'])
+    if args.dataset == 'dbpedia_14':
+        encoded_test_dataset = encoded_test_dataset.remove_columns(['title'])
+    encoded_test_dataset = encoded_test_dataset[:len(encoded_test_dataset)]
+
     concept_set = CFG.concepts_from_labels[args.dataset]
-    test_loader = build_loaders(encoded_test_dataset, args.batch_size, args.num_workers, mode="test")
+    print("concept len: ", len(concept_set))
+    test_loader = build_loaders(encoded_test_dataset, mode="test")
 
     # 3. Initialize Model Structure
     print("Initializing Model...")
@@ -169,71 +169,71 @@ def main():
     # ==============================================================================
 
     # --- A. STEERABILITY ---
-    print("\n=== Running Steerability Test ===")
-    roberta_tokenizer = RobertaTokenizerFast.from_pretrained('roberta-base')
-    classifier_path = args.dataset.replace('/', '_') + "_classifier.pt"
+    # print("\n=== Running Steerability Test ===")
+    # roberta_tokenizer = RobertaTokenizerFast.from_pretrained('roberta-base')
+    # classifier_path = args.dataset.replace('/', '_') + "_classifier.pt"
     
-    if not os.path.exists(classifier_path):
-        print(f"Warning: Classifier not found at {classifier_path}. Skipping Steerability.")
-    else:
-        classifier = Roberta_classifier(len(concept_set)).to(cmd_args.device)
-        classifier.load_state_dict(torch.load(classifier_path, map_location=cmd_args.device))
+    # if not os.path.exists(classifier_path):
+    #     print(f"Warning: Classifier not found at {classifier_path}. Skipping Steerability.")
+    # else:
+    #     classifier = Roberta_classifier(len(concept_set)).to(cmd_args.device)
+    #     classifier.load_state_dict(torch.load(classifier_path, map_location=cmd_args.device))
         
-        pred = []
-        text = []
-        acc_metric = evaluate.load("accuracy")
+    #     pred = []
+    #     text = []
+    #     acc_metric = evaluate.load("accuracy")
 
-        with torch.no_grad():
-            # Running fewer iterations for speed if needed, or keeping original 100 // len
-            iterations = 100 // len(concept_set)
-            for i in tqdm(range(iterations), desc="Steerability"):
-                input_ids = torch.tensor([tokenizer.encode("")]).to(cmd_args.device)
-                attention_mask = (input_ids != tokenizer.pad_token_id).long()
+    #     with torch.no_grad():
+    #         # Running fewer iterations for speed if needed, or keeping original 100 // len
+    #         iterations = 100 // len(concept_set)
+    #         for i in tqdm(range(iterations), desc="Steerability"):
+    #             input_ids = torch.tensor([tokenizer.encode("")]).to(cmd_args.device)
+    #             attention_mask = (input_ids != tokenizer.pad_token_id).long()
                 
-                for j in range(len(concept_set)):
-                    v = [0] * len(concept_set)
-                    v[j] = 1
-                    B, T = input_ids.shape
-                    intervene_tensor = torch.tensor(v, device=cmd_args.device).view(1, 1, -1).expand(B, T, len(concept_set))
+    #             for j in range(len(concept_set)):
+    #                 v = [0] * len(concept_set)
+    #                 v[j] = 1
+    #                 B, T = input_ids.shape
+    #                 intervene_tensor = torch.tensor(v, device=cmd_args.device).view(1, 1, -1).expand(B, T, len(concept_set))
 
-                    preLM_generator.model.intervene = intervene_tensor
-                    preLM_generator.model.intervention_margin = args.intervention_margin
-                    preLM_generator.model.intervention_spread = args.intervention_spread
+    #                 preLM_generator.model.intervene = intervene_tensor
+    #                 preLM_generator.model.intervention_margin = args.intervention_margin
+    #                 preLM_generator.model.intervention_spread = args.intervention_spread
                     
-                    with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
-                        output_tokens = preLM_generator.generate(
-                            input_ids,
-                            attention_mask=attention_mask,
-                            use_cache=True,
-                            max_new_tokens=100,
-                            temperature=0.7,
-                            top_k=100,
-                            top_p=0.9,
-                            repetition_penalty=1.5,
-                            pad_token_id=128001
-                        )
-                    preLM_generator.model.intervene = None
-                    decoded_text = tokenizer.decode(output_tokens[0], skip_special_tokens=True)
-                    text.append(decoded_text)
+    #                 with torch.amp.autocast(device_type="cuda", dtype=torch.bfloat16):
+    #                     output_tokens = preLM_generator.generate(
+    #                         input_ids,
+    #                         attention_mask=attention_mask,
+    #                         use_cache=True,
+    #                         max_new_tokens=100,
+    #                         temperature=0.7,
+    #                         top_k=100,
+    #                         top_p=0.9,
+    #                         repetition_penalty=1.5,
+    #                         pad_token_id=128001
+    #                     )
+    #                 preLM_generator.model.intervene = None
+    #                 decoded_text = tokenizer.decode(output_tokens[0], skip_special_tokens=True)
+    #                 text.append(decoded_text)
 
-                    encoded_input = roberta_tokenizer(
-                        decoded_text, return_tensors='pt', truncation=True, max_length=512
-                    ).to(cmd_args.device)
+    #                 encoded_input = roberta_tokenizer(
+    #                     decoded_text, return_tensors='pt', truncation=True, max_length=512
+    #                 ).to(cmd_args.device)
 
-                    roberta_input = {"input_ids": encoded_input["input_ids"], "attention_mask": encoded_input["attention_mask"]}
-                    logits = classifier(roberta_input)
-                    pred.append(logits)
+    #                 roberta_input = {"input_ids": encoded_input["input_ids"], "attention_mask": encoded_input["attention_mask"]}
+    #                 logits = classifier(roberta_input)
+    #                 pred.append(logits)
 
-        pred = torch.cat(pred, dim=0).detach().cpu()
-        pred_labels = np.argmax(pred.numpy(), axis=-1)
-        refs = list(range(len(concept_set))) * iterations
+    #     pred = torch.cat(pred, dim=0).detach().cpu()
+    #     pred_labels = np.argmax(pred.numpy(), axis=-1)
+    #     refs = list(range(len(concept_set))) * iterations
         
-        # Ensure lengths match (in case of uneven loops)
-        min_len = min(len(pred_labels), len(refs))
-        accuracy = acc_metric.compute(predictions=pred_labels[:min_len], references=refs[:min_len])
+    #     # Ensure lengths match (in case of uneven loops)
+    #     min_len = min(len(pred_labels), len(refs))
+    #     accuracy = acc_metric.compute(predictions=pred_labels[:min_len], references=refs[:min_len])
         
-        print("Steerability test accuracy:", accuracy)
-        wandb.log({"steerability_test_accuracy": accuracy['accuracy']})
+    #     print("Steerability test accuracy:", accuracy)
+    #     wandb.log({"steerability_test_accuracy": accuracy['accuracy']})
 
     # --- B. CONCEPT PREDICTION ---
     print("\n=== Running Concept Prediction Test ===")
