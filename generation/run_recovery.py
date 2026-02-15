@@ -112,7 +112,7 @@ def main():
 
     concept_set = CFG.concepts_from_labels[args.dataset]
     print("concept len: ", len(concept_set))
-    test_loader = build_loaders(encoded_test_dataset, mode="test")
+    test_loader = build_loaders(encoded_test_dataset, mode="test", batch_size=args.batch_size, num_workers=args.num_workers)
 
     # 3. Initialize Model Structure
     print("Initializing Model...")
