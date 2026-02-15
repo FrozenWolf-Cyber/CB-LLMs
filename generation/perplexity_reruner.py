@@ -54,7 +54,7 @@ for local_runs in os.listdir("."):
         # print("Checking run:", run_name)
         found = False
         for r in runs:
-            if "intervention" in r.run_name:
+            if "intervention" in r.displayName:
                 print("Skipping intervention run:", r.run_name)
                 continue
             if r.id == run_name:
