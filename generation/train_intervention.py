@@ -39,6 +39,7 @@ parser.add_argument("--concept_loss", type=float, default=1.0)
 
 parser.add_argument("--intermediate_recon_loss", type=float, default=1.0)
 parser.add_argument("--generation_recon_loss", type=float, default=1.0)
+parser.add_argument("--peft", action='store_true', help="Whether to use PEFT (LoRA) for training the intermediate module")
 
 parser.add_argument("--cyclic_loss", type=float, default=1.0)
 parser.add_argument("--intervention_gen_loss", type=float, default=1.0)
@@ -182,10 +183,44 @@ if __name__ == "__main__":
     preLM.create_intermediate(args.intermediate_loc, len(concept_set), intermediate_sizes=args.intermediate_sizes, skip_dropout=args.skip_dropout, gate=args.gate)
     preLM.to(device)
     
+    if args.peft:
+        print("Using PEFT (LoRA) for training the intermediate module")
+        preLM = get_peft_model(preLM, lora_config)
+        preLM.print_trainable_parameters()
+        preLM.peft_forward = True
+    
     preLM_generator = CustomLlamaForCausalLM.from_pretrained('meta-llama/Meta-Llama-3-8B', torch_dtype=torch.bfloat16)
     preLM_generator.model = preLM
     preLM_generator.lm_head.to(device)
     
+    ####### SANITY CHECK SAVING AND LAODING:
+    temp_path = "temp_intermediate"
+    torch.save(preLM.intermediate.state_dict(), temp_path)
+    
+    if args.peft:
+        preLM.save_pretrained("temp_peft")
+                
+    torch.cuda.empty_cache()
+    gc.collect()
+    preLM = CustomLlamaModel.from_pretrained('meta-llama/Meta-Llama-3-8B', torch_dtype=torch.bfloat16)
+    preLM.create_intermediate(args.intermediate_loc, len(concept_set), intermediate_sizes=args.intermediate_sizes, skip_dropout=args.skip_dropout, gate=args.gate)
+    ## lOAD BEST MODEL AND
+    if args.peft:
+        print("Loading best model with PEFT (LoRA)")
+        preLM = get_peft_model(preLM, lora_config)
+        preLM.print_trainable_parameters()
+        preLM.peft_forward = True
+        preLM.load_adapter("temp_peft")
+        preLM.eval()
+        
+    preLM.to(device)
+    
+
+    state_dict = torch.load(temp_path, map_location=device)  # or "cuda" if needed
+    preLM.intermediate.load_state_dict(state_dict)
+    preLM.eval() 
+    
+    0/0
     ## print numel
     total_params = sum(p.numel() for p in preLM.parameters())
     trainable_params = sum(p.numel() for p in preLM.parameters() if p.requires_grad)
@@ -392,13 +427,19 @@ if __name__ == "__main__":
                 print("save model")
                 best_loss = avg_val_loss
                 torch.save(preLM.intermediate.state_dict(), prefix + model_name + "_epoch_" + str(e + 1))
+                if args.peft:
+                    preLM.save_pretrained(prefix + model_name + "_llama_peft_epoch_" + str(e + 1))
                 wandb.log({"best_model_epoch": e + 1})
             else:
+                if args.peft:
+                    preLM.save_pretrained(prefix + model_name + "_llama_peft_epoch_" + str(e + 1))
                 torch.save(preLM.intermediate.state_dict(), prefix + model_name + "_low_score_epoch_" + str(e + 1))
         else:
             print("save model")
             torch.save(preLM.intermediate.state_dict(), prefix + model_name + "_epoch_" + str(e + 1))
-
+            if args.peft:
+                preLM.save_pretrained(prefix + model_name + "_llama_peft_epoch_" + str(e + 1))
+                
         if args.DEBUG:
             break
 
@@ -414,8 +455,18 @@ if __name__ == "__main__":
     gc.collect()
     preLM = CustomLlamaModel.from_pretrained('meta-llama/Meta-Llama-3-8B', torch_dtype=torch.bfloat16)
     preLM.create_intermediate(args.intermediate_loc, len(concept_set), intermediate_sizes=args.intermediate_sizes, skip_dropout=args.skip_dropout, gate=args.gate)
-    preLM.to(device)
     ## lOAD BEST MODEL AND
+    if args.peft:
+        print("Loading best model with PEFT (LoRA)")
+        preLM = get_peft_model(preLM, lora_config)
+        preLM.print_trainable_parameters()
+        preLM.peft_forward = True
+        peft_path = prefix + model_name + "_llama_peft_epoch_" + str(best_epoch)
+        preLM.load_adapter(peft_path)
+        preLM.eval()
+        
+    preLM.to(device)
+    
     best_path = prefix + model_name + "_epoch_" + str(best_epoch)
     state_dict = torch.load(best_path, map_location=device)  # or "cuda" if needed
     preLM.intermediate.load_state_dict(state_dict)

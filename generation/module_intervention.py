@@ -122,6 +122,7 @@ class LlamaUNetBottleneck(nn.Module):
 class CustomLlamaModel(LlamaPreTrainedModel):
     def __init__(self, config: LlamaConfig):
         super().__init__(config)
+        self.peft_forward = False
         self.config = config
         self.padding_idx = config.pad_token_id
         self.vocab_size = config.vocab_size
@@ -175,7 +176,7 @@ class CustomLlamaModel(LlamaPreTrainedModel):
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
 
-        with torch.no_grad():
+        with torch.set_grad_enabled(self.peft_forward): # If using PEFT, we want gradients to flow through the first half to the intermediate module. Otherwise, we keep it in no_grad mode.
             if inputs_embeds is None:
                 inputs_embeds: torch.Tensor = self.embed_tokens(input_ids)
 
