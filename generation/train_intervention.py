@@ -83,8 +83,10 @@ class ClassificationDataset(torch.utils.data.Dataset):
         return len(self.encoded_text['input_ids'])
 
 
-def build_loaders(encoded_text, mode):
+def build_loaders(encoded_text, mode, overfit=False):
     dataset = ClassificationDataset(encoded_text)
+    if overfit:
+        dataset = torch.utils.data.Subset(dataset, indices=range(min(100, len(dataset))))
     dataloader = torch.utils.data.DataLoader(dataset, batch_size=args.batch_size, num_workers=args.num_workers,
                                              shuffle=True if mode == "train" else False)
     return dataloader
@@ -177,13 +179,10 @@ if __name__ == "__main__":
     print("concept len: ", len(concept_set))
 
 
-    if args.overfit:
-        print("Overfitting mode enabled: using only 100 samples from the training data.")
-        encoded_train_dataset = encoded_train_dataset.select(range(100))
-        
+
 
     print("creating loader...")
-    train_loader = build_loaders(encoded_train_dataset, mode="train")
+    train_loader = build_loaders(encoded_train_dataset, mode="train", overfit=args.overfit)
     if args.dataset == 'SetFit/sst2':
         val_loader = build_loaders(encoded_val_dataset, mode="valid")
     test_loader = build_loaders(encoded_test_dataset, mode="test")
