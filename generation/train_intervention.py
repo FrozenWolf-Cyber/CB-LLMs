@@ -208,6 +208,7 @@ if __name__ == "__main__":
         preLM = PeftModel.from_pretrained(preLM, "temp_peft", is_trainable=False) 
 
         preLM.print_trainable_parameters()
+        preLM = preLM.merge_and_unload()
         preLM.peft_forward = True # Keep your custom flag if needed
         preLM.eval()
     preLM.to(device)
@@ -215,11 +216,12 @@ if __name__ == "__main__":
     preLM_generator.model = preLM
     preLM_generator.lm_head.to(device)
     
+
     ## test preLM generation before loading intermediate weights - sanity check
     with torch.no_grad():
         input_ids = tokenizer("This movie was fantastic! I really enjoyed it.").input_ids
         input_ids = torch.tensor(input_ids).unsqueeze(0).to(device)
-        generated_ids = preLM_generator.generate(input_ids, preLM.base_model.model if args.peft else preLM, length=20, temp=0.7, topk=50, topp=0.9, repetition_penalty=1.5)
+        generated_ids = preLM_generator.generate(input_ids, preLM, length=20, temp=0.7, topk=50, topp=0.9, repetition_penalty=1.5)
         generated_text = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
         print("Generated text before loading intermediate weights:", generated_text)
         
