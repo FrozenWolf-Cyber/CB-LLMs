@@ -86,7 +86,7 @@ class ClassificationDataset(torch.utils.data.Dataset):
 def build_loaders(encoded_text, mode, overfit=False):
     dataset = ClassificationDataset(encoded_text)
     if overfit:
-        dataset = torch.utils.data.Subset(dataset, indices=range(min(100, len(dataset))))
+        dataset = torch.utils.data.Subset(dataset, indices=range(min(10, len(dataset))))
     dataloader = torch.utils.data.DataLoader(dataset, batch_size=args.batch_size, num_workers=args.num_workers,
                                              shuffle=True if mode == "train" else False)
     return dataloader
@@ -333,102 +333,102 @@ if __name__ == "__main__":
         wandb.log({f"avg_{k}": avg_metrics[k] for k in avg_metrics.keys()})
 
 
-        if args.dataset == 'SetFit/sst2':
-            preLM.eval()
-            preLM_generator.eval()
-            preLM.intermediate.eval()
+        # if args.dataset == 'SetFit/sst2':
+        #     preLM.eval()
+        #     preLM_generator.eval()
+        #     preLM.intermediate.eval()
 
-            val_losses = {
-                "val_loss": [],
-                "val_concept_loss": [],
-                "val_intermediate_reconstruction_loss": [],
-                "val_generation_reconstruction_loss": [],
-                "val_cyclic_concept_loss": [],
-                "val_intervened_generation_loss": [],
-            }
+        #     val_losses = {
+        #         "val_loss": [],
+        #         "val_concept_loss": [],
+        #         "val_intermediate_reconstruction_loss": [],
+        #         "val_generation_reconstruction_loss": [],
+        #         "val_cyclic_concept_loss": [],
+        #         "val_intervened_generation_loss": [],
+        #     }
 
-            for i, batch in tqdm(enumerate(val_loader), total=len(val_loader)):
-                batch = {k: v.to(device) for k, v in batch.items()}
+        #     for i, batch in tqdm(enumerate(val_loader), total=len(val_loader)):
+        #         batch = {k: v.to(device) for k, v in batch.items()}
 
-                concept_label = torch.where(
-                    batch["attention_mask"][:, :-1] == 0,
-                    -100,
-                    batch["label"].view(-1, 1),
-                )
+        #         concept_label = torch.where(
+        #             batch["attention_mask"][:, :-1] == 0,
+        #             -100,
+        #             batch["label"].view(-1, 1),
+        #         )
 
-                word_label = torch.where(
-                    batch["attention_mask"][:, :-1] == 0,
-                    -100,
-                    batch["input_ids"][:, 1:],
-                )
+        #         word_label = torch.where(
+        #             batch["attention_mask"][:, :-1] == 0,
+        #             -100,
+        #             batch["input_ids"][:, 1:],
+        #         )
 
-                with torch.no_grad():
-                    with torch.amp.autocast(device_type=device_str, dtype=torch.bfloat16):
-                        loss_dict = compute_training_losses(
-                        batch=batch,
-                        preLM=preLM,
-                        preLM_generator=preLM_generator,
-                        reconstr_crit=reconstr_crit,
-                        CSE_crit=CSE_crit,
-                        concept_label=concept_label,
-                        word_label=word_label,
-                        concept_set=concept_set,
-                        config=config,
-                        args=args,
-                    )
+        #         with torch.no_grad():
+        #             with torch.amp.autocast(device_type=device_str, dtype=torch.bfloat16):
+        #                 loss_dict = compute_training_losses(
+        #                 batch=batch,
+        #                 preLM=preLM,
+        #                 preLM_generator=preLM_generator,
+        #                 reconstr_crit=reconstr_crit,
+        #                 CSE_crit=CSE_crit,
+        #                 concept_label=concept_label,
+        #                 word_label=word_label,
+        #                 concept_set=concept_set,
+        #                 config=config,
+        #                 args=args,
+        #             )
 
 
-                for k, v in loss_dict.items():
-                    val_losses[f"val_{k}"].append(v.detach().cpu().item())
+        #         for k, v in loss_dict.items():
+        #             val_losses[f"val_{k}"].append(v.detach().cpu().item())
                 
 
-                if args.DEBUG and i >= 2:
-                    break
+        #         if args.DEBUG and i >= 2:
+        #             break
  
 
-            avg_val_loss = {}
-            for key in val_losses:
-                if len(val_losses[key]) > 0:
-                    avg_val_loss[key] = sum(val_losses[key]) / len(val_losses[key])
+        #     avg_val_loss = {}
+        #     for key in val_losses:
+        #         if len(val_losses[key]) > 0:
+        #             avg_val_loss[key] = sum(val_losses[key]) / len(val_losses[key])
 
-            print(f"Epoch {e+1} validation losses:", avg_val_loss)
+        #     print(f"Epoch {e+1} validation losses:", avg_val_loss)
 
-            wandb.log({f"avg_{k}": v for k, v in avg_val_loss.items()})
+        #     wandb.log({f"avg_{k}": v for k, v in avg_val_loss.items()})
 
-            avg_val_concept_loss = avg_val_loss["val_concept_loss"]
-            avg_val_total_loss = avg_val_loss["val_loss"]
+        #     avg_val_concept_loss = avg_val_loss["val_concept_loss"]
+        #     avg_val_total_loss = avg_val_loss["val_loss"]
 
 
 
-            avg_val_loss = avg_val_total_loss
-            if avg_val_loss < best_loss:
-                best_epoch = e + 1
-                print("save model")
-                best_loss = avg_val_loss
-                torch.save(preLM.intermediate.state_dict(), prefix + model_name + "_epoch_" + str(e + 1))
-                if args.peft:
-                    preLM.save_pretrained(prefix + model_name + "_llama_peft_epoch_" + str(e + 1))
-                wandb.log({"best_model_epoch": e + 1})
-            else:
-                if args.peft:
-                    preLM.save_pretrained(prefix + model_name + "_llama_peft_epoch_" + str(e + 1))
-                torch.save(preLM.intermediate.state_dict(), prefix + model_name + "_low_score_epoch_" + str(e + 1))
-        else:
-            print("save model")
-            torch.save(preLM.intermediate.state_dict(), prefix + model_name + "_epoch_" + str(e + 1))
-            if args.peft:
-                preLM.save_pretrained(prefix + model_name + "_llama_peft_epoch_" + str(e + 1))
+        #     avg_val_loss = avg_val_total_loss
+        #     if avg_val_loss < best_loss:
+        #         best_epoch = e + 1
+        #         print("save model")
+        #         best_loss = avg_val_loss
+        #         torch.save(preLM.intermediate.state_dict(), prefix + model_name + "_epoch_" + str(e + 1))
+        #         if args.peft:
+        #             preLM.save_pretrained(prefix + model_name + "_llama_peft_epoch_" + str(e + 1))
+        #         wandb.log({"best_model_epoch": e + 1})
+        #     else:
+        #         if args.peft:
+        #             preLM.save_pretrained(prefix + model_name + "_llama_peft_epoch_" + str(e + 1))
+        #         torch.save(preLM.intermediate.state_dict(), prefix + model_name + "_low_score_epoch_" + str(e + 1))
+        # else:
+        #     print("save model")
+        #     torch.save(preLM.intermediate.state_dict(), prefix + model_name + "_epoch_" + str(e + 1))
+        #     if args.peft:
+        #         preLM.save_pretrained(prefix + model_name + "_llama_peft_epoch_" + str(e + 1))
                 
-        if args.DEBUG:
-            break
+        # if args.DEBUG:
+        #     break
 
-        if not args.overfit and args.dataset == 'SetFit/sst2':
-            eval_metrics = evaluate_steerability_and_concepts(
-            preLM, preLM_generator, tokenizer, concept_set, args, 
-            loader=val_loader, device=device
-        )
-            print(f"Validation Metrics: {eval_metrics}")
-            wandb.log({f"val_{k}": v for k, v in eval_metrics.items()})
+        # if not args.overfit and args.dataset == 'SetFit/sst2':
+        #     eval_metrics = evaluate_steerability_and_concepts(
+        #     preLM, preLM_generator, tokenizer, concept_set, args, 
+        #     loader=val_loader, device=device
+        # )
+        #     print(f"Validation Metrics: {eval_metrics}")
+        #     wandb.log({f"val_{k}": v for k, v in eval_metrics.items()})
 
     if args.overfit and args.dataset == 'SetFit/sst2':
         eval_metrics = evaluate_steerability_and_concepts(
