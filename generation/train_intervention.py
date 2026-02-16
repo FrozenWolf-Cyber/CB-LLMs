@@ -222,7 +222,8 @@ if __name__ == "__main__":
         input_ids = tokenizer("This movie was fantastic! I really enjoyed it.").input_ids
         input_ids = torch.tensor(input_ids).unsqueeze(0).to(device)
         attention_mask = torch.ones(input_ids.shape, dtype=torch.long, device=device)
-        generated_ids = preLM_generator.generate(input_ids,                                    
+        with torch.amp.autocast(device_type=device_str, dtype=torch.bfloat16):
+            generated_ids = preLM_generator.generate(input_ids,                                    
                                                  attention_mask=attention_mask,       # must pass if padding exists
                                         use_cache=True,
                                         max_new_tokens=100,                  # instead of length
