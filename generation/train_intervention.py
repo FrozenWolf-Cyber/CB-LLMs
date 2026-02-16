@@ -181,13 +181,14 @@ if __name__ == "__main__":
     # preLM = LlamaModel.from_pretrained('meta-llama/Meta-Llama-3-8B', torch_dtype=torch.bfloat16).to(device)
     preLM = CustomLlamaModel.from_pretrained('meta-llama/Meta-Llama-3-8B', torch_dtype=torch.bfloat16)
     preLM.create_intermediate(args.intermediate_loc, len(concept_set), intermediate_sizes=args.intermediate_sizes, skip_dropout=args.skip_dropout, gate=args.gate)
+    print("Trainable parameters in intermediate module:", sum(p.numel() for p in preLM.intermediate.parameters() if p.requires_grad))
     preLM.to(device)
     
     if args.peft:
         print("Using PEFT (LoRA) for training the intermediate module")
+        preLM.peft_forward = True
         preLM = get_peft_model(preLM, lora_config)
         preLM.print_trainable_parameters()
-        preLM.peft_forward = True
     
     preLM_generator = CustomLlamaForCausalLM.from_pretrained('meta-llama/Meta-Llama-3-8B', torch_dtype=torch.bfloat16)
     preLM_generator.model = preLM
@@ -443,7 +444,7 @@ if __name__ == "__main__":
 
         preLM.print_trainable_parameters()
         preLM = preLM.merge_and_unload()
-        preLM.peft_forward = True # Keep your custom flag if needed
+        preLM.peft_forward = True
         preLM.eval()
     preLM.to(device)
  
