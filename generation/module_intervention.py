@@ -655,6 +655,7 @@ import evaluate
 from modules import CBLResidual, CBL, Roberta_classifier
 from utils import elastic_net_penalty, mean_pooling, eos_pooling
 
+@torch.no_grad()
 def evaluate_steerability_and_concepts(preLM, preLM_generator, tokenizer, concept_set, args, loader=None, device="cuda"):
     """
     Performs Steerability (generation) and Concept Prediction (classification) tests.
@@ -696,14 +697,8 @@ def evaluate_steerability_and_concepts(preLM, preLM_generator, tokenizer, concep
                 preLM_generator.model.intervention_spread = args.intervention_spread
                 
                 with torch.amp.autocast(device_type=device_str, dtype=torch.bfloat16):
-                    output_tokens = preLM_generator.generate(
-                        input_ids,
-                        attention_mask=attention_mask,
-                        max_new_tokens=50, # Shortened for faster validation
-                        temperature=0.7,
-                        top_p=0.9,
-                        repetition_penalty=1.5,
-                        pad_token_id=tokenizer.eos_token_id
+                    output_tokens = generate(
+                        preLM_generator, input_ids, preLM=preLM, length=100, temp=0.7, topk=100, topp=0.9
                     )
                 
                 preLM_generator.model.intervene = None # Reset

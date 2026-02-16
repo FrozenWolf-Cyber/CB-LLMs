@@ -189,52 +189,10 @@ if __name__ == "__main__":
         preLM.print_trainable_parameters()
         preLM.peft_forward = True
     
-
-    ####### SANITY CHECK SAVING AND LAODING:
-    temp_path = "temp_intermediate"
-    torch.save(preLM.intermediate.state_dict(), temp_path)
-    
-    if args.peft:
-        preLM.save_pretrained("temp_peft")
-                
-    torch.cuda.empty_cache()
-    preLM = CustomLlamaModel.from_pretrained('meta-llama/Meta-Llama-3-8B', torch_dtype=torch.bfloat16)
-    preLM.create_intermediate(args.intermediate_loc, len(concept_set), intermediate_sizes=args.intermediate_sizes, skip_dropout=args.skip_dropout, gate=args.gate)
-    ## lOAD BEST MODEL AND
-    if args.peft:
-        print("Loading best model with PEFT (LoRA)")
-        # This replaces get_peft_model() AND load_adapter()
-        # is_trainable=True is needed if you plan to continue training, otherwise False for eval
-        preLM = PeftModel.from_pretrained(preLM, "temp_peft", is_trainable=False) 
-
-        preLM.print_trainable_parameters()
-        preLM = preLM.merge_and_unload()
-        preLM.peft_forward = True # Keep your custom flag if needed
-        preLM.eval()
-    preLM.to(device)
     preLM_generator = CustomLlamaForCausalLM.from_pretrained('meta-llama/Meta-Llama-3-8B', torch_dtype=torch.bfloat16)
     preLM_generator.model = preLM
     preLM_generator.lm_head.to(device)
     
-
-    ## test preLM generation before loading intermediate weights - sanity check
-    with torch.no_grad():
-        input_ids = tokenizer("This movie was fantastic! I really enjoyed it.").input_ids
-        input_ids = torch.tensor(input_ids).unsqueeze(0).to(device)
-        attention_mask = torch.ones(input_ids.shape, dtype=torch.long, device=device)
-        with torch.amp.autocast(device_type=device_str, dtype=torch.bfloat16):
-            generated_ids = generate(preLM_generator, input_ids, preLM=preLM, length=100, temp=0.7, topk=100, topp=0.9)
-        generated_text = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
-        print("Generated text before loading intermediate weights:", generated_text)
-        
-    
-    
-
-    state_dict = torch.load(temp_path, map_location=device)  # or "cuda" if needed
-    preLM.intermediate.load_state_dict(state_dict)
-    preLM.eval() 
-    
-    0/0
     ## print numel
     total_params = sum(p.numel() for p in preLM.parameters())
     trainable_params = sum(p.numel() for p in preLM.parameters() if p.requires_grad)
@@ -285,204 +243,212 @@ if __name__ == "__main__":
 
     
     
-    for e in range(epochs):
-        eval_metrics = evaluate_steerability_and_concepts(
-            preLM, preLM_generator, tokenizer, concept_set, args, 
-            loader=val_loader, device=device
-        )
-        print(f"Validation Metrics: {eval_metrics}")
-        wandb.log({f"val_{k}": v for k, v in eval_metrics.items()})
+    # for e in range(epochs):
+    #     eval_metrics = evaluate_steerability_and_concepts(
+    #         preLM, preLM_generator, tokenizer, concept_set, args, 
+    #         loader=val_loader, device=device
+    #     )
+    #     print(f"Validation Metrics: {eval_metrics}")
+    #     wandb.log({f"val_{k}": v for k, v in eval_metrics.items()})
         
         
-        print("Epoch ", e+1, ":")
-        preLM.train()
-        preLM_generator.train()
-        preLM.intermediate.train()
-        # cbl.train()
-        training_losses = {
-                "loss": [],
-                "concept_loss": [],
-                "intermediate_reconstruction_loss": [],
-                "generation_reconstruction_loss": [],
-                "cyclic_concept_loss": [],
-                "intervened_generation_loss": [],
-            }
+    #     print("Epoch ", e+1, ":")
+    #     preLM.train()
+    #     preLM_generator.train()
+    #     preLM.intermediate.train()
+    #     # cbl.train()
+    #     training_losses = {
+    #             "loss": [],
+    #             "concept_loss": [],
+    #             "intermediate_reconstruction_loss": [],
+    #             "generation_reconstruction_loss": [],
+    #             "cyclic_concept_loss": [],
+    #             "intervened_generation_loss": [],
+    #         }
 
         
-        for i, batch in tqdm(enumerate(train_loader), total=len(train_loader)):
-            gate_logs = {}
-            for i, gate_param in enumerate(preLM.intermediate.gates):
-                    # .item() is crucial to get the scalar value
-                    gate_logs[f"gates/skip_layer_{i}"] = gate_param.item()
+    #     for i, batch in tqdm(enumerate(train_loader), total=len(train_loader)):
+    #         gate_logs = {}
+    #         for i, gate_param in enumerate(preLM.intermediate.gates):
+    #                 # .item() is crucial to get the scalar value
+    #                 gate_logs[f"gates/skip_layer_{i}"] = gate_param.item()
 
-                # Log the final output gate (how much the whole bottleneck affects Llama)
-            gate_logs["gates/final_residual_gate"] = preLM.intermediate.final_gate.item()
+    #             # Log the final output gate (how much the whole bottleneck affects Llama)
+    #         gate_logs["gates/final_residual_gate"] = preLM.intermediate.final_gate.item()
 
 
-            batch = {k: v.to(device) for k, v in batch.items()}
-            concept_label = torch.where(batch["attention_mask"][:, :-1] == 0, -100, batch["label"].view(-1, 1))
-            word_label = torch.where(batch["attention_mask"][:, :-1] == 0, -100, batch["input_ids"][:, 1:])
+    #         batch = {k: v.to(device) for k, v in batch.items()}
+    #         concept_label = torch.where(batch["attention_mask"][:, :-1] == 0, -100, batch["label"].view(-1, 1))
+    #         word_label = torch.where(batch["attention_mask"][:, :-1] == 0, -100, batch["input_ids"][:, 1:])
             
-            with torch.amp.autocast(device_type=device_str, dtype=torch.bfloat16):
-                loss_dict = compute_training_losses(
-                                   batch=batch,
-                                   preLM=preLM,
-                                   preLM_generator=preLM_generator,
-                                   reconstr_crit=reconstr_crit,
-                                   CSE_crit=CSE_crit,
-                                   concept_label=concept_label,
-                                   word_label=word_label,
-                                   concept_set=concept_set,
-                                   config=config,
-                                   args=args,
-                               )
+    #         with torch.amp.autocast(device_type=device_str, dtype=torch.bfloat16):
+    #             loss_dict = compute_training_losses(
+    #                                batch=batch,
+    #                                preLM=preLM,
+    #                                preLM_generator=preLM_generator,
+    #                                reconstr_crit=reconstr_crit,
+    #                                CSE_crit=CSE_crit,
+    #                                concept_label=concept_label,
+    #                                word_label=word_label,
+    #                                concept_set=concept_set,
+    #                                config=config,
+    #                                args=args,
+    #                            )
                 
-                scaler.scale(loss_dict["loss"]).backward()
-                scaler.step(opt_prelm)
-                scaler.update()
-                opt_prelm.zero_grad()
+    #             scaler.scale(loss_dict["loss"]).backward()
+    #             scaler.step(opt_prelm)
+    #             scaler.update()
+    #             opt_prelm.zero_grad()
 
 
-            log = {}
+    #         log = {}
 
-            for k, v in loss_dict.items():
-                training_losses[k].append(v.detach().cpu().item())
-                log[k]  = training_losses[k][-1]
+    #         for k, v in loss_dict.items():
+    #             training_losses[k].append(v.detach().cpu().item())
+    #             log[k]  = training_losses[k][-1]
             
-            log["epoch"] = e + 1
-            log["batch"] = i + 1
+    #         log["epoch"] = e + 1
+    #         log["batch"] = i + 1
             
-            log = {**log, **gate_logs}
+    #         log = {**log, **gate_logs}
             
-            wandb.log(log)
+    #         wandb.log(log)
             
-            if args.DEBUG and i >= 2:
-                break
+    #         if args.DEBUG and i >= 2:
+    #             break
             
             
-        avg_metrics = {}
-        for key in training_losses.keys():
-            if len(training_losses[key]) > 0:
-                avg_metrics[key] = sum(training_losses[key]) / len(training_losses[key])
-        print("Epoch ", e + 1, " training losses: ", avg_metrics)
-        wandb.log({f"avg_{k}": avg_metrics[k] for k in avg_metrics.keys()})
+    #     avg_metrics = {}
+    #     for key in training_losses.keys():
+    #         if len(training_losses[key]) > 0:
+    #             avg_metrics[key] = sum(training_losses[key]) / len(training_losses[key])
+    #     print("Epoch ", e + 1, " training losses: ", avg_metrics)
+    #     wandb.log({f"avg_{k}": avg_metrics[k] for k in avg_metrics.keys()})
 
 
-        if args.dataset == 'SetFit/sst2':
-            preLM.eval()
-            preLM_generator.eval()
-            preLM.intermediate.eval()
+    #     if args.dataset == 'SetFit/sst2':
+    #         preLM.eval()
+    #         preLM_generator.eval()
+    #         preLM.intermediate.eval()
 
-            val_losses = {
-                "val_loss": [],
-                "val_concept_loss": [],
-                "val_intermediate_reconstruction_loss": [],
-                "val_generation_reconstruction_loss": [],
-                "val_cyclic_concept_loss": [],
-                "val_intervened_generation_loss": [],
-            }
+    #         val_losses = {
+    #             "val_loss": [],
+    #             "val_concept_loss": [],
+    #             "val_intermediate_reconstruction_loss": [],
+    #             "val_generation_reconstruction_loss": [],
+    #             "val_cyclic_concept_loss": [],
+    #             "val_intervened_generation_loss": [],
+    #         }
 
-            for i, batch in tqdm(enumerate(val_loader), total=len(val_loader)):
-                batch = {k: v.to(device) for k, v in batch.items()}
+    #         for i, batch in tqdm(enumerate(val_loader), total=len(val_loader)):
+    #             batch = {k: v.to(device) for k, v in batch.items()}
 
-                concept_label = torch.where(
-                    batch["attention_mask"][:, :-1] == 0,
-                    -100,
-                    batch["label"].view(-1, 1),
-                )
+    #             concept_label = torch.where(
+    #                 batch["attention_mask"][:, :-1] == 0,
+    #                 -100,
+    #                 batch["label"].view(-1, 1),
+    #             )
 
-                word_label = torch.where(
-                    batch["attention_mask"][:, :-1] == 0,
-                    -100,
-                    batch["input_ids"][:, 1:],
-                )
+    #             word_label = torch.where(
+    #                 batch["attention_mask"][:, :-1] == 0,
+    #                 -100,
+    #                 batch["input_ids"][:, 1:],
+    #             )
 
-                with torch.no_grad():
-                    with torch.amp.autocast(device_type=device_str, dtype=torch.bfloat16):
-                        loss_dict = compute_training_losses(
-                        batch=batch,
-                        preLM=preLM,
-                        preLM_generator=preLM_generator,
-                        reconstr_crit=reconstr_crit,
-                        CSE_crit=CSE_crit,
-                        concept_label=concept_label,
-                        word_label=word_label,
-                        concept_set=concept_set,
-                        config=config,
-                        args=args,
-                    )
+    #             with torch.no_grad():
+    #                 with torch.amp.autocast(device_type=device_str, dtype=torch.bfloat16):
+    #                     loss_dict = compute_training_losses(
+    #                     batch=batch,
+    #                     preLM=preLM,
+    #                     preLM_generator=preLM_generator,
+    #                     reconstr_crit=reconstr_crit,
+    #                     CSE_crit=CSE_crit,
+    #                     concept_label=concept_label,
+    #                     word_label=word_label,
+    #                     concept_set=concept_set,
+    #                     config=config,
+    #                     args=args,
+    #                 )
 
 
-                for k, v in loss_dict.items():
-                    val_losses[f"val_{k}"].append(v.detach().cpu().item())
+    #             for k, v in loss_dict.items():
+    #                 val_losses[f"val_{k}"].append(v.detach().cpu().item())
                 
 
-                if args.DEBUG and i >= 2:
-                    break
+    #             if args.DEBUG and i >= 2:
+    #                 break
  
 
-            avg_val_loss = {}
-            for key in val_losses:
-                if len(val_losses[key]) > 0:
-                    avg_val_loss[key] = sum(val_losses[key]) / len(val_losses[key])
+    #         avg_val_loss = {}
+    #         for key in val_losses:
+    #             if len(val_losses[key]) > 0:
+    #                 avg_val_loss[key] = sum(val_losses[key]) / len(val_losses[key])
 
-            print(f"Epoch {e+1} validation losses:", avg_val_loss)
+    #         print(f"Epoch {e+1} validation losses:", avg_val_loss)
 
-            wandb.log({f"avg_{k}": v for k, v in avg_val_loss.items()})
+    #         wandb.log({f"avg_{k}": v for k, v in avg_val_loss.items()})
 
-            avg_val_concept_loss = avg_val_loss["val_concept_loss"]
-            avg_val_total_loss = avg_val_loss["val_loss"]
+    #         avg_val_concept_loss = avg_val_loss["val_concept_loss"]
+    #         avg_val_total_loss = avg_val_loss["val_loss"]
 
 
 
-            avg_val_loss = avg_val_total_loss
-            if avg_val_loss < best_loss:
-                best_epoch = e + 1
-                print("save model")
-                best_loss = avg_val_loss
-                torch.save(preLM.intermediate.state_dict(), prefix + model_name + "_epoch_" + str(e + 1))
-                if args.peft:
-                    preLM.save_pretrained(prefix + model_name + "_llama_peft_epoch_" + str(e + 1))
-                wandb.log({"best_model_epoch": e + 1})
-            else:
-                if args.peft:
-                    preLM.save_pretrained(prefix + model_name + "_llama_peft_epoch_" + str(e + 1))
-                torch.save(preLM.intermediate.state_dict(), prefix + model_name + "_low_score_epoch_" + str(e + 1))
-        else:
-            print("save model")
-            torch.save(preLM.intermediate.state_dict(), prefix + model_name + "_epoch_" + str(e + 1))
-            if args.peft:
-                preLM.save_pretrained(prefix + model_name + "_llama_peft_epoch_" + str(e + 1))
+    #         avg_val_loss = avg_val_total_loss
+    #         if avg_val_loss < best_loss:
+    #             best_epoch = e + 1
+    #             print("save model")
+    #             best_loss = avg_val_loss
+    #             torch.save(preLM.intermediate.state_dict(), prefix + model_name + "_epoch_" + str(e + 1))
+    #             if args.peft:
+    #                 preLM.save_pretrained(prefix + model_name + "_llama_peft_epoch_" + str(e + 1))
+    #             wandb.log({"best_model_epoch": e + 1})
+    #         else:
+    #             if args.peft:
+    #                 preLM.save_pretrained(prefix + model_name + "_llama_peft_epoch_" + str(e + 1))
+    #             torch.save(preLM.intermediate.state_dict(), prefix + model_name + "_low_score_epoch_" + str(e + 1))
+    #     else:
+    #         print("save model")
+    #         torch.save(preLM.intermediate.state_dict(), prefix + model_name + "_epoch_" + str(e + 1))
+    #         if args.peft:
+    #             preLM.save_pretrained(prefix + model_name + "_llama_peft_epoch_" + str(e + 1))
                 
-        if args.DEBUG:
-            break
+    #     if args.DEBUG:
+    #         break
 
-    end = time.time()
-    print("time of training CBM:", (end - start) / 3600, "hours")
+    # end = time.time()
+    # print("time of training CBM:", (end - start) / 3600, "hours")
     
     ## delete previous models to save space
     import gc
-    del preLM, opt_prelm, loss_dict
+    # del opt_prelm, loss_dict
+    ### sanity check
+    best_epoch = 1
+    prefix = "../../"
     
-
+    torch.save(preLM.intermediate.state_dict(), prefix + model_name + "_epoch_" + str(best_epoch))
+    if args.peft:
+        preLM.save_pretrained(prefix + model_name + "_llama_peft_epoch_" + str(best_epoch))
+                
     torch.cuda.empty_cache()
     gc.collect()
-    preLM = CustomLlamaModel.from_pretrained('meta-llama/Meta-Llama-3-8B', torch_dtype=torch.bfloat16)
-    preLM.create_intermediate(args.intermediate_loc, len(concept_set), intermediate_sizes=args.intermediate_sizes, skip_dropout=args.skip_dropout, gate=args.gate)
     ## lOAD BEST MODEL AND
     if args.peft:
         print("Loading best model with PEFT (LoRA)")
-        preLM = get_peft_model(preLM, lora_config)
+        # This replaces get_peft_model() AND load_adapter()
+        # is_trainable=True is needed if you plan to continue training, otherwise False for eval
+        preLM = PeftModel.from_pretrained(preLM, prefix + model_name + "_llama_peft_epoch_" + str(best_epoch), is_trainable=False)
+
         preLM.print_trainable_parameters()
-        preLM.peft_forward = True
-        peft_path = prefix + model_name + "_llama_peft_epoch_" + str(best_epoch)
-        preLM.load_adapter(peft_path)
+        preLM = preLM.merge_and_unload()
+        preLM.peft_forward = True # Keep your custom flag if needed
         preLM.eval()
-        
     preLM.to(device)
+ 
     
+    
+
     best_path = prefix + model_name + "_epoch_" + str(best_epoch)
-    state_dict = torch.load(best_path, map_location=device)  # or "cuda" if needed
+    state_dict = torch.load(best_path, map_location=device) 
     preLM.intermediate.load_state_dict(state_dict)
     preLM.eval()
     preLM.intermediate.eval()
@@ -515,17 +481,7 @@ if __name__ == "__main__":
         print("example", str(i), end="\r")
         with torch.no_grad():
             with torch.amp.autocast(device_type=device_str, dtype=torch.bfloat16):
-                text_ids = preLM_generator.generate(
-                                        input_ids,
-                                        attention_mask=attention_mask,       # must pass if padding exists
-                                        use_cache=True,
-                                        max_new_tokens=100,                  # instead of length
-                                        temperature=0.7,                     # temp -> temperature
-                                        top_k=100,                           # topk -> top_k
-                                        top_p=0.9,                           # topp -> top_p
-                                        repetition_penalty=1.5,
-                                        pad_token_id=128001                   # set pad_token_id to avoid warnings
-                                    )
+                text_ids = generate(preLM_generator, input_ids, preLM=preLM, length=100, temp=0.7, topk=100, topp=0.9)
             pred.append(tokenizer.decode(text_ids[0], skip_special_tokens=True ))
             if len(pred[-1].split()) > 30:
                 continue
