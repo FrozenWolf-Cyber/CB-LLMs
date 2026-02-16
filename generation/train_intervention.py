@@ -244,14 +244,7 @@ if __name__ == "__main__":
     
     
     for e in range(epochs):
-        eval_metrics = evaluate_steerability_and_concepts(
-            preLM, preLM_generator, tokenizer, concept_set, args, 
-            loader=val_loader, device=device
-        )
-        print(f"Validation Metrics: {eval_metrics}")
-        wandb.log({f"val_{k}": v for k, v in eval_metrics.items()})
-        
-        
+
         print("Epoch ", e+1, ":")
         preLM.train()
         preLM_generator.train()
@@ -414,6 +407,16 @@ if __name__ == "__main__":
                 
         if args.DEBUG:
             break
+
+
+        eval_metrics = evaluate_steerability_and_concepts(
+            preLM, preLM_generator, tokenizer, concept_set, args, 
+            loader=val_loader, device=device
+        )
+        print(f"Validation Metrics: {eval_metrics}")
+        wandb.log({f"val_{k}": v for k, v in eval_metrics.items()})
+        
+        
 
     end = time.time()
     print("time of training CBM:", (end - start) / 3600, "hours")
