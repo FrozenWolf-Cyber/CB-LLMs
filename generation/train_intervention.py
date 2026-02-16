@@ -221,7 +221,16 @@ if __name__ == "__main__":
     with torch.no_grad():
         input_ids = tokenizer("This movie was fantastic! I really enjoyed it.").input_ids
         input_ids = torch.tensor(input_ids).unsqueeze(0).to(device)
-        generated_ids = preLM_generator.generate(input_ids, length=20, temp=0.7, topk=50, topp=0.9, repetition_penalty=1.5)
+        attention_mask = torch.ones(input_ids.shape, dtype=torch.long, device=device)
+        generated_ids = preLM_generator.generate(input_ids,                                    
+                                                 attention_mask=attention_mask,       # must pass if padding exists
+                                        use_cache=True,
+                                        max_new_tokens=100,                  # instead of length
+                                        temperature=0.7,                     # temp -> temperature
+                                        top_k=100,                           # topk -> top_k
+                                        top_p=0.9,                           # topp -> top_p
+                                        repetition_penalty=1.5,
+                                        pad_token_id=128001   )
         generated_text = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
         print("Generated text before loading intermediate weights:", generated_text)
         
