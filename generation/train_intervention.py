@@ -190,6 +190,9 @@ if __name__ == "__main__":
         preLM = get_peft_model(preLM, lora_config)
         preLM.print_trainable_parameters()
     
+        for param in preLM.base_model.intermediate.parameters():
+            param.requires_grad = True
+    
     preLM_generator = CustomLlamaForCausalLM.from_pretrained('meta-llama/Meta-Llama-3-8B', torch_dtype=torch.bfloat16)
     preLM_generator.model = preLM
     preLM_generator.lm_head.to(device)

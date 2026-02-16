@@ -175,8 +175,9 @@ class CustomLlamaModel(LlamaPreTrainedModel):
     ):
         if (input_ids is None) ^ (inputs_embeds is not None):
             raise ValueError("You must specify exactly one of input_ids or inputs_embeds")
-
+        print("Gradient tracking in first half forward:", torch.is_grad_enabled())
         with torch.set_grad_enabled(self.peft_forward): # If using PEFT, we want gradients to flow through the first half to the intermediate module. Otherwise, we keep it in no_grad mode.
+            print("PEFT forward mode:", self.peft_forward, "- Gradients will flow through first half:", torch.is_grad_enabled())
             if inputs_embeds is None:
                 inputs_embeds: torch.Tensor = self.embed_tokens(input_ids)
 
