@@ -9,7 +9,7 @@ from tqdm.auto import tqdm
 from datasets import load_dataset, concatenate_datasets
 import config as CFG
 from transformers import LlamaConfig, LlamaModel, AutoTokenizer, RobertaTokenizerFast
-from peft import LoraConfig, TaskType, get_peft_model
+from peft import LoraConfig, TaskType, get_peft_model, PeftModel
 from modules import CBLResidual, CBL, Roberta_classifier
 from module_intervention import CustomLlamaModel, CustomLlamaForCausalLM, amplify_intervention, compute_training_losses
 import time
@@ -189,10 +189,7 @@ if __name__ == "__main__":
         preLM.print_trainable_parameters()
         preLM.peft_forward = True
     
-    preLM_generator = CustomLlamaForCausalLM.from_pretrained('meta-llama/Meta-Llama-3-8B', torch_dtype=torch.bfloat16)
-    preLM_generator.model = preLM
-    preLM_generator.lm_head.to(device)
-    
+
     ####### SANITY CHECK SAVING AND LAODING:
     temp_path = "temp_intermediate"
     torch.save(preLM.intermediate.state_dict(), temp_path)
@@ -206,13 +203,27 @@ if __name__ == "__main__":
     ## lOAD BEST MODEL AND
     if args.peft:
         print("Loading best model with PEFT (LoRA)")
-        preLM = get_peft_model(preLM, lora_config)
+        # This replaces get_peft_model() AND load_adapter()
+        # is_trainable=True is needed if you plan to continue training, otherwise False for eval
+        preLM = PeftModel.from_pretrained(preLM, "temp_peft", is_trainable=False) 
+
         preLM.print_trainable_parameters()
-        preLM.peft_forward = True
-        preLM.load_adapter("temp_peft")
+        preLM.peft_forward = True # Keep your custom flag if needed
         preLM.eval()
-        
     preLM.to(device)
+    preLM_generator = CustomLlamaForCausalLM.from_pretrained('meta-llama/Meta-Llama-3-8B', torch_dtype=torch.bfloat16)
+    preLM_generator.model = preLM
+    preLM_generator.lm_head.to(device)
+    
+    ## test preLM generation before loading intermediate weights - sanity check
+    with torch.no_grad():
+        input_ids = tokenizer("This movie was fantastic! I really enjoyed it.").input_ids
+        input_ids = torch.tensor(input_ids).unsqueeze(0).to(device)
+        generated_ids = preLM_generator.generate(input_ids, preLM, length=20, temp=0.7, topk=50, topp=0.9, repetition_penalty=1.5)
+        generated_text = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
+        print("Generated text before loading intermediate weights:", generated_text)
+        
+    
     
 
     state_dict = torch.load(temp_path, map_location=device)  # or "cuda" if needed
