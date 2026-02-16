@@ -47,6 +47,11 @@ parser.add_argument("--epoch", type=int, default=10)
 parser.add_argument("--intervention_margin", type=float, default=10.0)
 parser.add_argument("--intervention_spread", type=float, default=2.0)
 parser.add_argument(
+    "--overfit", 
+    action='store_true', 
+    help="If set, the model will be trained to overfit on a small subset of the data, which can be useful for debugging and sanity checking."
+)
+parser.add_argument(
     "--intermediate_sizes", 
     type=int, 
     nargs="+", 
@@ -170,6 +175,12 @@ if __name__ == "__main__":
 
     concept_set = CFG.concepts_from_labels[args.dataset]
     print("concept len: ", len(concept_set))
+
+
+    if args.overfit:
+        print("Overfitting mode enabled: using only 100 samples from the training data.")
+        encoded_train_dataset = encoded_train_dataset.select(range(100))
+        
 
     print("creating loader...")
     train_loader = build_loaders(encoded_train_dataset, mode="train")
@@ -412,14 +423,21 @@ if __name__ == "__main__":
         if args.DEBUG:
             break
 
-
-        eval_metrics = evaluate_steerability_and_concepts(
+        if not args.overfit and args.dataset == 'SetFit/sst2':
+            eval_metrics = evaluate_steerability_and_concepts(
             preLM, preLM_generator, tokenizer, concept_set, args, 
             loader=val_loader, device=device
         )
-        print(f"Validation Metrics: {eval_metrics}")
-        wandb.log({f"val_{k}": v for k, v in eval_metrics.items()})
-        
+            print(f"Validation Metrics: {eval_metrics}")
+            wandb.log({f"val_{k}": v for k, v in eval_metrics.items()})
+
+        if args.overfit and args.dataset == 'SetFit/sst2':
+            eval_metrics = evaluate_steerability_and_concepts(
+            preLM, preLM_generator, tokenizer, concept_set, args, 
+            loader=train_loader, device=device
+        )
+            print(f"Validation Metrics (overfit mode): {eval_metrics}")
+            wandb.log({f"val_{k}": v for k, v in eval_metrics.items()})
         
 
     end = time.time()
