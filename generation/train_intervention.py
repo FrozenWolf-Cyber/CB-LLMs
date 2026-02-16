@@ -4,6 +4,7 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 import evaluate
+from module_intervention import evaluate_steerability_and_concepts
 from tqdm.auto import tqdm
 from datasets import load_dataset, concatenate_datasets
 import config as CFG
@@ -236,6 +237,14 @@ if __name__ == "__main__":
     
     
     for e in range(epochs):
+        eval_metrics = evaluate_steerability_and_concepts(
+            preLM, preLM_generator, tokenizer, concept_set, args, 
+            loader=val_loader, device=device
+        )
+        print(f"Validation Metrics: {eval_metrics}")
+        wandb.log({f"val_{k}": v for k, v in eval_metrics.items()})
+        
+        
         print("Epoch ", e+1, ":")
         preLM.train()
         preLM_generator.train()
@@ -416,107 +425,18 @@ if __name__ == "__main__":
     preLM_generator.eval()
 
     
-    ### TEST STEERABILITY AFTER TRAINING
-    roberta_tokenizer = RobertaTokenizerFast.from_pretrained('roberta-base')
-    classifier_path = args.dataset.replace('/', '_') + "_classifier.pt"
-    classifier = Roberta_classifier(len(concept_set)).to(device)
-    classifier.load_state_dict(torch.load(classifier_path, map_location=device))
+    # concept_prediction_accuracy
+    # steerability_test_accuracy
+ 
+ 
+    test_metrics = evaluate_steerability_and_concepts(
+        preLM, preLM_generator, tokenizer, concept_set, args, 
+        loader=test_loader, device=device
+    )
     
-
-
-    pred = []
-    text = []
-
-    acc_metric = evaluate.load("accuracy")
-
-    with torch.no_grad():
-        for i in tqdm(range(100 // len(concept_set))):
-            print("example", str(i), end="\r")
-            input_ids = torch.tensor([tokenizer.encode("")]).to(device)
-            attention_mask = (input_ids != tokenizer.pad_token_id).long()
-            for j in range(len(concept_set)):
-                # original vector: one-hot for the concept
-                v = [0] * len(concept_set)  # all concepts suppressed
-                v[j] = 1                    # activate target concept j
-                B, T = input_ids.shape
-                intervene_tensor = torch.tensor(v, device=device).view(1, 1, -1).expand(B, T, len(concept_set))
-
-                preLM_generator.model.intervene = intervene_tensor
-                preLM_generator.model.intervention_margin = args.intervention_margin
-                preLM_generator.model.intervention_spread = args.intervention_spread
-                print("Gen")
-                with torch.amp.autocast(device_type=device_str, dtype=torch.bfloat16):
-                    output_tokens = preLM_generator.generate(
-                                        input_ids,
-                                        attention_mask=attention_mask,       # must pass if padding exists
-                                        use_cache=True,
-                                        max_new_tokens=100,                  # instead of length
-                                        temperature=0.7,                     # temp -> temperature
-                                        top_k=100,                           # topk -> top_k
-                                        top_p=0.9,                           # topp -> top_p
-                                        repetition_penalty=1.5,
-                                        pad_token_id=128001                   # set pad_token_id to avoid warnings
-                                    )
-                preLM_generator.model.intervene = None
-                decoded_text = tokenizer.decode(output_tokens[0], skip_special_tokens=True)
-                print(f"Class {concept_set[j]}: {decoded_text}")
-                text.append(decoded_text)
-
-                encoded_input = roberta_tokenizer(
-                    decoded_text, 
-                    return_tensors='pt', 
-                    truncation=True, 
-                    max_length=512
-                ).to(device)
-
-                roberta_input = {
-                    "input_ids": encoded_input["input_ids"], 
-                    "attention_mask": encoded_input["attention_mask"]
-                }
-
-                logits = classifier(roberta_input)
-                pred.append(logits)
-
-
-    pred = torch.cat(pred, dim=0).detach().cpu()
-    pred_labels = np.argmax(pred.numpy(), axis=-1)
-
-    refs = list(range(len(concept_set))) * (100 // len(concept_set))
-    acc_metric.add_batch(predictions=pred_labels, references=refs)
-    accuracy = acc_metric.compute()
-
-    print("Steerability test accuracy:", accuracy)
-    wandb.log({"steerability_test_accuracy": accuracy})
-
-    
-    
-    
-    ### TEST CONCEPT PREDICTION AFTER TRAINING
-    print("eval concepts...")
-    metric = evaluate.load("accuracy")
-    concept_predictions = []
-    for batch in tqdm(test_loader, total=len(test_loader)):
-        batch = {k: v.to(device) for k, v in batch.items()}
-        with torch.no_grad():
-            with torch.amp.autocast(device_type=device_str, dtype=torch.bfloat16):
-                pre_hidden_states, causal_mask, position_embeddings = (
-                    preLM.firsthalf_forward(
-                        input_ids=batch["input_ids"],
-                        attention_mask=batch["attention_mask"],
-                    )
-                )
-                concepts, skips = preLM.intermediate.encode(pre_hidden_states)
-
-        concept_predictions.append(eos_pooling(concepts, batch["attention_mask"]))
-    concept_predictions = torch.cat(concept_predictions, dim=0).detach().cpu()
-    pred = np.argmax(concept_predictions.numpy(), axis=-1)
-    metric.add_batch(predictions=pred, references=encoded_test_dataset["label"])
-    print("Concept prediction accuracy:")
-    acc = metric.compute()
-    print(acc)
-    wandb.log({"concept_prediction_accuracy": acc})
-    
-    
+    print("Final Test Results:", test_metrics)
+    wandb.log({"concept_prediction_accuracy": test_metrics["concept_acc"],
+               "steerability_test_accuracy": test_metrics["steerability_acc"]})
     
     #### TEST PERPLEXITY AFTER TRAINING
     print("Test perplexity after training:")

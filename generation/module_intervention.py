@@ -648,7 +648,106 @@ def compute_training_losses(
         "cyclic_concept_loss": cyclic_concept_loss,
         "intervened_generation_loss": intervened_generation_loss,
     }
+
+from transformers import LlamaConfig, LlamaModel, AutoTokenizer, RobertaTokenizerFast
+import evaluate
+from modules import CBLResidual, CBL, Roberta_classifier
+from utils import elastic_net_penalty, mean_pooling, eos_pooling
+
+def evaluate_steerability_and_concepts(preLM, preLM_generator, tokenizer, concept_set, args, loader=None, device="cuda"):
+    """
+    Performs Steerability (generation) and Concept Prediction (classification) tests.
+    Loads and deletes RoBERTa internally to save VRAM.
+    """
+    results = {}
+    preLM.eval()
+    preLM_generator.eval()
+    device_str = str(device)
     
+    # --- 1. STEERABILITY TEST ---
+    print("Running Steerability Test...")
+    roberta_tokenizer = RobertaTokenizerFast.from_pretrained('roberta-base')
+    classifier_path = args.dataset.replace('/', '_') + "_classifier.pt"
+    classifier = Roberta_classifier(len(concept_set)).to(device)
+    classifier.load_state_dict(torch.load(classifier_path, map_location=device))
+    classifier.eval()
+
+    acc_metric = evaluate.load("accuracy")
+    pred_logits = []
+    
+    # We use BS=1 for generation as requested
+    num_samples_per_concept = max(1, 100 // len(concept_set))
+    
+    with torch.no_grad():
+        for i in range(num_samples_per_concept):
+            # Start with empty prompt or BOS
+            input_ids = torch.tensor([[tokenizer.bos_token_id if tokenizer.bos_token_id else 128000]]).to(device)
+            attention_mask = torch.ones_like(input_ids)
+            
+            for j in range(len(concept_set)):
+                # Intervene: One-hot vector for target concept
+                v = torch.zeros(len(concept_set), device=device)
+                v[j] = 1.0
+                intervene_tensor = v.view(1, 1, -1) # [BS=1, Seq=1, Dim]
+
+                preLM_generator.model.intervene = intervene_tensor
+                preLM_generator.model.intervention_margin = args.intervention_margin
+                preLM_generator.model.intervention_spread = args.intervention_spread
+                
+                with torch.amp.autocast(device_type=device_str, dtype=torch.bfloat16):
+                    output_tokens = preLM_generator.generate(
+                        input_ids,
+                        attention_mask=attention_mask,
+                        max_new_tokens=50, # Shortened for faster validation
+                        temperature=0.7,
+                        top_p=0.9,
+                        repetition_penalty=1.5,
+                        pad_token_id=tokenizer.eos_token_id
+                    )
+                
+                preLM_generator.model.intervene = None # Reset
+                decoded_text = tokenizer.decode(output_tokens[0], skip_special_tokens=True)
+
+                # Classify with RoBERTa
+                encoded_input = roberta_tokenizer(decoded_text, return_tensors='pt', truncation=True, max_length=512).to(device)
+                logits = classifier({"input_ids": encoded_input["input_ids"], "attention_mask": encoded_input["attention_mask"]})
+                pred_logits.append(logits)
+
+    pred_labels = torch.cat(pred_logits, dim=0).argmax(dim=-1).cpu().numpy()
+    refs = list(range(len(concept_set))) * num_samples_per_concept
+    steer_acc = acc_metric.compute(predictions=pred_labels, references=refs[:len(pred_labels)])['accuracy']
+    results['steerability_acc'] = steer_acc
+
+    # CLEANUP RoBERTa immediately
+    del classifier, roberta_tokenizer
+    import gc
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    # --- 2. CONCEPT PREDICTION TEST ---
+    if loader is not None:
+        print("Running Concept Prediction Test...")
+        concept_metric = evaluate.load("accuracy")
+        all_preds = []
+        all_refs = []
+        
+        with torch.no_grad():
+            for batch in loader:
+                batch = {k: v.to(device) for k, v in batch.items()}
+                with torch.amp.autocast(device_type=device_str, dtype=torch.bfloat16):
+                    pre_h, _, _ = preLM.firsthalf_forward(batch["input_ids"], batch["attention_mask"])
+                    concepts, _ = preLM.intermediate.encode(pre_h)
+                
+                pooled_concepts = eos_pooling(concepts, batch["attention_mask"])
+                all_preds.append(pooled_concepts.argmax(dim=-1).cpu())
+                all_refs.append(batch["label"].cpu())
+        
+        concept_acc = concept_metric.compute(predictions=torch.cat(all_preds), references=torch.cat(all_refs))['accuracy']
+        results['concept_acc'] = concept_acc
+
+    return results
+
+
 import torch
 from transformers import AutoTokenizer, LlamaConfig
 
