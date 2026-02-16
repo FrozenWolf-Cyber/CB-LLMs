@@ -430,13 +430,13 @@ if __name__ == "__main__":
             print(f"Validation Metrics: {eval_metrics}")
             wandb.log({f"val_{k}": v for k, v in eval_metrics.items()})
 
-        if args.overfit and args.dataset == 'SetFit/sst2':
-            eval_metrics = evaluate_steerability_and_concepts(
-            preLM, preLM_generator, tokenizer, concept_set, args, 
-            loader=train_loader, device=device
-        )
-            print(f"Validation Metrics (overfit mode): {eval_metrics}")
-            wandb.log({f"val_{k}": v for k, v in eval_metrics.items()})
+    if args.overfit and args.dataset == 'SetFit/sst2':
+        eval_metrics = evaluate_steerability_and_concepts(
+        preLM, preLM_generator, tokenizer, concept_set, args, 
+        loader=train_loader, device=device
+    )
+        print(f"Validation Metrics (overfit mode): {eval_metrics}")
+        wandb.log({f"val_{k}": v for k, v in eval_metrics.items()})
         
 
     end = time.time()
