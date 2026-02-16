@@ -750,6 +750,51 @@ def evaluate_steerability_and_concepts(preLM, preLM_generator, tokenizer, concep
 
 
 import torch
+import torch.nn.functional as F
+
+def generate(self, ids, preLM, length=100, temp=0.7, topk=100, topp=0.9, repetition_penalty=1.5, eos_token_id=128001):
+    past_key_values = None
+    device = ids.device
+    
+    for i in range(length):
+        # 1. Forward pass through the backbone (using KV-cache for efficiency)
+        # Only pass the last token if we have a cache
+        inputs = ids[:, -1:] if past_key_values is not None else ids
+        outputs = preLM(inputs, past_key_values=past_key_values, use_cache=True)
+        
+        past_key_values = outputs.past_key_values
+        hidden_states = outputs.last_hidden_state # [batch, seq_len, hidden_dim]
+        
+        # 2. Project to vocabulary (lm_head)
+        # Taking only the last position's logits
+        logits = self.lm_head(hidden_states[:, -1, :]) # [batch, vocab_size]
+        
+        # 3. Apply Repetition Penalty (using your specific logic)
+        # Note: This logic assumes batch_size=1 based on your 'ids[0]' indexing
+        existing_tokens = ids[0]
+        score = logits[0, existing_tokens]
+        # If score is negative, make it more negative; if positive, dampen it
+        score = torch.where(score < 0, score * repetition_penalty, score / repetition_penalty)
+        logits[0, existing_tokens] = score
+        
+        # 4. Scaling and Filtering
+        next_token_logits = logits / temp
+        filtered_logits = top_k_top_p_filtering(next_token_logits, top_k=topk, top_p=topp)
+        
+        # 5. Sample next token
+        probs = F.softmax(filtered_logits, dim=-1)
+        next_token = torch.multinomial(probs, num_samples=1)
+        
+        # 6. Update sequence
+        ids = torch.cat((ids, next_token), dim=-1)
+        
+        # 7. Check for EOS
+        if eos_token_id is not None and next_token.item() == eos_token_id:
+            break
+            
+    return ids
+
+import torch
 from transformers import AutoTokenizer, LlamaConfig
 
 # --- ASSUMING YOUR CustomLlamaModel AND LlamaForCausalLM CLASSES ARE DEFINED ABOVE ---

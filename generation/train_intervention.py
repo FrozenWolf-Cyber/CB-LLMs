@@ -11,7 +11,7 @@ import config as CFG
 from transformers import LlamaConfig, LlamaModel, AutoTokenizer, RobertaTokenizerFast
 from peft import LoraConfig, TaskType, get_peft_model, PeftModel
 from modules import CBLResidual, CBL, Roberta_classifier
-from module_intervention import CustomLlamaModel, CustomLlamaForCausalLM, amplify_intervention, compute_training_losses
+from module_intervention import generate, CustomLlamaModel, CustomLlamaForCausalLM, amplify_intervention, compute_training_losses
 import time
 import random
 # from torch.cuda.amp import autocast, GradScaler
@@ -223,15 +223,7 @@ if __name__ == "__main__":
         input_ids = torch.tensor(input_ids).unsqueeze(0).to(device)
         attention_mask = torch.ones(input_ids.shape, dtype=torch.long, device=device)
         with torch.amp.autocast(device_type=device_str, dtype=torch.bfloat16):
-            generated_ids = preLM_generator.generate(input_ids,                                    
-                                                 attention_mask=attention_mask,       # must pass if padding exists
-                                        use_cache=True,
-                                        max_new_tokens=100,                  # instead of length
-                                        temperature=0.7,                     # temp -> temperature
-                                        top_k=100,                           # topk -> top_k
-                                        top_p=0.9,                           # topp -> top_p
-                                        repetition_penalty=1.5,
-                                        pad_token_id=128001   )
+            generated_ids = generate(preLM_generator, input_ids, preLM=preLM, length=100, temp=0.7, topk=100, topp=0.9)
         generated_text = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
         print("Generated text before loading intermediate weights:", generated_text)
         
