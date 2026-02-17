@@ -486,8 +486,8 @@ def compute_training_losses(
     # ============================================================
 
 # Check magnitude of concepts
-    print(f"Concepts Mean: {concepts.mean().item()}, Max: {concepts.max().item()}")
-    print(f"Concepts GT Mean: {concept_label.float().mean().item()}, Max: {concept_label.float().max().item()}")
+    # print(f"Concepts Mean: {concepts.mean().item()}, Max: {concepts.max().item()}")
+    # print(f"Concepts GT Mean: {concept_label.float().mean().item()}, Max: {concept_label.float().max().item()}")
     # concepts[:, :-1, :] : (B, T-1, C)
     # reshape -> (B*(T-1), C)
     # concept_label -> (B*(T-1))
