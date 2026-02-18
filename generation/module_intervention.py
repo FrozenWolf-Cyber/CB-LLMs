@@ -119,6 +119,54 @@ class LlamaUNetBottleneck(nn.Module):
         return self.decode(x, concepts, skips)
         
     
+import torch
+import torch.nn as nn
+
+class SimpleLlamaBottleneck(nn.Module):
+    def __init__(self, hidden_size=4096, intermediate_size=1024, concept_size=14, gate=True):
+        super().__init__()
+        self.gate_enabled = gate
+        self.act = nn.SiLU()
+
+        # --- Encoder (Replicating LlamaUNet logic: Linear -> Norm -> Act) ---
+        # We collapse the loop into a single intermediate projection
+        self.enc_proj = nn.Linear(hidden_size, intermediate_size)
+        self.enc_norm = nn.LayerNorm(intermediate_size)
+        
+        # Concept Bottleneck
+        self.concept_enc = nn.Linear(intermediate_size, concept_size)
+        self.concept_norm = nn.LayerNorm(concept_size)
+
+        # --- Decoder (Mirroring the encoder) ---
+        self.dec_proj = nn.Linear(concept_size, intermediate_size)
+        self.dec_norm = nn.LayerNorm(intermediate_size)
+        
+        self.final_proj = nn.Linear(intermediate_size, hidden_size)
+        
+        # Final gate for the residual connection
+        self.gate = nn.Parameter(torch.zeros(1))
+
+    def encode(self, x):
+        # Replicates: h = norm(act(enc(h))) -> concepts = norm(enc(h))
+        h = self.act(self.enc_norm(self.enc_proj(x)))
+        concepts = self.concept_norm(self.concept_enc(h))
+        return concepts
+
+    def decode(self, concepts):
+        # Replicates the expansion path without the complex skips
+        h = self.act(self.dec_norm(self.dec_proj(concepts)))
+        return self.final_proj(h)
+
+    def forward(self, x):
+        concepts = self.encode(x)
+        reconstruction = self.decode(concepts)
+
+        if self.gate_enabled:
+            return x + (self.gate * reconstruction)
+        else:
+            return x + reconstruction
+    
+    
 class CustomLlamaModel(LlamaPreTrainedModel):
     def __init__(self, config: LlamaConfig):
         super().__init__(config)
@@ -142,7 +190,7 @@ class CustomLlamaModel(LlamaPreTrainedModel):
         for p in self.parameters():
             p.requires_grad = False
 
-    def create_intermediate(self, where, concept_size, intermediate_sizes=[1024, 512, 256], debug=False, skip_dropout=0.0, gate=True):
+    def create_intermediate(self, where, concept_size, intermediate_sizes=[1024, 512, 256], debug=False, skip_dropout=0.0, gate=True, arch="unet"):
         self.where = where
         self.debug = debug
         self.concept_size = concept_size
@@ -151,12 +199,19 @@ class CustomLlamaModel(LlamaPreTrainedModel):
         if debug:
             self.intermediate = nn.Identity()
         else:
-            self.intermediate = LlamaUNetBottleneck(hidden_size=hidden_size,
-                                                    intermediate_sizes=intermediate_sizes, #4096/8 = 512
-                                                    concept_size=concept_size,
-                                                    skip_dropout=skip_dropout,
-                                                    gate=gate
-                                                    )
+            if arch == "unet":
+                self.intermediate = LlamaUNetBottleneck(hidden_size=hidden_size,
+                                                        intermediate_sizes=intermediate_sizes, #4096/8 = 512
+                                                        concept_size=concept_size,
+                                                        skip_dropout=skip_dropout,
+                                                        gate=gate
+                                                        )
+            elif arch == "simple":
+                self.intermediate = SimpleLlamaBottleneck(hidden_size=hidden_size,
+                                                          intermediate_size=intermediate_sizes[0],
+                                                          concept_size=concept_size,
+                                                          gate=gate
+                                                          )
 
         self.add_module("intermediate", self.intermediate)
         for p in self.intermediate.parameters():

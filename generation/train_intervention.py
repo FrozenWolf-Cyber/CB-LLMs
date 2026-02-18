@@ -51,6 +51,7 @@ parser.add_argument(
     action='store_true', 
     help="If set, the model will be trained to overfit on a small subset of the data, which can be useful for debugging and sanity checking."
 )
+parser.add_argument("--arch", type=str, default="unet", choices=["unet", "simple"], help="Architecture for the intermediate module")
 parser.add_argument(
     "--intermediate_sizes", 
     type=int, 
@@ -190,7 +191,7 @@ if __name__ == "__main__":
     print("preparing backbone")
     # preLM = LlamaModel.from_pretrained('meta-llama/Meta-Llama-3-8B', torch_dtype=torch.bfloat16).to(device)
     preLM = CustomLlamaModel.from_pretrained('meta-llama/Meta-Llama-3-8B', torch_dtype=torch.bfloat16)
-    preLM.create_intermediate(args.intermediate_loc, len(concept_set), intermediate_sizes=args.intermediate_sizes, skip_dropout=args.skip_dropout, gate=args.gate)
+    preLM.create_intermediate(args.intermediate_loc, len(concept_set), intermediate_sizes=args.intermediate_sizes, skip_dropout=args.skip_dropout, gate=args.gate, arch=args.arch)
     print("Trainable parameters in intermediate module:", sum(p.numel() for p in preLM.intermediate.parameters() if p.requires_grad))
     preLM.to(device)
     
