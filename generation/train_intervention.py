@@ -276,12 +276,13 @@ if __name__ == "__main__":
 
         
         for i, batch in tqdm(enumerate(train_loader), total=len(train_loader)):
+            gate_logs = {}
             if args.arch == "unet":
-                gate_logs = {}
+                
                 for i, gate_param in enumerate(preLM.intermediate.gates):
                         # .item() is crucial to get the scalar value
                         gate_logs[f"gates/skip_layer_{i}"] = gate_param.item()
-    
+
                     # Log the final output gate (how much the whole bottleneck affects Llama)
                 gate_logs["gates/final_residual_gate"] = preLM.intermediate.final_gate.item()
 
