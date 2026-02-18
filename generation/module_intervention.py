@@ -150,16 +150,16 @@ class SimpleLlamaBottleneck(nn.Module):
         # Replicates: h = norm(act(enc(h))) -> concepts = norm(enc(h))
         h = self.act(self.enc_norm(self.enc_proj(x)))
         concepts = self.concept_norm(self.concept_enc(h))
-        return concepts
+        return concepts, []
 
-    def decode(self, concepts):
+    def decode(self, concepts, skips= None):
         # Replicates the expansion path without the complex skips
         h = self.act(self.dec_norm(self.dec_proj(concepts)))
         return self.final_proj(h)
 
     def forward(self, x):
-        concepts = self.encode(x)
-        reconstruction = self.decode(concepts)
+        concepts, skips = self.encode(x)
+        reconstruction = self.decode(concepts, skips)
 
         if self.gate_enabled:
             return x + (self.gate * reconstruction)
