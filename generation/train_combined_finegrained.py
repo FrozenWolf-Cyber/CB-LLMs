@@ -497,7 +497,7 @@ if __name__ == "__main__":
                     print("sims shape: ", sims.shape)
                     v = torch.tensor(v).to(device).unsqueeze(0) # (1, concept_num)
                     print("v: ", v.shape)
-                    cos_sim_cubed_values.append(cos_sim_cubed(sims,v).item())
+                    cos_sim_cubed_values.append(cos_sim_cubed(sims,v.float()).item())
                     softmax_values.append(torch.nn.CrossEntropyLoss()(sims, torch.tensor([j]).to(device)).item())
                     
 
