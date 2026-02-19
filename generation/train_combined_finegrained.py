@@ -456,7 +456,7 @@ if __name__ == "__main__":
     print(concept_features.hidden_states)
     print(concept_features.pooler_output.shape, encoded_c["attention_mask"].shape)
     # print ("concept features shape before pooling: ", concept_features)
-    concept_features = mean_pooling(concept_features, encoded_c["attention_mask"])
+    concept_features = mean_pooling(concept_features.last_hidden_state, encoded_c["attention_mask"])
     concept_features = F.normalize(concept_features, p=2, dim=1)
     
     # roberta_tokenizer = RobertaTokenizerFast.from_pretrained('roberta-base')
