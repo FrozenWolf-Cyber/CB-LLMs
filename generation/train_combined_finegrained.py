@@ -453,7 +453,7 @@ if __name__ == "__main__":
     encoded_c = tokenizer_sim(concept_set, padding=True, truncation=True, max_length=args.max_length)
     encoded_c = {k: torch.tensor(v).to(device) for k, v in encoded_c.items()}
     concept_features = sim_model(input_ids=encoded_c["input_ids"], attention_mask=encoded_c["attention_mask"])
-    print(concept_features.hidden_states)
+    print(concept_features.last_hidden_state.shape)
     print(concept_features.pooler_output.shape, encoded_c["attention_mask"].shape)
     # print ("concept features shape before pooling: ", concept_features)
     concept_features = mean_pooling(concept_features.last_hidden_state, encoded_c["attention_mask"])
@@ -482,14 +482,14 @@ if __name__ == "__main__":
                 for j in range(len(concept_set)):
                     v = [0] * len(concept_set)
                     v[j] = intervention_value
-                    text_ids, _ = cbl.generate(input_ids, preLM)
+                    text_ids, _ = cbl.generate(input_ids, preLM, intervene=v)
                     decoded_text_ids = tokenizer.decode(text_ids[0][~torch.isin(text_ids[0], torch.tensor([128000, 128001]).to(device))])
                     text.append(decoded_text_ids)
                     
                     generated_c = tokenizer_sim(decoded_text_ids, padding=True, truncation=True, max_length=args.max_length, return_tensors="pt").to(device)
                     generated_c = {k: v.to(device) for k, v in generated_c.items()}
                     generated_features = sim_model(input_ids=generated_c["input_ids"], attention_mask=generated_c["attention_mask"])
-                    print("gen", generated_features.hidden_states.shape)
+                    print("gen", generated_features.last_hidden_state.shape)
                     generated_features = mean_pooling(generated_features.last_hidden_state, generated_c["attention_mask"])
                     generated_features = F.normalize(generated_features, p=2, dim=1)
                     print("gen after pooling", generated_features.shape)
