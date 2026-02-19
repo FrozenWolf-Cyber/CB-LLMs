@@ -464,7 +464,7 @@ if __name__ == "__main__":
     # classifier = Roberta_classifier(len(concept_set)).to(device)
     # classifier.load_state_dict(torch.load(classifier_path, map_location=device))
     
-    print("concept set: ", concept_set)
+    # print("concept set: ", concept_set)
     if args.dataset == "dbpedia_14":
         intervention_value = 150
     else:
@@ -475,7 +475,7 @@ if __name__ == "__main__":
     softmax_values = []
     acc = evaluate.load("accuracy")
     with torch.no_grad():
-        for i in tqdm(range(100 // len(concept_set))):
+        for i in tqdm(range(50)): ## 50 per concept
             print("example", str(i), end="\r")
             with torch.no_grad():
                 input_ids = torch.tensor([tokenizer.encode("")]).to(device)
