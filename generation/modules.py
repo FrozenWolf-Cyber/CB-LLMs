@@ -83,12 +83,16 @@ class CBL(nn.Module):
         self.relu = nn.ReLU()
         self.concept_dim = concept_dim
         self.tokenizer = tokenizer
+        self.match_layer = None
+        if concept_dim != 768:
+            print("Warning: concept_dim and unsup feature dim are not equal so creating a linear layer to match dimensions.")
+            self.match_layer = nn.Linear(768, concept_dim)
 
     def forward(self, features):
         concepts = self.cbl(features)
         unsup_features = self.unsup(features)
         e = torch.cat((self.relu(concepts), unsup_features), dim=-1)
-        return self.relu(concepts), unsup_features, self.fc(e), None
+        return self.relu(concepts), unsup_features, self.fc(e), self.match_layer(unsup_features) if self.match_layer else unsup_features
 
     def generate(self, ids, preLM, intervene=None, length=100, temp=0.7, topk=100, topp=0.9, repetition_penalty=1.5, eos_token_id=128001):
         past_key_values = None
