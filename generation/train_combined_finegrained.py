@@ -437,7 +437,7 @@ if __name__ == "__main__":
     # else:
     #     cbl = CBLResidual(config, len(concept_set), args.residual_dim, tokenizer).to(device)
     # cbl.load_state_dict(torch.load(prefix + cbl_name + "_epoch_" + str(best_epoch) + ".pt", map_location=device))
-    # cbl.eval()
+    cbl.eval()
         
     
     import config as CFG
