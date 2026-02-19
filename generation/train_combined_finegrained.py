@@ -268,10 +268,10 @@ if __name__ == "__main__":
             word_loss = torch.nn.CrossEntropyLoss()(vocabs[:, :-1, :].reshape(-1, config.vocab_size), word_label.reshape(-1))
             reg = elastic_net_penalty(cbl.fc.weight[:, :len(concept_set)])
             
-            print("concepts shape: ", concepts.shape)
-            print("concept_label shape: ", concept_label.shape)
-            print("unsup shape: ", unsup.shape)
-            print("matched_unsup shape: ", matched_unsup.shape)
+            # print("concepts shape: ", concepts.shape)
+            # print("concept_label shape: ", concept_label.shape)
+            # print("unsup shape: ", unsup.shape)
+            # print("matched_unsup shape: ", matched_unsup.shape)
             
             loss = 0
             if matched_unsup is not None:
