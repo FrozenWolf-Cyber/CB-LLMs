@@ -493,9 +493,11 @@ if __name__ == "__main__":
                     generated_features = mean_pooling(generated_features.last_hidden_state, generated_c["attention_mask"])
                     generated_features = F.normalize(generated_features, p=2, dim=1)
                     print("gen after pooling", generated_features.shape)
-                    sims = generated_features @ concept_features.T
-                    print("sims shape: ", sims.shape, j.shape)
-                    cos_sim_cubed_values.append(cos_sim_cubed(sims, j).item())
+                    sims = generated_features @ concept_features.T # (1, concept_num)
+                    print("sims shape: ", sims.shape)
+                    v = torch.tensor(v).to(device).unsqueeze(0) # (1, concept_num)
+                    print("v: ", v.shape)
+                    cos_sim_cubed_values.append(cos_sim_cubed(sims,v).item())
                     softmax_values.append(torch.nn.CrossEntropyLoss()(sims, torch.tensor([j]).to(device)).item())
                     
 
