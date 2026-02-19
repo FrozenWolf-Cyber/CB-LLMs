@@ -361,7 +361,7 @@ if __name__ == "__main__":
                 "val_residual_penalty_loss": [],
                 "val_orthogonal_loss": [],
             }
-            for i, batch in tqdm(enumerate(val_loader), total=len(val_loader)):
+            for i, (batch, batch_sim) in tqdm(enumerate(val_loader), total=len(val_loader)):
                 batch = {k: v.to(device) for k, v in batch.items()}
                 concept_label = torch.where(batch["attention_mask"][:, :-1] == 0, -100, batch["label"].view(-1, 1))
                 word_label = torch.where(batch["attention_mask"][:, :-1] == 0, -100, batch["input_ids"][:, 1:])
@@ -369,7 +369,8 @@ if __name__ == "__main__":
                     features = preLM(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"]).last_hidden_state
                     concepts, unsup, vocabs, matched_unsup = cbl(features.float())
                     classification = classifier(mean_pooling(unsup, batch["attention_mask"]))
-                concept_loss = torch.nn.CrossEntropyLoss()(concepts[:, :-1, :].reshape(-1, len(concept_set)), concept_label.reshape(-1))
+                
+                
                 word_loss = torch.nn.CrossEntropyLoss()(vocabs[:, :-1, :].reshape(-1, config.vocab_size), word_label.reshape(-1))
                 discrimination_loss = torch.nn.CrossEntropyLoss()(classification, batch["label"])
                 p = F.softmax(classification, dim=-1)
@@ -382,6 +383,12 @@ if __name__ == "__main__":
                 if matched_unsup is not None:
                     orthogonal_loss = torch.cosine_similarity(concepts, matched_unsup, dim=-1).mean().abs() ## TODO: check shape
                     val_losses["val_orthogonal_loss"].append(orthogonal_loss.detach().cpu().numpy())
+                
+                batch_sim = batch_sim.to(device) # (B, C)
+                batch_sim = batch_sim.unsqueeze(1).expand(-1, concepts.shape[1], -1) # (B, seq_len, C)
+                concepts = concepts.view(-1, concepts.shape[-1]) # (B*seq_len, C)
+                batch_sim = batch_sim.contiguous().view(-1, batch_sim.shape[-1]) # (B*seq_len, C)
+                concept_loss = cos_sim_cubed(concepts, batch_sim)
                 
                 neg_entropy_loss = torch.sum(p * torch.log(p), dim=-1).mean()
                 reg = elastic_net_penalty(cbl.fc.weight[:, :len(concept_set)])
