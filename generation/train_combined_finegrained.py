@@ -482,7 +482,7 @@ if __name__ == "__main__":
                 for j in range(len(concept_set)):
                     v = [0] * len(concept_set)
                     v[j] = intervention_value
-                    text_ids, _ = cbl.generate(input_ids, preLM, intervene=v)
+                    text_ids, _ = cbl.generate(input_ids, preLM)
                     decoded_text_ids = tokenizer.decode(text_ids[0][~torch.isin(text_ids[0], torch.tensor([128000, 128001]).to(device))])
                     text.append(decoded_text_ids)
                     
