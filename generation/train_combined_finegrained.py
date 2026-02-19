@@ -458,13 +458,13 @@ if __name__ == "__main__":
     # print ("concept features shape before pooling: ", concept_features)
     concept_features = mean_pooling(concept_features.last_hidden_state, encoded_c["attention_mask"])
     concept_features = F.normalize(concept_features, p=2, dim=1)
-    
+    print("concept features shape after pooling: ", concept_features.shape)
     # roberta_tokenizer = RobertaTokenizerFast.from_pretrained('roberta-base')
     # classifier_path = args.dataset.replace('/', '_') + "_finegrained_classifier.pt"
     # classifier = Roberta_classifier(len(concept_set)).to(device)
     # classifier.load_state_dict(torch.load(classifier_path, map_location=device))
     
-
+    print("concept set: ", concept_set)
     if args.dataset == "dbpedia_14":
         intervention_value = 150
     else:
@@ -488,11 +488,13 @@ if __name__ == "__main__":
                     
                     generated_c = tokenizer_sim(decoded_text_ids, padding=True, truncation=True, max_length=args.max_length, return_tensors="pt").to(device)
                     generated_c = {k: v.to(device) for k, v in generated_c.items()}
-                    generated_features = sim_model(input_ids=generated_c["input_ids"], attention_mask=generated_c["attention_mask"]).pooler_output
-                    generated_features = mean_pooling(generated_features, generated_c["attention_mask"])
+                    generated_features = sim_model(input_ids=generated_c["input_ids"], attention_mask=generated_c["attention_mask"])
+                    print("gen", generated_features.hidden_states.shape)
+                    generated_features = mean_pooling(generated_features.last_hidden_state, generated_c["attention_mask"])
                     generated_features = F.normalize(generated_features, p=2, dim=1)
+                    print("gen after pooling", generated_features.shape)
                     sims = generated_features @ concept_features.T
-                    
+                    print("sims shape: ", sims.shape)
                     cos_sim_cubed_values.append(cos_sim_cubed(sims, j).item())
                     softmax_values.append(torch.nn.CrossEntropyLoss()(sims, torch.tensor([j]).to(device)).item())
                     
