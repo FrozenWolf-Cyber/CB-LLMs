@@ -452,9 +452,9 @@ if __name__ == "__main__":
 
     encoded_c = tokenizer_sim(concept_set, padding=True, truncation=True, max_length=args.max_length)
     encoded_c = {k: torch.tensor(v).to(device) for k, v in encoded_c.items()}
-    concept_features = sim_model(input_ids=encoded_c["input_ids"], attention_mask=encoded_c["attention_mask"]).pooler_output
-    # print(concept_features)
-    # print(concept_features.pooler_output.shape, encoded_c["attention_mask"].shape)
+    concept_features = sim_model(input_ids=encoded_c["input_ids"], attention_mask=encoded_c["attention_mask"])
+    print(concept_features.hidden_states)
+    print(concept_features.pooler_output.shape, encoded_c["attention_mask"].shape)
     # print ("concept features shape before pooling: ", concept_features)
     concept_features = mean_pooling(concept_features, encoded_c["attention_mask"])
     concept_features = F.normalize(concept_features, p=2, dim=1)
