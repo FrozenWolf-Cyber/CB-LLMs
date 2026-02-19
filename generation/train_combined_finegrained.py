@@ -451,6 +451,7 @@ if __name__ == "__main__":
     
 
     encoded_c = tokenizer_sim(concept_set, padding=True, truncation=True, max_length=args.max_length)
+    encoded_c = {k: torch.tensor(v).to(device) for k, v in encoded_c.items()}
     concept_features = sim_model(input_ids=encoded_c["input_ids"], attention_mask=encoded_c["attention_mask"])
     concept_features = mean_pooling(concept_features, encoded_c["attention_mask"])
     concept_features = F.normalize(concept_features, p=2, dim=1)
@@ -483,6 +484,7 @@ if __name__ == "__main__":
                     text.append(decoded_text_ids)
                     
                     generated_c = tokenizer_sim(decoded_text_ids, padding=True, truncation=True, max_length=args.max_length, return_tensors="pt").to(device)
+                    generated_c = {k: v.to(device) for k, v in generated_c.items()}
                     generated_features = sim_model(input_ids=generated_c["input_ids"], attention_mask=generated_c["attention_mask"])
                     generated_features = mean_pooling(generated_features, generated_c["attention_mask"])
                     generated_features = F.normalize(generated_features, p=2, dim=1)
