@@ -264,16 +264,16 @@ if __name__ == "__main__":
             # print("elastic_net_alphaunsup shape in training loop:", unsup.shape)
             # print("vocabs shape in training loop:", vocabs.shape)
             
-            concept_loss = torch.nn.CrossEntropyLoss()(concepts[:, :-1, :].reshape(-1, len(concept_set)), concept_label.reshape(-1))
+            # concept_loss = torch.nn.CrossEntropyLoss()(concepts[:, :-1, :].reshape(-1, len(concept_set)), concept_label.reshape(-1))
             word_loss = torch.nn.CrossEntropyLoss()(vocabs[:, :-1, :].reshape(-1, config.vocab_size), word_label.reshape(-1))
-            loss = args.concept_loss * concept_loss + word_loss
             reg = elastic_net_penalty(cbl.fc.weight[:, :len(concept_set)])
             
-            batch_sim = batch_sim.to(device) # (B, C)
-            batch_sim = batch_sim.unsqueeze(1).expand(-1, concepts.shape[1], -1) # (B, seq_len, C)
-            concepts = concepts.view(-1, concepts.shape[-1]) # (B*seq_len, C)
-            batch_sim = batch_sim.contiguous().view(-1, batch_sim.shape[-1]) # (B*seq_len, C)
-            concept_loss = cos_sim_cubed(concepts, batch_sim)
+            print("concepts shape: ", concepts.shape)
+            print("concept_label shape: ", concept_label.shape)
+            print("unsup shape: ", unsup.shape)
+            print("matched_unsup shape: ", matched_unsup.shape)
+            
+            loss = 0
             if matched_unsup is not None:
                 orthogonal_loss = torch.cosine_similarity(concepts, matched_unsup, dim=-1).mean().abs() ## TODO: check shape
                 loss += args.orthogonal_loss_weight * orthogonal_loss
@@ -284,6 +284,15 @@ if __name__ == "__main__":
                 residual_penalty = torch.mean(torch.abs(residual_contrib)) ## TODO: check logic
                 loss += args.residual_penalty_weight * residual_penalty
                 training_losses["residual_penalty_loss"].append(residual_penalty.detach().cpu().numpy())
+            
+            batch_sim = batch_sim.to(device) # (B, C)
+            batch_sim = batch_sim.unsqueeze(1).expand(-1, concepts.shape[1], -1) # (B, seq_len, C)
+            concepts = concepts.view(-1, concepts.shape[-1]) # (B*seq_len, C)
+            batch_sim = batch_sim.contiguous().view(-1, batch_sim.shape[-1]) # (B*seq_len, C)
+            concept_loss = cos_sim_cubed(concepts, batch_sim)
+
+            
+            loss += args.concept_loss * concept_loss + word_loss
                 
             loss += args.elastic_net_alpha * reg
             
