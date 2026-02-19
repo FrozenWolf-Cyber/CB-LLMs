@@ -251,7 +251,7 @@ if __name__ == "__main__":
                 for b in range(concepts.shape[0]):
                     intervened_concept[b, :, concept_label_raw[b].item()] = intervention_value
                     
-                print("intervened_concept shape: ", intervened_concept.shape, intervened_concept.max(), intervened_concept.min())
+                # print("intervened_concept shape: ", intervened_concept.shape, intervened_concept.max(), intervened_concept.min())
                 vocab = cbl.intervene(unsup.detach(), intervened_concept.detach())
                 intervention_gen_loss = torch.nn.CrossEntropyLoss()(vocab[:, :-1, :].reshape(-1, config.vocab_size), word_label.reshape(-1))
                 loss += args.intervention_gen_loss * intervention_gen_loss
