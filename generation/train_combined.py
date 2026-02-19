@@ -11,6 +11,7 @@ from transformers import LlamaConfig, LlamaModel, AutoTokenizer, RobertaTokenize
 from peft import LoraConfig, TaskType, get_peft_model
 from modules import CBLResidual, CBL, Roberta_classifier
 import time
+from module_intervention import amplify_intervention
 from utils import elastic_net_penalty, mean_pooling, eos_pooling
 import wandb
 def set_seed(seed):
@@ -30,12 +31,15 @@ parser.add_argument("--seed", type=int, default=42)
 parser.add_argument("--discrimination_loss", type=float, default=1.0)
 parser.add_argument("--neg_entropy_loss", type=float, default=1.0)
 parser.add_argument("--concept_loss", type=float, default=1.0)
+parser.add_argument("--word_loss", type=float, default=1.0)
 parser.add_argument("--elastic_net_alpha", type=float, default=1.0)
 parser.add_argument("--residual_dim", type=int, default=768)
 parser.add_argument("--orthogonal_loss_weight", type=float, default=0)
 parser.add_argument("--residual_penalty_weight", type=float, default=0)
 parser.add_argument("--DEBUG", action='store_true', help="If set, use a smaller subset of data for quick debugging.")
-
+parser.add_argument("--intervention_gen_loss", type=float, default=1.0)
+parser.add_argument("--intervention_margin", type=float, default=10.0)
+parser.add_argument("--intervention_spread", type=float, default=2.0)
 
 class ClassificationDataset(torch.utils.data.Dataset):
     def __init__(self, encoded_text):
@@ -204,6 +208,7 @@ if __name__ == "__main__":
             "reg_loss": [],
             "orthogonal_loss": [],
             "residual_penalty_loss": [],
+            "intervention_gen_loss": []
         }
 
         
@@ -219,7 +224,7 @@ if __name__ == "__main__":
             
             concept_loss = torch.nn.CrossEntropyLoss()(concepts[:, :-1, :].reshape(-1, len(concept_set)), concept_label.reshape(-1))
             word_loss = torch.nn.CrossEntropyLoss()(vocabs[:, :-1, :].reshape(-1, config.vocab_size), word_label.reshape(-1))
-            loss = args.concept_loss * concept_loss + word_loss
+            loss = args.concept_loss * concept_loss + word_loss*args.word_loss
             reg = elastic_net_penalty(cbl.fc.weight[:, :len(concept_set)])
             
             if matched_unsup is not None:
@@ -232,6 +237,25 @@ if __name__ == "__main__":
                 residual_penalty = torch.mean(torch.abs(residual_contrib)) ## TODO: check logic
                 loss += args.residual_penalty_weight * residual_penalty
                 training_losses["residual_penalty_loss"].append(residual_penalty.detach().cpu().numpy())
+                
+            if args.intervention_gen_loss > 0:
+                ### concepts shapes: (B, seq_len, concept_dim)
+                concept_label_raw = batch["label"].view(-1, 1) ## shape: (B, 1)
+                
+                if args.dataset == "dbpedia_14":
+                    intervention_value = 150
+                else:
+                    intervention_value = 100
+                    
+                intervened_concept = torch.zeros_like(concepts, device=device) ## shape: (B, seq_len, concept_dim)
+                for b in range(concepts.shape[0]):
+                    intervened_concept[b, :, concept_label_raw[b].item()] = intervention_value
+                    
+                print("intervened_concept shape: ", intervened_concept.shape, intervened_concept.max(), intervened_concept.min())
+                vocab = cbl.intervene(unsup.detach(), intervened_concept.detach())
+                intervention_gen_loss = torch.nn.CrossEntropyLoss()(vocab[:, :-1, :].reshape(-1, config.vocab_size), word_label.reshape(-1))
+                loss += args.intervention_gen_loss * intervention_gen_loss
+                training_losses["intervention_gen_loss"].append(intervention_gen_loss.detach().cpu().numpy())
                 
             loss += args.elastic_net_alpha * reg
             
@@ -299,6 +323,7 @@ if __name__ == "__main__":
                 "val_reg_loss": [],
                 "val_residual_penalty_loss": [],
                 "val_orthogonal_loss": [],
+                "val_intervention_gen_loss": []
             }
             for i, batch in tqdm(enumerate(val_loader), total=len(val_loader)):
                 batch = {k: v.to(device) for k, v in batch.items()}
@@ -321,6 +346,20 @@ if __name__ == "__main__":
                 if matched_unsup is not None:
                     orthogonal_loss = torch.cosine_similarity(concepts, matched_unsup, dim=-1).mean().abs() ## TODO: check shape
                     val_losses["val_orthogonal_loss"].append(orthogonal_loss.detach().cpu().numpy())
+                
+                if args.intervention_gen_loss > 0:
+                    if args.dataset == "dbpedia_14":
+                        intervention_value = 150
+                    else:
+                        intervention_value = 100
+
+                    intervened_concept = torch.zeros_like(concepts, device=device) ## shape: (B, seq_len, concept_dim)
+                    for b in range(concepts.shape[0]):
+                        intervened_concept[b, :, concept_label[b].item()] = intervention_value
+
+                    vocab = cbl.intervene(unsup.detach(), intervened_concept.detach())
+                    intervention_gen_loss = torch.nn.CrossEntropyLoss()(vocab[:, :-1, :].reshape(-1, config.vocab_size), word_label.reshape(-1))
+                    val_losses["val_intervention_gen_loss"].append(intervention_gen_loss.detach().cpu().numpy())
                 
                 neg_entropy_loss = torch.sum(p * torch.log(p), dim=-1).mean()
                 reg = elastic_net_penalty(cbl.fc.weight[:, :len(concept_set)])

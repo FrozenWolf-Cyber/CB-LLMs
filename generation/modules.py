@@ -94,6 +94,11 @@ class CBL(nn.Module):
         e = torch.cat((self.relu(concepts), unsup_features), dim=-1)
         return self.relu(concepts), unsup_features, self.fc(e), self.match_layer(unsup_features) if self.match_layer else unsup_features
 
+    def intervene(self, unsup_features, intervene):
+        concepts = intervene
+        e = torch.cat((self.relu(concepts), unsup_features), dim=-1)
+        return self.fc(e)
+
     def generate(self, ids, preLM, intervene=None, length=100, temp=0.7, topk=100, topp=0.9, repetition_penalty=1.5, eos_token_id=128001):
         past_key_values = None
         for i in range(length):
@@ -140,6 +145,12 @@ class CBLResidual(nn.Module):
         # print("unsup_features shape:", unsup_features.shape)
         e = torch.cat((self.relu(concepts), unsup_features), dim=-1)
         return self.relu(concepts), unsup_features, self.fc(e), self.match_layer(unsup_features) if self.match_layer else unsup_features
+
+    def intervene(self, unsup_features, intervene):
+        concepts = intervene
+        e = torch.cat((self.relu(concepts), unsup_features), dim=-1)
+        return self.fc(e)
+
 
     def generate(self, ids, preLM, intervene=None, length=100, temp=0.7, topk=100, topp=0.9, repetition_penalty=1.5, eos_token_id=128001):
         past_key_values = None
