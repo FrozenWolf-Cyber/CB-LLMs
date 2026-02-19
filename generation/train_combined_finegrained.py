@@ -254,100 +254,100 @@ if __name__ == "__main__":
         }
 
         
-        # for i, (batch, batch_sim) in tqdm(enumerate(train_loader), total=len(train_loader)):
-        #     batch = {k: v.to(device) for k, v in batch.items()}
-        #     concept_label = torch.where(batch["attention_mask"][:, :-1] == 0, -100, batch["label"].view(-1, 1))
-        #     word_label = torch.where(batch["attention_mask"][:, :-1] == 0, -100, batch["input_ids"][:, 1:])
-        #     features = preLM(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"]).last_hidden_state
-        #     concepts, unsup, vocabs, matched_unsup = cbl(features.float())
-        #     # print("concepts shape in training loop:", concepts.shape)
-        #     # print("elastic_net_alphaunsup shape in training loop:", unsup.shape)
-        #     # print("vocabs shape in training loop:", vocabs.shape)
+        for i, (batch, batch_sim) in tqdm(enumerate(train_loader), total=len(train_loader)):
+            batch = {k: v.to(device) for k, v in batch.items()}
+            concept_label = torch.where(batch["attention_mask"][:, :-1] == 0, -100, batch["label"].view(-1, 1))
+            word_label = torch.where(batch["attention_mask"][:, :-1] == 0, -100, batch["input_ids"][:, 1:])
+            features = preLM(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"]).last_hidden_state
+            concepts, unsup, vocabs, matched_unsup = cbl(features.float())
+            # print("concepts shape in training loop:", concepts.shape)
+            # print("elastic_net_alphaunsup shape in training loop:", unsup.shape)
+            # print("vocabs shape in training loop:", vocabs.shape)
             
-        #     # concept_loss = torch.nn.CrossEntropyLoss()(concepts[:, :-1, :].reshape(-1, len(concept_set)), concept_label.reshape(-1))
-        #     word_loss = torch.nn.CrossEntropyLoss()(vocabs[:, :-1, :].reshape(-1, config.vocab_size), word_label.reshape(-1))
-        #     reg = elastic_net_penalty(cbl.fc.weight[:, :len(concept_set)])
+            # concept_loss = torch.nn.CrossEntropyLoss()(concepts[:, :-1, :].reshape(-1, len(concept_set)), concept_label.reshape(-1))
+            word_loss = torch.nn.CrossEntropyLoss()(vocabs[:, :-1, :].reshape(-1, config.vocab_size), word_label.reshape(-1))
+            reg = elastic_net_penalty(cbl.fc.weight[:, :len(concept_set)])
             
-        #     # print("concepts shape: ", concepts.shape)
-        #     # print("concept_label shape: ", concept_label.shape)
-        #     # print("unsup shape: ", unsup.shape)
-        #     # print("matched_unsup shape: ", matched_unsup.shape)
+            # print("concepts shape: ", concepts.shape)
+            # print("concept_label shape: ", concept_label.shape)
+            # print("unsup shape: ", unsup.shape)
+            # print("matched_unsup shape: ", matched_unsup.shape)
             
-        #     loss = 0
-        #     if matched_unsup is not None:
-        #         orthogonal_loss = torch.cosine_similarity(concepts, matched_unsup, dim=-1).mean().abs() ## TODO: check shape
-        #         loss += args.orthogonal_loss_weight * orthogonal_loss
-        #         training_losses["orthogonal_loss"].append(orthogonal_loss.detach().cpu().numpy())
+            loss = 0
+            if matched_unsup is not None:
+                orthogonal_loss = torch.cosine_similarity(concepts, matched_unsup, dim=-1).mean().abs() ## TODO: check shape
+                loss += args.orthogonal_loss_weight * orthogonal_loss
+                training_losses["orthogonal_loss"].append(orthogonal_loss.detach().cpu().numpy())
             
-        #     if args.residual_penalty_weight > 0:
-        #         residual_contrib = cbl.compute_residual_contrib(unsup)
-        #         residual_penalty = torch.mean(torch.abs(residual_contrib)) ## TODO: check logic
-        #         loss += args.residual_penalty_weight * residual_penalty
-        #         training_losses["residual_penalty_loss"].append(residual_penalty.detach().cpu().numpy())
+            if args.residual_penalty_weight > 0:
+                residual_contrib = cbl.compute_residual_contrib(unsup)
+                residual_penalty = torch.mean(torch.abs(residual_contrib)) ## TODO: check logic
+                loss += args.residual_penalty_weight * residual_penalty
+                training_losses["residual_penalty_loss"].append(residual_penalty.detach().cpu().numpy())
             
-        #     batch_sim = batch_sim.to(device) # (B, C)
-        #     batch_sim = batch_sim.unsqueeze(1).expand(-1, concepts.shape[1], -1) # (B, seq_len, C)
-        #     concepts = concepts.view(-1, concepts.shape[-1]) # (B*seq_len, C)
-        #     batch_sim = batch_sim.contiguous().view(-1, batch_sim.shape[-1]) # (B*seq_len, C)
-        #     concept_loss = cos_sim_cubed(concepts, batch_sim)
+            batch_sim = batch_sim.to(device) # (B, C)
+            batch_sim = batch_sim.unsqueeze(1).expand(-1, concepts.shape[1], -1) # (B, seq_len, C)
+            concepts = concepts.view(-1, concepts.shape[-1]) # (B*seq_len, C)
+            batch_sim = batch_sim.contiguous().view(-1, batch_sim.shape[-1]) # (B*seq_len, C)
+            concept_loss = cos_sim_cubed(concepts, batch_sim)
 
             
-        #     loss += args.concept_loss * concept_loss + word_loss
+            loss += args.concept_loss * concept_loss + word_loss
                 
-        #     loss += args.elastic_net_alpha * reg
+            loss += args.elastic_net_alpha * reg
             
             
             
-        #     opt_prelm.zero_grad()
-        #     opt_cbl.zero_grad()
-        #     loss.backward()
-        #     opt_prelm.step()
-        #     opt_cbl.step()
+            opt_prelm.zero_grad()
+            opt_cbl.zero_grad()
+            loss.backward()
+            opt_prelm.step()
+            opt_cbl.step()
 
-        #     if args.discrimination_loss > 0:
-        #         classification = classifier(mean_pooling(unsup.detach(), batch["attention_mask"]))
-        #         discrimination_loss = torch.nn.CrossEntropyLoss()(classification, batch["label"])
-        #         opt_classifier.zero_grad()
-        #         (args.discrimination_loss * discrimination_loss).backward(inputs=list(classifier.parameters()))
-        #         opt_classifier.step()
+            if args.discrimination_loss > 0:
+                classification = classifier(mean_pooling(unsup.detach(), batch["attention_mask"]))
+                discrimination_loss = torch.nn.CrossEntropyLoss()(classification, batch["label"])
+                opt_classifier.zero_grad()
+                (args.discrimination_loss * discrimination_loss).backward(inputs=list(classifier.parameters()))
+                opt_classifier.step()
 
-        #     if args.neg_entropy_loss > 0:
-        #         _, unsup, _, _ = cbl(features.detach().float())
-        #         classification = classifier(mean_pooling(unsup, batch["attention_mask"]))
-        #         p = F.softmax(classification, dim=-1)
-        #         neg_entropy_loss = torch.sum(p * torch.log(p), dim=-1).mean()
-        #         opt_cbl.zero_grad()
-        #         (args.neg_entropy_loss * neg_entropy_loss).backward(inputs=list(cbl.unsup.parameters()))
-        #         opt_cbl.step()
-        #         training_losses["neg_entropy_loss"].append(neg_entropy_loss.detach().cpu().numpy())
+            if args.neg_entropy_loss > 0:
+                _, unsup, _, _ = cbl(features.detach().float())
+                classification = classifier(mean_pooling(unsup, batch["attention_mask"]))
+                p = F.softmax(classification, dim=-1)
+                neg_entropy_loss = torch.sum(p * torch.log(p), dim=-1).mean()
+                opt_cbl.zero_grad()
+                (args.neg_entropy_loss * neg_entropy_loss).backward(inputs=list(cbl.unsup.parameters()))
+                opt_cbl.step()
+                training_losses["neg_entropy_loss"].append(neg_entropy_loss.detach().cpu().numpy())
 
-        #     training_losses["concept_loss"].append(concept_loss.detach().cpu().numpy())
-        #     training_losses["word_loss"].append(word_loss.detach().cpu().numpy())
+            training_losses["concept_loss"].append(concept_loss.detach().cpu().numpy())
+            training_losses["word_loss"].append(word_loss.detach().cpu().numpy())
             
-        #     training_losses["reg_loss"].append(reg.detach().cpu().numpy())
+            training_losses["reg_loss"].append(reg.detach().cpu().numpy())
             
-        #     log = {}
-        #     for key in training_losses.keys():
-        #         if len(training_losses[key]) > 0:
-        #             print(f"{key}: {training_losses[key][-1]}", end=" ")
-        #             log[key] = training_losses[key][-1]
-        #     # print(" | batch ", i+1, " / ", len(train_loader), end="\r")
-            
-            
-        #     log["epoch"] = e + 1
-        #     log["batch"] = i + 1
-        #     wandb.log(log)
-            
-        #     if args.DEBUG and i >= 2:
-        #         break
+            log = {}
+            for key in training_losses.keys():
+                if len(training_losses[key]) > 0:
+                    print(f"{key}: {training_losses[key][-1]}", end=" ")
+                    log[key] = training_losses[key][-1]
+            # print(" | batch ", i+1, " / ", len(train_loader), end="\r")
             
             
-        # avg_metrics = {}
-        # for key in training_losses.keys():
-        #     if len(training_losses[key]) > 0:
-        #         avg_metrics[key] = sum(training_losses[key]) / len(training_losses[key])
-        # print("Epoch ", e + 1, " training losses: ", avg_metrics)
-        # wandb.log({f"avg_{k}": avg_metrics[k] for k in avg_metrics.keys()})
+            log["epoch"] = e + 1
+            log["batch"] = i + 1
+            wandb.log(log)
+            
+            if args.DEBUG and i >= 2:
+                break
+            
+            
+        avg_metrics = {}
+        for key in training_losses.keys():
+            if len(training_losses[key]) > 0:
+                avg_metrics[key] = sum(training_losses[key]) / len(training_losses[key])
+        print("Epoch ", e + 1, " training losses: ", avg_metrics)
+        wandb.log({f"avg_{k}": avg_metrics[k] for k in avg_metrics.keys()})
 
 
         if args.dataset == 'SetFit/sst2':
