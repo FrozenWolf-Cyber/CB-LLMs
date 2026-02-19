@@ -454,7 +454,7 @@ if __name__ == "__main__":
     encoded_c = {k: torch.tensor(v).to(device) for k, v in encoded_c.items()}
     concept_features = sim_model(input_ids=encoded_c["input_ids"], attention_mask=encoded_c["attention_mask"]).pooler_output
     # print(concept_features.last_hidden_state.shape)
-    # print(concept_features.pooler_output.shape)
+    print(concept_features.pooler_output.shape, encoded_c["attention_mask"].shape)
     # print ("concept features shape before pooling: ", concept_features)
     concept_features = mean_pooling(concept_features, encoded_c["attention_mask"])
     concept_features = F.normalize(concept_features, p=2, dim=1)
