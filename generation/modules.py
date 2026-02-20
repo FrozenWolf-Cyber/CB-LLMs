@@ -105,7 +105,7 @@ class CBL(nn.Module):
             outputs = preLM(ids[:, -1:] if past_key_values is not None else ids, past_key_values=past_key_values, use_cache=True)
             past_key_values = outputs.past_key_values
             features = outputs.last_hidden_state.float()
-            concepts, _, _, _ = self.cbl(features)
+            concepts = self.cbl(features)
             unsup_features = self.unsup(features)
             if intervene:
                 for j in range(self.concept_dim):
