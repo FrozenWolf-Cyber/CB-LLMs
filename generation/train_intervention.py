@@ -501,6 +501,7 @@ if __name__ == "__main__":
     set_seed(args.seed)
     
     pred = []
+    skips = 0
     perplexity = evaluate.load("perplexity", module_type="metric")
     input_ids = torch.tensor([tokenizer.encode("")]).to(device)
     attention_mask = (input_ids != tokenizer.pad_token_id).long()
@@ -510,9 +511,13 @@ if __name__ == "__main__":
             with torch.amp.autocast(device_type=device_str, dtype=torch.bfloat16):
                 text_ids = generate(preLM_generator, input_ids, preLM=preLM, length=100, temp=0.7, topk=100, topp=0.9)
             pred.append(tokenizer.decode(text_ids[0], skip_special_tokens=True ))
-            if len(pred[-1].split()) > 30:
+            if len(pred[-1].split()) > 35:
+                skips += 1
                 continue
             perplexity.add_batch(predictions=[pred[i]])
+
+    if skips == len(pred):
+        perplexity.add_batch(predictions=pred)
 
         ## print some generated texts
     print("Some generated texts:")
