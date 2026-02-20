@@ -356,7 +356,6 @@ if __name__ == "__main__":
                     intervened_concept = torch.zeros_like(concepts, device=device)
 
                     # ---- BEFORE ----
-                    print("Counter:", counter)
                     print("Before intervention:")
                     print("  min:", intervened_concept.min().item())
                     print("  max:", intervened_concept.max().item())
@@ -367,7 +366,10 @@ if __name__ == "__main__":
 
                     intervened_concept[:, :seq_len, 1] = mask.float() * intervention_value
 
-                    # ---- AFTER ----
+                    # ---- Counter AFTER intervention ----
+                    counter = (intervened_concept[:, :, 1] == intervention_value).sum().item()
+                    
+                    print("Counter:", counter)
                     print("After intervention:")
                     print("  min:", intervened_concept.min().item())
                     print("  max:", intervened_concept.max().item())
