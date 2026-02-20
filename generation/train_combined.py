@@ -312,7 +312,6 @@ if __name__ == "__main__":
         print("Epoch ", e + 1, " training losses: ", avg_metrics)
         wandb.log({f"avg_{k}": avg_metrics[k] for k in avg_metrics.keys()})
 
-    with torch.no_grad():
         if args.dataset == 'SetFit/sst2':
             preLM.eval()
             cbl.eval()
