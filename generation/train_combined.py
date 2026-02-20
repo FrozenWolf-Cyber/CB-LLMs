@@ -354,28 +354,28 @@ if __name__ == "__main__":
                         intervention_value = 100
                     print("concept_label shape: ", concept_label.shape, concepts.shape)
                     intervened_concept = torch.zeros_like(concepts, device=device)
-                    
+
                     # ---- BEFORE ----
                     print("Counter:", counter)
                     print("Before intervention:")
                     print("  min:", intervened_concept.min().item())
                     print("  max:", intervened_concept.max().item())
-                    
+
                     # Apply intervention
                     seq_len = concept_label.size(1)
                     mask = (concept_label == 1)
-                    
+
                     intervened_concept[:, :seq_len, 1] = mask.float() * intervention_value
-                    
+
                     # ---- AFTER ----
                     print("After intervention:")
                     print("  min:", intervened_concept.min().item())
                     print("  max:", intervened_concept.max().item())
-                    
+
                     # Optional: how many positions activated
                     print("Activated positions:", mask.sum().item())
                     print("-" * 50)
-                                        vocab = cbl.intervene(unsup.detach(), intervened_concept.detach())
+                    vocab = cbl.intervene(unsup.detach(), intervened_concept.detach())
                     intervention_gen_loss = torch.nn.CrossEntropyLoss()(vocab[:, :-1, :].reshape(-1, config.vocab_size), word_label.reshape(-1))
                     val_losses["val_intervention_gen_loss"].append(intervention_gen_loss.detach().cpu().numpy())
                 
