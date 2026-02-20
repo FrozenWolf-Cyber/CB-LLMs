@@ -37,7 +37,7 @@ parser.add_argument("--residual_dim", type=int, default=768)
 parser.add_argument("--orthogonal_loss_weight", type=float, default=0)
 parser.add_argument("--residual_penalty_weight", type=float, default=0)
 parser.add_argument("--DEBUG", action='store_true', help="If set, use a smaller subset of data for quick debugging.")
-parser.add_argument("--intervention_gen_loss", type=float, default=1.0)
+parser.add_argument("--intervention_gen_loss", type=float, default=0.0)
 parser.add_argument("--intervention_margin", type=float, default=10.0)
 parser.add_argument("--intervention_spread", type=float, default=2.0)
 
