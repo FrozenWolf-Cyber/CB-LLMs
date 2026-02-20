@@ -353,15 +353,29 @@ if __name__ == "__main__":
                     else:
                         intervention_value = 100
                     print("concept_label shape: ", concept_label.shape, concepts.shape)
-                    intervened_concept = torch.zeros_like(concepts, device=device) ## shape: (B, seq_len, concept_dim)
-                    valid_mask = concept_label != -100  # (B, seq_len)
-
-                    b_idx, t_idx = valid_mask.nonzero(as_tuple=True)
-                    c_idx = concept_label[b_idx, t_idx]
-
-                    intervened_concept[b_idx, t_idx, c_idx] = intervention_value
+                    intervened_concept = torch.zeros_like(concepts, device=device)
                     
-                    vocab = cbl.intervene(unsup.detach(), intervened_concept.detach())
+                    # ---- BEFORE ----
+                    print("Counter:", counter)
+                    print("Before intervention:")
+                    print("  min:", intervened_concept.min().item())
+                    print("  max:", intervened_concept.max().item())
+                    
+                    # Apply intervention
+                    seq_len = concept_label.size(1)
+                    mask = (concept_label == 1)
+                    
+                    intervened_concept[:, :seq_len, 1] = mask.float() * intervention_value
+                    
+                    # ---- AFTER ----
+                    print("After intervention:")
+                    print("  min:", intervened_concept.min().item())
+                    print("  max:", intervened_concept.max().item())
+                    
+                    # Optional: how many positions activated
+                    print("Activated positions:", mask.sum().item())
+                    print("-" * 50)
+                                        vocab = cbl.intervene(unsup.detach(), intervened_concept.detach())
                     intervention_gen_loss = torch.nn.CrossEntropyLoss()(vocab[:, :-1, :].reshape(-1, config.vocab_size), word_label.reshape(-1))
                     val_losses["val_intervention_gen_loss"].append(intervention_gen_loss.detach().cpu().numpy())
                 
