@@ -401,8 +401,8 @@ if __name__ == "__main__":
             preLM.save_pretrained(prefix + model_name + "_epoch_" + str(e + 1))
             torch.save(cbl.state_dict(), prefix + cbl_name + "_epoch_" + str(e + 1) + ".pt")
 
-        if args.DEBUG:
-            break
+        # if args.DEBUG:
+        #     break
 
     end = time.time()
     print("time of training CBM:", (end - start) / 3600, "hours")
