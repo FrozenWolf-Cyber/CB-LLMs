@@ -538,7 +538,7 @@ if __name__ == "__main__":
     print("eval concepts...")
     metric = evaluate.load("accuracy")
     concept_predictions = []
-    for batch in tqdm(test_loader, total=len(test_loader)):
+    for i, (batch, batch_sim) in tqdm(enumerate(test_loader), total=len(test_loader)):
         batch = {k: v.to(device) for k, v in batch.items()}
         with torch.no_grad():
             features = preLM(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"]).last_hidden_state
