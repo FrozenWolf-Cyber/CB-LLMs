@@ -24,7 +24,6 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 parser = argparse.ArgumentParser()
 parser.add_argument("--run_ids_pickle", type=str, required=True, help="Path to pickle file containing list of wandb run IDs")
-parser.add_argument("--model_weight_indices", type=str, default="1,2,3", help="Comma-separated list of model weight indices to test (e.g., '1,2,3' for epochs 1,2,3)")
 parser.add_argument("--wandb_project", type=str, default="cbm-generation-new", help="Wandb project name")
 parser.add_argument("--wandb_entity", type=str, default=None, help="Wandb entity (username or team)")
 parser.add_argument("--classifier_weight_suffixes", type=str, default="_seed42,_seed123,_seed456", 
@@ -188,7 +187,7 @@ def load_model_and_cbl(peft_path, cbl_path, config, concept_set, tokenizer, disc
     return preLM, cbl
 
 
-def process_run(run_id, weight_indices, classifier_suffixes, expected_dataset, seed, wandb_project, wandb_entity=None):
+def process_run(run_id, classifier_suffixes, expected_dataset, seed, wandb_project, wandb_entity=None):
     """
     Process a single wandb run: load config, load models, run steerability tests, and log results.
     """
@@ -228,30 +227,18 @@ def process_run(run_id, weight_indices, classifier_suffixes, expected_dataset, s
         print(f"SKIPPING run {run_id}: dataset mismatch. Run used '{dataset}' but expected '{expected_dataset}'.")
         return
     
-    # Find available epochs
-    available_epochs = find_all_available_epochs(run_id, dataset)
-    print(f"Available epochs: {available_epochs}")
-    
-    if not available_epochs:
-        print(f"No model weights found for run {run_id}")
-        return
-    
-    # Find best epoch
+    # Find best epoch (validation-based for SetFit/sst2, last epoch for others)
     best_epoch = find_best_epoch(run_id, dataset)
     print(f"Best epoch: {best_epoch}")
     
-    # Determine which epochs to test
-    if weight_indices:
-        epochs_to_test = [int(idx) for idx in weight_indices if int(idx) in available_epochs]
-    else:
-        # Default: test best epoch only
-        epochs_to_test = [best_epoch] if best_epoch else available_epochs[-1:]
-    
-    print(f"Epochs to test: {epochs_to_test}")
-    
-    if not epochs_to_test:
-        print(f"No valid epochs to test for run {run_id}")
+    if best_epoch is None:
+        print(f"No model weights found for run {run_id}")
         return
+    
+    # Only test the best epoch
+    epochs_to_test = [best_epoch]
+    
+    print(f"Epoch to test: {epochs_to_test}")
     
     # Setup tokenizers and config
     config = LlamaConfig.from_pretrained('meta-llama/Meta-Llama-3-8B')
@@ -379,10 +366,6 @@ def main():
     print(f"Loaded {len(run_ids)} run IDs from {args.run_ids_pickle}")
     print(f"Run IDs: {run_ids}")
     
-    # Parse weight indices
-    weight_indices = [int(idx.strip()) for idx in args.model_weight_indices.split(',')]
-    print(f"Weight indices to test: {weight_indices}")
-    
     # Parse classifier weight suffixes
     classifier_suffixes = [s.strip() for s in args.classifier_weight_suffixes.split(',')]
     print(f"Classifier weight suffixes to test: {classifier_suffixes}")
@@ -396,7 +379,6 @@ def main():
         try:
             results = process_run(
                 run_id, 
-                weight_indices,
                 classifier_suffixes,
                 args.dataset,
                 args.seed,
