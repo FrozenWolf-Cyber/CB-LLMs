@@ -366,7 +366,7 @@ if __name__ == "__main__":
                     intervened_concept[:, :seq_len, 1] = mask.float() * intervention_value
 
                     # ---- Counter AFTER intervention ----
-                    counter = (intervened_concept[:, :, 1] == intervention_value).sum().item()
+                    # counter = (intervened_concept[:, :, 1] == intervention_value).sum().item()
 
                     # print("Counter:", counter)
                     # print("After intervention:")

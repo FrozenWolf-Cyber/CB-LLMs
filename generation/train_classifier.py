@@ -11,6 +11,15 @@ from modules import Roberta_classifier
 import wandb
 import copy
 
+
+def set_seed(seed):
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    import random
+    random.seed(seed)
+
+
 parser = argparse.ArgumentParser()
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -18,6 +27,9 @@ parser.add_argument("--dataset", type=str, default="SetFit/sst2")
 parser.add_argument("--batch_size", type=int, default=16)
 parser.add_argument("--max_length", type=int, default=100)
 parser.add_argument("--num_workers", type=int, default=0)
+parser.add_argument("--seed", type=int, default=42, help="Random seed for reproducibility")
+parser.add_argument("--weight_suffix", type=str, default="", help="Suffix for classifier weight file (e.g., '_seed42')")
+parser.add_argument("--lr", type=float, default=5e-6, help="Learning rate")
 
 
 class ClassificationDataset(torch.utils.data.Dataset):
@@ -45,8 +57,10 @@ def get_accuracy(logits, labels):
 if __name__ == "__main__":
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
     args = parser.parse_args()
+    
+    set_seed(args.seed)
 
-    wandb.init(project="CB-LLMs-steer", name=f"{args.dataset}_class", config=vars(args))
+    wandb.init(project="CB-LLMs-steer", name=f"{args.dataset}_class_seed{args.seed}", config=vars(args))
 
     print("loading data...")
     train_dataset = load_dataset(args.dataset, split='train')
@@ -80,7 +94,7 @@ if __name__ == "__main__":
 
     print("preparing classifier...")
     classifier = Roberta_classifier(len(concept_set)).to(device)
-    optimizer = torch.optim.Adam(classifier.parameters(), lr=5e-6)
+    optimizer = torch.optim.Adam(classifier.parameters(), lr=args.lr)
 
 
     print("start training...")
@@ -107,6 +121,10 @@ if __name__ == "__main__":
         metrics = {"train_loss": np.mean(training_loss), "train_acc": np.mean(training_acc), "epoch": e+1}
         print(f"\ntrain loss: {metrics['train_loss']:.4f} | train acc: {metrics['train_acc']:.4f}")
         wandb.log(metrics)
-        torch.save(classifier.state_dict(), args.dataset.replace('/', '_') + "_classifier.pt")
+        
+        # Save with suffix
+        weight_path = args.dataset.replace('/', '_') + f"_classifier{args.weight_suffix}.pt"
+        torch.save(classifier.state_dict(), weight_path)
+        print(f"Saved classifier to {weight_path}")
     
     wandb.finish()
