@@ -2,7 +2,7 @@ import torch
 from torch import nn
 from transformers import PreTrainedModel, GPT2Config, GPT2Model, GPT2TokenizerFast, RobertaModel
 import torch.nn.functional as F
-from utils import top_k_top_p_filtering
+from utils import top_k_top_p_filtering, top_k_top_p_filtering_batched
 
 class Roberta_classifier(nn.Module):
     def __init__(self, class_num):
@@ -121,8 +121,42 @@ class CBL(nn.Module):
             if eos_token_id is not None and next_token.item() == eos_token_id:
                 break
         return ids, self.relu(concepts)[0]
-    
-    
+
+    def generate_batch(self, ids, preLM, num_samples=1, intervene=None, length=100, temp=0.7, topk=100, topp=0.9, repetition_penalty=1.5, eos_token_id=128001):
+        """Generate num_samples trajectories in parallel (batched autoregressive)."""
+        ids = ids.expand(num_samples, -1).contiguous()  # (B, prompt_len)
+        finished = torch.zeros(num_samples, dtype=torch.bool, device=ids.device)
+        past_key_values = None
+        concepts = None
+        for i in range(length):
+            input_ids = ids[:, -1:] if past_key_values is not None else ids
+            outputs = preLM(input_ids, past_key_values=past_key_values, use_cache=True)
+            past_key_values = outputs.past_key_values
+            features = outputs.last_hidden_state.float()
+            concepts = self.cbl(features)
+            unsup_features = self.unsup(features)
+            if intervene:
+                for j in range(self.concept_dim):
+                    concepts[:, :, j] = intervene[j]
+            logits = self.fc(torch.cat((self.relu(concepts), unsup_features), dim=-1))
+            # Per-sample repetition penalty
+            for b in range(num_samples):
+                if not finished[b]:
+                    score = logits[b, -1, ids[b]].clone()
+                    score = torch.where(score < 0, score * repetition_penalty, score / repetition_penalty)
+                    logits[b, -1, ids[b]] = score
+            next_token_logits = logits[:, -1, :] / temp  # (B, vocab_size)
+            filtered_logits = top_k_top_p_filtering_batched(next_token_logits.clone(), top_k=topk, top_p=topp)
+            next_token = torch.multinomial(F.softmax(filtered_logits, dim=-1), num_samples=1)  # (B, 1)
+            next_token[finished] = eos_token_id
+            ids = torch.cat((ids, next_token), dim=-1)
+            if eos_token_id is not None:
+                finished = finished | (next_token.squeeze(-1) == eos_token_id)
+            if finished.all():
+                break
+        return ids, self.relu(concepts) if concepts is not None else None
+
+
 class CBLResidual(nn.Module):
     def __init__(self, config, concept_dim, residual_dim, tokenizer):
         super().__init__()
@@ -174,7 +208,41 @@ class CBLResidual(nn.Module):
             if eos_token_id is not None and next_token.item() == eos_token_id:
                 break
         return ids, self.relu(concepts)[0]
-    
+
+    def generate_batch(self, ids, preLM, num_samples=1, intervene=None, length=100, temp=0.7, topk=100, topp=0.9, repetition_penalty=1.5, eos_token_id=128001):
+        """Generate num_samples trajectories in parallel (batched autoregressive)."""
+        ids = ids.expand(num_samples, -1).contiguous()  # (B, prompt_len)
+        finished = torch.zeros(num_samples, dtype=torch.bool, device=ids.device)
+        past_key_values = None
+        concepts = None
+        for i in range(length):
+            input_ids = ids[:, -1:] if past_key_values is not None else ids
+            outputs = preLM(input_ids, past_key_values=past_key_values, use_cache=True)
+            past_key_values = outputs.past_key_values
+            features = outputs.last_hidden_state.float()
+            concepts = self.cbl(features)
+            unsup_features = self.cbl_residual(features)
+            if intervene:
+                for j in range(self.concept_dim):
+                    concepts[:, :, j] = intervene[j]
+            logits = self.fc(torch.cat((self.relu(concepts), unsup_features), dim=-1))
+            # Per-sample repetition penalty
+            for b in range(num_samples):
+                if not finished[b]:
+                    score = logits[b, -1, ids[b]].clone()
+                    score = torch.where(score < 0, score * repetition_penalty, score / repetition_penalty)
+                    logits[b, -1, ids[b]] = score
+            next_token_logits = logits[:, -1, :] / temp  # (B, vocab_size)
+            filtered_logits = top_k_top_p_filtering_batched(next_token_logits.clone(), top_k=topk, top_p=topp)
+            next_token = torch.multinomial(F.softmax(filtered_logits, dim=-1), num_samples=1)  # (B, 1)
+            next_token[finished] = eos_token_id
+            ids = torch.cat((ids, next_token), dim=-1)
+            if eos_token_id is not None:
+                finished = finished | (next_token.squeeze(-1) == eos_token_id)
+            if finished.all():
+                break
+        return ids, self.relu(concepts) if concepts is not None else None
+
     def compute_residual_contrib(self, unsup_features):
         w = self.fc.weight  # shape: (vocab_size, concept_dim + residual_dim)
         # print("fc weight shape:", w.shape)

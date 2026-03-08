@@ -34,6 +34,22 @@ def top_k_top_p_filtering(logits, top_k=0, top_p=0.0, filter_value=float('-inf')
         logits[0][indices_to_remove] = filter_value
     return logits
 
+def top_k_top_p_filtering_batched(logits, top_k=0, top_p=0.0, filter_value=float('-inf')):
+    """Batched top-k/top-p filtering. logits: (B, vocab_size)"""
+    if top_k > 0:
+        top_k_vals = torch.topk(logits, min(top_k, logits.size(-1)), dim=-1)[0]
+        indices_to_remove = logits < top_k_vals[:, -1:]
+        logits = logits.masked_fill(indices_to_remove, filter_value)
+    if top_p > 0.0:
+        sorted_logits, sorted_indices = torch.sort(logits, descending=True, dim=-1)
+        cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+        sorted_indices_to_remove = cumulative_probs > top_p
+        sorted_indices_to_remove[..., 1:] = sorted_indices_to_remove[..., :-1].clone()
+        sorted_indices_to_remove[..., 0] = 0
+        indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
+        logits = logits.masked_fill(indices_to_remove, filter_value)
+    return logits
+
 def elastic_net_penalty(param, alpha=0.99):
     return alpha * torch.abs(param).mean() + (1-alpha) * torch.square(param).mean()
 

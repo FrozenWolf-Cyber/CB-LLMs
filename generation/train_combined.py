@@ -230,6 +230,29 @@ if __name__ == "__main__":
     model_name = "llama3"
     cbl_name = "cbl"
 
+    # ======= DEBUG: Test batched generate =======
+    if args.DEBUG:
+        print("=" * 60)
+        print("DEBUG: Testing generate_batch (no intervention)")
+        print("=" * 60)
+        test_input = torch.tensor([tokenizer.encode("")]).to(device)
+        num_test = min(args.grpo_num_trajectories, 8)
+        preLM.eval()
+        cbl.eval()
+        with torch.no_grad():
+            batch_ids, _ = cbl.generate_batch(
+                test_input, preLM, num_samples=num_test,
+                intervene=None, length=50
+            )
+        special_tokens = torch.tensor([128000, 128001]).to(device)
+        for g in range(num_test):
+            tokens = batch_ids[g][~torch.isin(batch_ids[g], special_tokens)]
+            text = tokenizer.decode(tokens)
+            print(f"  [{g+1}/{num_test}] ({len(tokens)} tokens): {text}")
+        print("=" * 60)
+        preLM.train()
+        cbl.train()
+
     start = time.time()
     best_epoch = -1
     epochs = CFG.epoch[args.dataset]
@@ -334,48 +357,56 @@ if __name__ == "__main__":
                 grpo_intervene = [0] * len(concept_set)
                 grpo_intervene[grpo_concept_idx] = intervention_value
 
-                # Phase 1: Generate G trajectories & score with RoBERTa ensemble (no grad)
-                generated_seqs = []
-                grpo_rewards = []
+                # Phase 1: Generate G trajectories in parallel & score with RoBERTa ensemble (no grad)
                 gen_input = torch.tensor([tokenizer.encode("")]).to(device)
+                special_tokens_mask = torch.tensor([128000, 128001]).to(device)
 
                 preLM.eval()
                 cbl.eval()
                 with torch.no_grad():
-                    for g in range(args.grpo_num_trajectories):
-                        text_ids, _ = cbl.generate(
-                            gen_input, preLM, intervene=grpo_intervene,
-                            length=args.grpo_gen_length
-                        )
+                    # Batched generation — all trajectories at once
+                    text_ids_batch, _ = cbl.generate_batch(
+                        gen_input, preLM, num_samples=args.grpo_num_trajectories,
+                        intervene=grpo_intervene, length=args.grpo_gen_length
+                    )
 
+                    # Decode all trajectories and re-encode
+                    generated_seqs = []
+                    decoded_texts = []
+                    for g in range(args.grpo_num_trajectories):
                         decoded = tokenizer.decode(
-                            text_ids[0][~torch.isin(text_ids[0], torch.tensor([128000, 128001]).to(device))]
+                            text_ids_batch[g][~torch.isin(text_ids_batch[g], special_tokens_mask)]
                         )
-                        # Re-encode the decoded text to get clean token IDs (without special tokens)
                         re_encoded = torch.tensor([tokenizer.encode(decoded)]).to(device)
                         generated_seqs.append(re_encoded.detach())
+                        decoded_texts.append(decoded)
 
-                        if len(decoded.strip()) == 0:
-                            grpo_rewards.append(0.0)
-                            continue
-
+                    # Batched reward scoring with RoBERTa ensemble
+                    grpo_rewards = [0.0] * args.grpo_num_trajectories
+                    non_empty_indices = [g for g, t in enumerate(decoded_texts) if len(t.strip()) > 0]
+                    if non_empty_indices:
+                        non_empty_texts = [decoded_texts[g] for g in non_empty_indices]
                         rob_enc = roberta_tokenizer_grpo(
-                            decoded, return_tensors='pt', truncation=True, max_length=512
+                            non_empty_texts, return_tensors='pt', truncation=True,
+                            max_length=512, padding=True
                         ).to(device)
                         rob_input = {"input_ids": rob_enc["input_ids"], "attention_mask": rob_enc["attention_mask"]}
 
-                        reward = 0.0
+                        total_probs = torch.zeros(len(non_empty_texts), device=device)
                         for grpo_clf in grpo_classifiers:
-                            logits = grpo_clf(rob_input)
-                            prob = F.softmax(logits, dim=-1)[0, grpo_concept_idx].item()
-                            reward += prob
-                        reward /= len(grpo_classifiers)
-                        grpo_rewards.append(reward)
-                        
-                        if args.DEBUG:
+                            clf_logits = grpo_clf(rob_input)
+                            probs = F.softmax(clf_logits, dim=-1)[:, grpo_concept_idx]
+                            total_probs += probs
+                        total_probs /= len(grpo_classifiers)
+
+                        for idx, g in enumerate(non_empty_indices):
+                            grpo_rewards[g] = total_probs[idx].item()
+
+                    if args.DEBUG:
+                        for g in range(args.grpo_num_trajectories):
                             print(f"GRPO Trajectory {g+1}/{args.grpo_num_trajectories}:")
-                            print("  Decoded text:", decoded)
-                            print("  Reward:", reward)
+                            print("  Decoded text:", decoded_texts[g])
+                            print("  Reward:", grpo_rewards[g])
                             print("-" * 50)
 
                 preLM.train()
@@ -389,32 +420,54 @@ if __name__ == "__main__":
                     grpo_advantages = torch.zeros_like(grpo_rewards_t)
                 grpo_advantages = grpo_advantages.clamp(-args.grpo_clip_advantage, args.grpo_clip_advantage)
 
-                # Phase 3: Recompute log-probs WITH gradient (teacher-forced, single fwd per traj)
-                grpo_loss_parts = []
-                for g in range(args.grpo_num_trajectories):
-                    seq = generated_seqs[g]  # (1, seq_len)
-                    if seq.shape[1] <= 1 or grpo_advantages[g].abs().item() < 1e-8:
-                        continue
+                # Phase 3: Recompute log-probs WITH gradient (batched teacher-forced)
+                valid_indices = [g for g in range(args.grpo_num_trajectories)
+                                 if generated_seqs[g].shape[1] > 1 and grpo_advantages[g].abs().item() > 1e-8]
 
-                    seq_input = seq[:, :-1]
-                    seq_target = seq[:, 1:]
-                    seq_attn = torch.ones_like(seq_input)
+                if valid_indices:
+                    max_seq_len = max(generated_seqs[g].shape[1] for g in valid_indices)
+                    padded_inputs = []
+                    padded_targets = []
+                    attn_masks = []
+                    valid_advantages = []
 
-                    feats_g = preLM(input_ids=seq_input, attention_mask=seq_attn).last_hidden_state
+                    for g in valid_indices:
+                        seq = generated_seqs[g]  # (1, seq_len)
+                        seq_len = seq.shape[1] - 1
+                        pad_len = max_seq_len - 1 - seq_len
+                        seq_input = seq[:, :-1]
+                        seq_target = seq[:, 1:]
+                        if pad_len > 0:
+                            seq_input = F.pad(seq_input, (0, pad_len), value=tokenizer.pad_token_id)
+                            seq_target = F.pad(seq_target, (0, pad_len), value=0)
+                            attn = torch.cat([torch.ones(1, seq_len, device=device),
+                                              torch.zeros(1, pad_len, device=device)], dim=1)
+                        else:
+                            attn = torch.ones(1, seq_len, device=device)
+                        padded_inputs.append(seq_input)
+                        padded_targets.append(seq_target)
+                        attn_masks.append(attn)
+                        valid_advantages.append(grpo_advantages[g])
+
+                    batch_input = torch.cat(padded_inputs, dim=0)     # (V, max_seq_len-1)
+                    batch_target = torch.cat(padded_targets, dim=0)   # (V, max_seq_len-1)
+                    batch_attn = torch.cat(attn_masks, dim=0).long()  # (V, max_seq_len-1)
+                    valid_adv = torch.stack(valid_advantages)          # (V,)
+
+                    feats_g = preLM(input_ids=batch_input, attention_mask=batch_attn).last_hidden_state
                     _, unsup_g, _, _ = cbl(feats_g.float())
 
-                    intervened_g = torch.zeros(1, seq_input.shape[1], len(concept_set), device=device)
+                    intervened_g = torch.zeros(len(valid_indices), batch_input.shape[1], len(concept_set), device=device)
                     intervened_g[:, :, grpo_concept_idx] = intervention_value
 
                     vocab_logits_g = cbl.intervene(unsup_g, intervened_g)
                     log_probs_g = F.log_softmax(vocab_logits_g, dim=-1)
-                    token_log_probs_g = log_probs_g.gather(2, seq_target.unsqueeze(-1)).squeeze(-1)
-                    mean_log_prob_g = token_log_probs_g.mean()
+                    token_log_probs_g = log_probs_g.gather(2, batch_target.unsqueeze(-1)).squeeze(-1)
+                    # Mask out padded positions
+                    token_log_probs_g = token_log_probs_g * batch_attn.float()
+                    mean_log_probs = token_log_probs_g.sum(dim=1) / batch_attn.sum(dim=1).float()
 
-                    grpo_loss_parts.append(-grpo_advantages[g] * mean_log_prob_g)
-
-                if len(grpo_loss_parts) > 0:
-                    grpo_loss_val = torch.stack(grpo_loss_parts).mean()
+                    grpo_loss_val = (-valid_adv * mean_log_probs).mean()
                     opt_prelm.zero_grad()
                     opt_cbl.zero_grad()
                     (args.grpo_loss_weight * grpo_loss_val).backward()
