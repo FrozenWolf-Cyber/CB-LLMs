@@ -408,6 +408,14 @@ if __name__ == "__main__":
                             print("  Decoded text:", decoded_texts[g])
                             print("  Reward:", grpo_rewards[g])
                             print("-" * 50)
+                            
+                    ## log the lowest and highest reward text+reward to wandb for debugging
+                    wandb.log({
+                        "grpo_debug_lowest_reward": min(grpo_rewards),
+                        "grpo_debug_highest_reward": max(grpo_rewards),
+                        "grpo_debug_lowest_text": decoded_texts[grpo_rewards.index(min(grpo_rewards))],
+                        "grpo_debug_highest_text": decoded_texts[grpo_rewards.index(max(grpo_rewards))]
+                    })
 
                 preLM.train()
                 cbl.train()
