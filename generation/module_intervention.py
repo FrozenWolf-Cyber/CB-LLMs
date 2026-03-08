@@ -523,8 +523,10 @@ def compute_training_losses(
             attention_mask=batch["attention_mask"],
         )
     )
-    pre_hidden_states = pre_hidden_states.detach() 
-    ## technically pre_hidden_states wouldn't need detach since firsthalf is no_grad 
+    
+    if not args.peft:
+        pre_hidden_states = pre_hidden_states.detach() 
+        ## technically pre_hidden_states wouldn't need detach since firsthalf is no_grad 
 
     # Encode into concept space
     # concepts : (B, T, C)
