@@ -43,7 +43,7 @@ parser.add_argument("--peft", action='store_true', help="Whether to use PEFT (Lo
 
 parser.add_argument("--cyclic_loss", type=float, default=1.0)
 parser.add_argument("--intervention_gen_loss", type=float, default=1.0)
-parser.add_argument("--epoch", type=int, default=10)
+parser.add_argument("--epoch", type=int, default=-1)
 parser.add_argument("--intervention_margin", type=float, default=10.0)
 parser.add_argument("--intervention_spread", type=float, default=2.0)
 parser.add_argument(
@@ -65,6 +65,7 @@ parser.add_argument(
     default=0.0, 
     help="Dropout rate for skip connections in the U-Net"
 )
+parser.add_argument("--residual_dim", type=int, default=768, help="Residual dimension for the unsup/fc layers (matching CBLResidual)")
 parser.add_argument(
     "--gate", 
     action='store_true', 
@@ -97,8 +98,9 @@ def build_loaders(encoded_text, mode, overfit=False):
 if __name__ == "__main__":
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
     args = parser.parse_args()
+    if args.epoch < 0:
+        args.epoch = CFG.epoch[args.dataset]
     set_seed(args.seed)
-    scaler = torch.amp.GradScaler("cuda")
 
     wandb.init(project="cbm-generation-new", name=f"intervention-{args.dataset}-{args.seed}",
                config=vars(args))
@@ -191,7 +193,7 @@ if __name__ == "__main__":
     print("preparing backbone")
     # preLM = LlamaModel.from_pretrained('meta-llama/Meta-Llama-3-8B', torch_dtype=torch.bfloat16).to(device)
     preLM = CustomLlamaModel.from_pretrained('meta-llama/Meta-Llama-3-8B', torch_dtype=torch.bfloat16)
-    preLM.create_intermediate(args.intermediate_loc, len(concept_set), intermediate_sizes=args.intermediate_sizes, skip_dropout=args.skip_dropout, gate=args.gate, arch=args.arch)
+    preLM.create_intermediate(args.intermediate_loc, len(concept_set), intermediate_sizes=args.intermediate_sizes, skip_dropout=args.skip_dropout, gate=args.gate, arch=args.arch, residual_dim=args.residual_dim)
     print("Trainable parameters in intermediate module:", sum(p.numel() for p in preLM.intermediate.parameters() if p.requires_grad))
     preLM.to(device)
     
@@ -205,8 +207,10 @@ if __name__ == "__main__":
             param.requires_grad = True
     
     preLM_generator = CustomLlamaForCausalLM.from_pretrained('meta-llama/Meta-Llama-3-8B', torch_dtype=torch.bfloat16)
+    preLM.lm_head.load_state_dict(preLM_generator.lm_head.state_dict())
+    for p in preLM.lm_head.parameters():
+        p.requires_grad = True
     preLM_generator.model = preLM
-    preLM_generator.lm_head.to(device)
     
     ## print numel
     total_params = sum(p.numel() for p in preLM.parameters())
@@ -216,10 +220,12 @@ if __name__ == "__main__":
     wandb.log({"trainable_parameters": trainable_params, "trainable_ratio": trainable_params/total_params})
     
     
-    # preLM = get_peft_model(preLM, lora_config)
-    # preLM.print_trainable_parameters()
-    # lora_layers = filter(lambda p: p.requires_grad, preLM.parameters())
-    opt_prelm = torch.optim.Adam(preLM.intermediate.parameters(), lr=args.lr)
+    if args.peft:
+        # Include both LoRA and intermediate parameters in the optimizer
+        trainable_params_list = [p for p in preLM.parameters() if p.requires_grad]
+        opt_prelm = torch.optim.Adam(trainable_params_list, lr=args.lr)
+    else:
+        opt_prelm = torch.optim.Adam(preLM.intermediate.parameters(), lr=args.lr)
     
     # if args.discrimination_loss > 0:
     #     cbl = CBL(config, len(concept_set), tokenizer).to(device)
@@ -305,9 +311,8 @@ if __name__ == "__main__":
                                    args=args,
                                )
                 
-                scaler.scale(loss_dict["loss"]).backward()
-                scaler.step(opt_prelm)
-                scaler.update()
+                loss_dict["loss"].backward()
+                opt_prelm.step()
                 opt_prelm.zero_grad()
 
 

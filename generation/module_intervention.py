@@ -149,7 +149,7 @@ class SimpleLlamaBottleneck(nn.Module):
     def encode(self, x):
         # Replicates: h = norm(act(enc(h))) -> concepts = norm(enc(h))
         h = self.act(self.enc_norm(self.enc_proj(x)))
-        concepts = self.concept_norm(self.concept_enc(h))
+        concepts = F.relu(self.concept_norm(self.concept_enc(h))) 
         return concepts, []
 
     def decode(self, x_org, concepts, skips= None):
@@ -184,11 +184,15 @@ class CustomLlamaModel(LlamaPreTrainedModel):
         self.gradient_checkpointing = False
         self.intervene = None
         self.skip_first_half = False
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.post_init()
 
         # freeze everything except new layer
         for p in self.parameters():
             p.requires_grad = False
+
+        for p in self.lm_head.parameters():
+            p.requires_grad = True
 
     def create_intermediate(self, where, concept_size, intermediate_sizes=[1024, 512, 256], debug=False, skip_dropout=0.0, gate=True, arch="unet"):
         self.where = where
@@ -474,7 +478,7 @@ class CustomLlamaForCausalLM(LlamaPreTrainedModel, GenerationMixin):
         hidden_states = outputs.last_hidden_state
         # Only compute necessary logits, and do not upcast them to float if we are not computing the loss
         slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
-        logits = self.lm_head(hidden_states[:, slice_indices, :])
+        logits = self.model.lm_head(hidden_states[:, slice_indices, :])
         loss = None
         if labels is not None:
             loss = self.loss_function(logits=logits, labels=labels, vocab_size=self.config.vocab_size, **kwargs)
@@ -591,10 +595,10 @@ def compute_training_losses(
     # logits -> log probs
     # (B, T, V)
     log_probs_org = F.log_softmax(
-        preLM_generator.lm_head(vocabs_org), dim=-1
+        preLM.lm_head(vocabs_org), dim=-1
     )
     log_probs_reconstr = F.log_softmax(
-        preLM_generator.lm_head(vocabs_reconstr), dim=-1
+        preLM.lm_head(vocabs_reconstr), dim=-1
     )
 
     # KL over vocabulary dimension
@@ -681,7 +685,7 @@ def compute_training_losses(
     ).last_hidden_state
 
     # logits : (B, T, V)
-    vocabs_intervened = preLM_generator.lm_head(vocabs_intervened)
+    vocabs_intervened = preLM.lm_head(vocabs_intervened)
 
     # CE loss
     # reshape -> (B*(T-1), V)
@@ -823,7 +827,7 @@ def generate(self, ids, preLM, length=100, temp=0.7, topk=100, topp=0.9, repetit
         
         # 2. Project to vocabulary (lm_head)
         # Taking only the last position's logits
-        logits = self.lm_head(hidden_states[:, -1, :]) # [batch, vocab_size]
+        logits = self.model.lm_head(hidden_states[:, -1, :]) # [batch, vocab_size]
         
         # 3. Apply Repetition Penalty (using your specific logic)
         # Note: This logic assumes batch_size=1 based on your 'ids[0]' indexing
