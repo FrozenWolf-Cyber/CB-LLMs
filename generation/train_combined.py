@@ -40,6 +40,7 @@ parser.add_argument("--residual_penalty_weight", type=float, default=0)
 parser.add_argument("--DEBUG", action='store_true', help="If set, use a smaller subset of data for quick debugging.")
 parser.add_argument("--intervention_gen_loss", type=float, default=0.0)
 parser.add_argument("--intervention_margin", type=float, default=10.0)
+parser.add_argument("--no_detach_intervention", action='store_true', help="If set, do not detach unsup during intervention generation loss computation.")
 parser.add_argument("--intervention_spread", type=float, default=2.0)
 parser.add_argument("--classifier_weight_suffixes", type=str, default="_seed42,_seed123,_seed456", 
                     help="Comma-separated list of classifier weight suffixes to test (e.g., '_seed42,_seed123,_seed456')")
@@ -255,7 +256,10 @@ if __name__ == "__main__":
                     intervened_concept[b, :, concept_label_raw[b].item()] = intervention_value
                     
                 # print("intervened_concept shape: ", intervened_concept.shape, intervened_concept.max(), intervened_concept.min())
-                vocab = cbl.intervene(unsup.detach(), intervened_concept.detach())
+                if args.no_detach_intervention:
+                    vocab = cbl.intervene(unsup, intervened_concept.detach())
+                else:
+                    vocab = cbl.intervene(unsup.detach(), intervened_concept.detach())
                 intervention_gen_loss = torch.nn.CrossEntropyLoss()(vocab[:, :-1, :].reshape(-1, config.vocab_size), word_label.reshape(-1))
                 loss += args.intervention_gen_loss * intervention_gen_loss
                 training_losses["intervention_gen_loss"].append(intervention_gen_loss.detach().cpu().numpy())
