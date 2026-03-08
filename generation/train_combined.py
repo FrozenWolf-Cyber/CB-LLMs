@@ -210,7 +210,7 @@ if __name__ == "__main__":
             for p in clf.parameters():
                 p.requires_grad = False
             try:
-                clf = torch.compile(clf, mode="max-autotune")
+                clf = torch.compile(clf)
             except Exception as compile_err:
                 print(f"  Warning: torch.compile failed for {clf_path}, using eager mode: {compile_err}")
             grpo_classifiers.append(clf)
