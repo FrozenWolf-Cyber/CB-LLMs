@@ -1,5 +1,6 @@
 import argparse
 import os
+import dataset
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -40,6 +41,8 @@ parser.add_argument("--DEBUG", action='store_true', help="If set, use a smaller 
 parser.add_argument("--intervention_gen_loss", type=float, default=0.0)
 parser.add_argument("--intervention_margin", type=float, default=10.0)
 parser.add_argument("--intervention_spread", type=float, default=2.0)
+parser.add_argument("--classifier_weight_suffixes", type=str, default="_seed42,_seed123,_seed456", 
+                    help="Comma-separated list of classifier weight suffixes to test (e.g., '_seed42,_seed123,_seed456')")
 
 class ClassificationDataset(torch.utils.data.Dataset):
     def __init__(self, encoded_text):
@@ -453,39 +456,56 @@ if __name__ == "__main__":
     
     roberta_tokenizer = RobertaTokenizerFast.from_pretrained('roberta-base')
     classifier_path = args.dataset.replace('/', '_') + "_classifier.pt"
-    classifier = Roberta_classifier(len(concept_set)).to(device)
-    classifier.load_state_dict(torch.load(classifier_path, map_location=device))
+    ## this is default.
     
+    classifier_paths = [classifier_path]
+    ### three more classifiers with different random seeds for training
+    classifier_suffixes = [s.strip() for s in args.classifier_weight_suffixes.split(',')]
+    print(f"Classifier weight suffixes to test: {classifier_suffixes}")
+    for suffix in classifier_suffixes:
+        classifier_paths.append(args.dataset.replace('/', '_') + f"_classifier{suffix}.pt")
+    
+    for clf_idx, classifier_path in enumerate(classifier_paths):
+        print(f"Testing steerability with classifier weights from: {classifier_path}")
+        classifier = Roberta_classifier(len(concept_set)).to(device)
+        classifier.load_state_dict(torch.load(classifier_path, map_location=device))
+        classifier.eval()
 
-    if args.dataset == "dbpedia_14":
-        intervention_value = 150
-    else:
-        intervention_value = 100
-    pred = []
-    text = []
-    acc = evaluate.load("accuracy")
-    with torch.no_grad():
-        for i in tqdm(range(100 // len(concept_set))):
-            print("example", str(i), end="\r")
-            with torch.no_grad():
-                input_ids = torch.tensor([tokenizer.encode("")]).to(device)
-                for j in range(len(concept_set)):
-                    v = [0] * len(concept_set)
-                    v[j] = intervention_value
-                    text_ids, _ = cbl.generate(input_ids, preLM, intervene=v)
-                    decoded_text_ids = tokenizer.decode(text_ids[0][~torch.isin(text_ids[0], torch.tensor([128000, 128001]).to(device))])
-                    text.append(decoded_text_ids)
-                    roberta_text_ids = torch.tensor([roberta_tokenizer.encode(decoded_text_ids)]).to(device)
-                    roberta_input = {"input_ids": roberta_text_ids, "attention_mask": torch.tensor([[1]*roberta_text_ids.shape[1]]).to(device)}
-                    logits = classifier(roberta_input)
-                    pred.append(logits)
-        pred = torch.cat(pred, dim=0).detach().cpu()
-        pred = np.argmax(pred.numpy(), axis=-1)
-        acc.add_batch(predictions=pred, references=list(range(len(concept_set)))*(100 // len(concept_set)))
+        set_seed(args.seed)
 
-    print("Steerability test accuracy:")
-    acc = acc.compute()
-    wandb.log({"steerability_test_accuracy": acc})
+        if args.dataset == "dbpedia_14":
+            intervention_value = 150
+        else:
+            intervention_value = 100
+        pred = []
+        text = []
+        acc = evaluate.load("accuracy")
+        with torch.no_grad():
+            for i in tqdm(range(100 // len(concept_set))):
+                print("example", str(i), end="\r")
+                with torch.no_grad():
+                    input_ids = torch.tensor([tokenizer.encode("")]).to(device)
+                    for j in range(len(concept_set)):
+                        v = [0] * len(concept_set)
+                        v[j] = intervention_value
+                        text_ids, _ = cbl.generate(input_ids, preLM, intervene=v)
+                        decoded_text_ids = tokenizer.decode(text_ids[0][~torch.isin(text_ids[0], torch.tensor([128000, 128001]).to(device))])
+                        text.append(decoded_text_ids)
+                        roberta_text_ids = torch.tensor([roberta_tokenizer.encode(decoded_text_ids)]).to(device)
+                        roberta_input = {"input_ids": roberta_text_ids, "attention_mask": torch.tensor([[1]*roberta_text_ids.shape[1]]).to(device)}
+                        logits = classifier(roberta_input)
+                        pred.append(logits)
+            pred = torch.cat(pred, dim=0).detach().cpu()
+            pred = np.argmax(pred.numpy(), axis=-1)
+            acc.add_batch(predictions=pred, references=list(range(len(concept_set)))*(100 // len(concept_set)))
+
+        print("Steerability test accuracy:")
+        acc = acc.compute()
+        if clf_idx == 0:
+            wandb.log({"steerability_test_accuracy": acc})
+        else:
+            wandb.log({f"steerability_test_accuracy_{clf_idx}": acc})
+        print(acc)
     
     
     
