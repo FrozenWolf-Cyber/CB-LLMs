@@ -65,7 +65,6 @@ parser.add_argument(
     default=0.0, 
     help="Dropout rate for skip connections in the U-Net"
 )
-parser.add_argument("--residual_dim", type=int, default=768, help="Residual dimension for the unsup/fc layers (matching CBLResidual)")
 parser.add_argument(
     "--gate", 
     action='store_true', 
@@ -193,7 +192,7 @@ if __name__ == "__main__":
     print("preparing backbone")
     # preLM = LlamaModel.from_pretrained('meta-llama/Meta-Llama-3-8B', torch_dtype=torch.bfloat16).to(device)
     preLM = CustomLlamaModel.from_pretrained('meta-llama/Meta-Llama-3-8B', torch_dtype=torch.bfloat16)
-    preLM.create_intermediate(args.intermediate_loc, len(concept_set), intermediate_sizes=args.intermediate_sizes, skip_dropout=args.skip_dropout, gate=args.gate, arch=args.arch, residual_dim=args.residual_dim)
+    preLM.create_intermediate(args.intermediate_loc, len(concept_set), intermediate_sizes=args.intermediate_sizes, skip_dropout=args.skip_dropout, gate=args.gate, arch=args.arch)
     print("Trainable parameters in intermediate module:", sum(p.numel() for p in preLM.intermediate.parameters() if p.requires_grad))
     preLM.to(device)
     
