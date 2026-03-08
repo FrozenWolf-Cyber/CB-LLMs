@@ -329,7 +329,7 @@ if __name__ == "__main__":
 
             # ======= GRPO STEERABILITY LOSS (activated after warmup) =======
             grpo_step = e * len(train_loader) + i
-            if args.grpo_loss_weight > 0 and grpo_step >= args.grpo_warmup_steps:
+            if args.DEBUG or (args.grpo_loss_weight > 0 and grpo_step >= args.grpo_warmup_steps):
                 grpo_concept_idx = torch.randint(0, len(concept_set), (1,)).item()
                 grpo_intervene = [0] * len(concept_set)
                 grpo_intervene[grpo_concept_idx] = intervention_value
@@ -415,6 +415,9 @@ if __name__ == "__main__":
                     training_losses["grpo_mean_reward"].append(grpo_rewards_t.mean().item())
                     
                 training_losses["non_zero_grpo_advantages"].append((grpo_advantages.abs() > 1e-8).sum().item())
+                if args.DEBUG:
+                    print(f"GRPO debug - rewards: {grpo_rewards}, advantages: {grpo_advantages.tolist()}")
+
 
             training_losses["concept_loss"].append(concept_loss.detach().cpu().numpy())
             training_losses["word_loss"].append(word_loss.detach().cpu().numpy())
