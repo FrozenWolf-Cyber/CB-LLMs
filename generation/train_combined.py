@@ -347,11 +347,14 @@ if __name__ == "__main__":
                             gen_input, preLM, intervene=grpo_intervene,
                             length=args.grpo_gen_length
                         )
-                        generated_seqs.append(text_ids.detach())
 
                         decoded = tokenizer.decode(
                             text_ids[0][~torch.isin(text_ids[0], torch.tensor([128000, 128001]).to(device))]
                         )
+                        # Re-encode the decoded text to get clean token IDs (without special tokens)
+                        re_encoded = torch.tensor([tokenizer.encode(decoded)]).to(device)
+                        generated_seqs.append(re_encoded.detach())
+
                         if len(decoded.strip()) == 0:
                             grpo_rewards.append(0.0)
                             continue
@@ -368,6 +371,12 @@ if __name__ == "__main__":
                             reward += prob
                         reward /= len(grpo_classifiers)
                         grpo_rewards.append(reward)
+                        
+                        if args.DEBUG:
+                            print(f"GRPO Trajectory {g+1}/{args.grpo_num_trajectories}:")
+                            print("  Decoded text:", decoded)
+                            print("  Reward:", reward)
+                            print("-" * 50)
 
                 preLM.train()
                 cbl.train()
