@@ -376,26 +376,97 @@ if __name__ == "__main__":
     model_name = "llama3"
     cbl_name = "cbl"
 
-    # ======= DEBUG: Test batched generate =======
-    if args.DEBUG:
+    # ======= DEBUG: Test batched generate + reward scoring =======
+    def _debug_generate_and_score(label, intervene, target_concept_idx):
+        """Generate num_test trajectories, score with RoBERTa ensemble, compute advantages."""
         print("=" * 60)
-        print("DEBUG: Testing generate_batch (no intervention)")
+        print(f"DEBUG: {label}")
         print("=" * 60)
-        test_input = torch.tensor([tokenizer.encode("")]).to(device)
-        num_test = min(args.grpo_num_trajectories, 8)
-        preLM.eval()
-        cbl.eval()
         with torch.no_grad():
             batch_ids, _ = cbl.generate_batch(
                 test_input, preLM, num_samples=num_test,
-                intervene=None, length=50
+                intervene=intervene, length=50
             )
-        special_tokens = torch.tensor([128000, 128001]).to(device)
+        decoded_texts = []
         for g in range(num_test):
             tokens = batch_ids[g][~torch.isin(batch_ids[g], special_tokens)]
             text = tokenizer.decode(tokens)
-            print(f"  [{g+1}/{num_test}] ({len(tokens)} tokens): {text}")
+            decoded_texts.append(text)
+
+        # Score with RoBERTa ensemble for each concept
+        rewards_per_concept = {}
+        for c_idx in range(len(concept_set)):
+            rewards = [0.0] * num_test
+            non_empty = [g for g, t in enumerate(decoded_texts) if len(t.strip()) > 0]
+            if non_empty:
+                non_empty_texts = [decoded_texts[g] for g in non_empty]
+                rob_enc = roberta_tokenizer_grpo(
+                    non_empty_texts, return_tensors='pt', truncation=True,
+                    max_length=512, padding=True
+                ).to(device)
+                rob_input = {"input_ids": rob_enc["input_ids"], "attention_mask": rob_enc["attention_mask"]}
+                total_probs = torch.zeros(len(non_empty_texts), device=device)
+                for grpo_clf in grpo_classifiers:
+                    clf_logits = grpo_clf(rob_input)
+                    probs = F.softmax(clf_logits, dim=-1)[:, c_idx]
+                    total_probs += probs
+                total_probs /= len(grpo_classifiers)
+                for idx_ne, g in enumerate(non_empty):
+                    rewards[g] = total_probs[idx_ne].item()
+            rewards_per_concept[c_idx] = rewards
+
+        # Print trajectories with rewards
+        for g in range(num_test):
+            reward_str = ", ".join([f"{concept_set[c]}={rewards_per_concept[c][g]:.3f}" for c in range(len(concept_set))])
+            print(f"  [{g+1}/{num_test}] ({len(decoded_texts[g].split())} words): {decoded_texts[g][:200]}")
+            print(f"    Rewards: {reward_str}")
+
+        # Compute advantages for the target concept
+        rewards_t = torch.tensor(rewards_per_concept[target_concept_idx], device=device, dtype=torch.float32)
+        if rewards_t.std() > 1e-8:
+            advantages = (rewards_t - rewards_t.mean()) / (rewards_t.std() + 1e-8)
+        else:
+            advantages = torch.zeros_like(rewards_t)
+        advantages = advantages.clamp(-args.grpo_clip_advantage, args.grpo_clip_advantage)
+        print(f"  Target concept: {concept_set[target_concept_idx]} (idx={target_concept_idx})")
+        print(f"  Rewards:    {[round(r, 4) for r in rewards_per_concept[target_concept_idx]]}")
+        print(f"  Mean reward: {rewards_t.mean().item():.4f}, Std: {rewards_t.std().item():.4f}")
+        print(f"  Advantages: {[round(a, 4) for a in advantages.tolist()]}")
+        print(f"  Non-zero advantages: {(advantages.abs() > 1e-8).sum().item()}/{num_test}")
         print("=" * 60)
+
+    if args.DEBUG:
+        test_input = torch.tensor([tokenizer.encode("")]).to(device)
+        num_test = min(args.grpo_num_trajectories, 8)
+        special_tokens = torch.tensor([128000, 128001]).to(device)
+        preLM.eval()
+        cbl.eval()
+        with torch.no_grad():
+            # --- No intervention ---
+            _debug_generate_and_score(
+                label="generate_batch (no intervention)",
+                intervene=None,
+                target_concept_idx=0
+            )
+
+            # --- Intervention on first concept ---
+            test_intervene_0 = [0] * len(concept_set)
+            test_intervene_0[0] = intervention_value
+            _debug_generate_and_score(
+                label=f"generate_batch (intervene concept 0 = '{concept_set[0]}', value={intervention_value})",
+                intervene=test_intervene_0,
+                target_concept_idx=0
+            )
+
+            # --- Intervention on last concept ---
+            last_idx = len(concept_set) - 1
+            test_intervene_last = [0] * len(concept_set)
+            test_intervene_last[last_idx] = intervention_value
+            _debug_generate_and_score(
+                label=f"generate_batch (intervene concept {last_idx} = '{concept_set[last_idx]}', value={intervention_value})",
+                intervene=test_intervene_last,
+                target_concept_idx=last_idx
+            )
         preLM.train()
         cbl.train()
 
