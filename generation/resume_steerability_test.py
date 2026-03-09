@@ -181,7 +181,14 @@ def load_model_and_cbl(peft_path, cbl_path, config, concept_set, tokenizer, disc
     else:
         cbl = CBLResidual(config, len(concept_set), residual_dim, tokenizer).to(device)
     
-    cbl.load_state_dict(torch.load(cbl_path, map_location=device))
+    cbl.load_state_dict(torch.load(cbl_path, map_location=device), strict=False)
+    ### warn missing keys:
+    for name, param in cbl.named_parameters():
+        if name not in cbl.state_dict():
+            print(f"Warning: {name} is in the model but not in the state dict.")
+    for name in cbl.state_dict():
+        if name not in cbl.named_parameters():
+            print(f"Warning: {name} is in the state dict but not in the model.")
     cbl.eval()
     
     return preLM, cbl
