@@ -81,6 +81,7 @@ parser.add_argument("--grpo_gen_length", type=int, default=100, help="Max genera
 parser.add_argument("--grpo_clip_advantage", type=float, default=5.0, help="Clip GRPO advantages to [-clip, clip].")
 parser.add_argument("--grpo_lr", type=float, default=1e-5, help="Learning rate for GRPO fine-tuning.")
 parser.add_argument("--grpo_steps_per_epoch", type=int, default=-1, help="Max GRPO steps per epoch. -1 = full dataset.")
+parser.add_argument("--concept_distill_weight", type=float, default=0.0, help="Weight for concept prediction distillation loss (CE between policy and reference model concepts on real data). 0 disables it.")
 
 
 class ClassificationDataset(torch.utils.data.Dataset):
@@ -162,7 +163,7 @@ if __name__ == "__main__":
     if args.pretrained_run_id is None and args.pretrained_path is None:
         raise ValueError("Must provide either --pretrained_run_id or --pretrained_path")
 
-    wandb.init(project="cbm-generation-new", name=f"grpo-{args.dataset}-seed{args.seed}",
+    wandb.init(project="cbm-generation-new", name=f"grpo-{args.dataset}-seed{args.seed}-{args.pretrained_run_id}",
                config=vars(args))
     
     run_name = wandb.run.id
@@ -481,7 +482,8 @@ if __name__ == "__main__":
             "grpo_kl_loss": [],
             "grpo_total_loss": [],
             "grpo_mean_reward": [],
-            "non_zero_grpo_advantages": []
+            "non_zero_grpo_advantages": [],
+            "concept_distill_loss": []
         }
 
         
@@ -601,7 +603,7 @@ if __name__ == "__main__":
 
                 # --- Policy model forward (with grad) ---
                 feats_g = preLM(input_ids=batch_input, attention_mask=batch_attn).last_hidden_state
-                _, unsup_g, _, _ = cbl(feats_g.float())
+                concepts_g, unsup_g, _, _ = cbl(feats_g.float())
 
                 intervened_g = torch.zeros(len(valid_indices), batch_input.shape[1], len(concept_set), device=device)
                 intervened_g[:, :, grpo_concept_idx] = intervention_value
@@ -616,7 +618,7 @@ if __name__ == "__main__":
                 # --- Reference model forward (no grad) ---
                 with torch.no_grad():
                     ref_feats_g = ref_preLM(input_ids=batch_input, attention_mask=batch_attn).last_hidden_state
-                    _, ref_unsup_g, _, _ = ref_cbl(ref_feats_g.float())
+                    ref_concepts_g, ref_unsup_g, _, _ = ref_cbl(ref_feats_g.float())
 
                     ref_intervened_g = torch.zeros(len(valid_indices), batch_input.shape[1], len(concept_set), device=device)
                     ref_intervened_g[:, :, grpo_concept_idx] = intervention_value
@@ -634,8 +636,22 @@ if __name__ == "__main__":
                 # --- Policy gradient loss ---
                 policy_loss = (-valid_adv * mean_log_probs).mean()
 
+                # --- Concept prediction distillation loss ---
+                # concepts_g are ReLU'd (used as logits), ref_concepts_g → softmax → soft targets
+                # Only on non-padded positions (batch_attn)
+                concept_distill_loss = torch.tensor(0.0, device=device)
+                if args.concept_distill_weight > 0:
+                    concept_mask_flat = batch_attn.reshape(-1).bool()  # (V * seq_len,)
+                    policy_concept_flat = concepts_g.reshape(-1, len(concept_set))  # (V * seq_len, C)
+                    with torch.no_grad():
+                        ref_concept_targets = F.softmax(ref_concepts_g.reshape(-1, len(concept_set)), dim=-1)
+                    concept_distill_loss = F.cross_entropy(
+                        policy_concept_flat[concept_mask_flat],
+                        ref_concept_targets[concept_mask_flat]
+                    )
+
                 # --- Total GRPO loss ---
-                grpo_total_loss = args.grpo_loss_weight * policy_loss + args.grpo_kl_weight * kl_loss
+                grpo_total_loss = args.grpo_loss_weight * policy_loss + args.grpo_kl_weight * kl_loss + args.concept_distill_weight * concept_distill_loss
 
                 opt_prelm.zero_grad()
                 opt_cbl.zero_grad()
@@ -645,6 +661,7 @@ if __name__ == "__main__":
 
                 training_losses["grpo_policy_loss"].append(policy_loss.detach().cpu().numpy())
                 training_losses["grpo_kl_loss"].append(kl_loss.detach().cpu().numpy())
+                training_losses["concept_distill_loss"].append(concept_distill_loss.detach().cpu().numpy())
                 training_losses["grpo_total_loss"].append(grpo_total_loss.detach().cpu().numpy())
                 training_losses["grpo_mean_reward"].append(grpo_rewards_t.mean().item())
                 
