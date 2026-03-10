@@ -59,7 +59,7 @@ parser.add_argument("--batch_size", type=int, default=4)
 parser.add_argument("--max_length", type=int, default=350)
 parser.add_argument("--num_workers", type=int, default=0)
 parser.add_argument("--seed", type=int, default=42)
-parser.add_argument("--discrimination_loss", type=float, default=1.0)
+parser.add_argument("--discrimination_loss", type=float, default=0.0)
 parser.add_argument("--residual_dim", type=int, default=768)
 parser.add_argument("--DEBUG", action='store_true', help="If set, use a smaller subset of data for quick debugging.")
 parser.add_argument("--classifier_weight_suffixes", type=str, default="_seed42,_seed123,_seed456", 
