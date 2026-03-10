@@ -60,6 +60,7 @@ parser.add_argument("--max_length", type=int, default=350)
 parser.add_argument("--num_workers", type=int, default=0)
 parser.add_argument("--seed", type=int, default=42)
 parser.add_argument("--discrimination_loss", type=float, default=0.0)
+parser.add_argument("--arch_type", type=str, default="residual", choices=["residual", "non_residual"])
 parser.add_argument("--residual_dim", type=int, default=768)
 parser.add_argument("--DEBUG", action='store_true', help="If set, use a smaller subset of data for quick debugging.")
 parser.add_argument("--classifier_weight_suffixes", type=str, default="_seed42,_seed123,_seed456", 
@@ -290,7 +291,7 @@ if __name__ == "__main__":
     for p in ref_preLM.parameters():
         p.requires_grad = False
 
-    if args.discrimination_loss > 0:
+    if args.arch_type == "non_residual":
         ref_cbl = CBL(config, len(concept_set), tokenizer).to(device)
     else:
         ref_cbl = CBLResidual(config, len(concept_set), args.residual_dim, tokenizer).to(device)
@@ -319,7 +320,7 @@ if __name__ == "__main__":
     lora_layers = filter(lambda p: p.requires_grad, preLM.parameters())
     opt_prelm = torch.optim.Adam(lora_layers, lr=args.grpo_lr)
     
-    if args.discrimination_loss > 0:
+    if args.arch_type == "non_residual":
         cbl = CBL(config, len(concept_set), tokenizer).to(device)
     else:
         cbl = CBLResidual(config, len(concept_set), args.residual_dim, tokenizer).to(device)
@@ -625,11 +626,12 @@ if __name__ == "__main__":
 
                     ref_vocab_logits_g = ref_cbl.intervene(ref_unsup_g, ref_intervened_g)
                     ref_log_probs_g = F.log_softmax(ref_vocab_logits_g, dim=-1)
-                    ref_token_log_probs_g = ref_log_probs_g.gather(2, batch_target.unsqueeze(-1)).squeeze(-1)
-                    ref_token_log_probs_g = ref_token_log_probs_g * batch_attn.float()
-
-                # --- KL divergence: approx KL(π_θ || π_ref) = E[log π_θ - log π_ref] ---
-                kl_per_token = (token_log_probs_g - ref_token_log_probs_g) * batch_attn.float()
+                    
+                # --- KL divergence: full-vocab KL(π_θ || π_ref) per token, always ≥ 0 ---
+                # KL(π_θ || π_ref) = Σ_a π_θ(a) [log π_θ(a) - log π_ref(a)]
+                policy_probs_g = F.softmax(vocab_logits_g, dim=-1)  # (V, seq_len, vocab_size)
+                kl_per_token = (policy_probs_g * (log_probs_g - ref_log_probs_g)).sum(dim=-1)  # (V, seq_len)
+                kl_per_token = kl_per_token * batch_attn.float()
                 kl_per_seq = kl_per_token.sum(dim=1) / batch_attn.sum(dim=1).float()
                 kl_loss = kl_per_seq.mean()
 
@@ -717,7 +719,7 @@ if __name__ == "__main__":
     peft_path_eval = prefix + model_name + "_epoch_" + str(best_epoch)
     preLM_eval.load_adapter(peft_path_eval)
     preLM_eval.eval()
-    if args.discrimination_loss > 0:
+    if args.arch_type == "non_residual":
         cbl_eval = CBL(config, len(concept_set), tokenizer).to(device)
     else:
         cbl_eval = CBLResidual(config, len(concept_set), args.residual_dim, tokenizer).to(device)
