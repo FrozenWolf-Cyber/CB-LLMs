@@ -295,7 +295,7 @@ if __name__ == "__main__":
         ref_cbl = CBL(config, len(concept_set), tokenizer).to(device)
     else:
         ref_cbl = CBLResidual(config, len(concept_set), args.residual_dim, tokenizer).to(device)
-    ref_cbl.load_state_dict(torch.load(cbl_path, map_location=device))
+    ref_cbl.load_state_dict(torch.load(cbl_path, map_location=device), strict=False)  # strict=False to allow missing keys if arch differs
     ref_cbl.eval()
     for p in ref_cbl.parameters():
         p.requires_grad = False
@@ -324,7 +324,7 @@ if __name__ == "__main__":
         cbl = CBL(config, len(concept_set), tokenizer).to(device)
     else:
         cbl = CBLResidual(config, len(concept_set), args.residual_dim, tokenizer).to(device)
-    cbl.load_state_dict(torch.load(cbl_path, map_location=device))
+    cbl.load_state_dict(torch.load(cbl_path, map_location=device), strict=False)
     opt_cbl = torch.optim.Adam(cbl.parameters(), lr=args.grpo_lr)
 
     print("preparing classifier")
@@ -723,7 +723,7 @@ if __name__ == "__main__":
         cbl_eval = CBL(config, len(concept_set), tokenizer).to(device)
     else:
         cbl_eval = CBLResidual(config, len(concept_set), args.residual_dim, tokenizer).to(device)
-    cbl_eval.load_state_dict(torch.load(prefix + cbl_name + "_epoch_" + str(best_epoch) + ".pt", map_location=device))
+    cbl_eval.load_state_dict(torch.load(prefix + cbl_name + "_epoch_" + str(best_epoch) + ".pt", map_location=device), strict=False)
     cbl_eval.eval()
 
     # Use the eval models for all subsequent tests
