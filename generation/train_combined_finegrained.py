@@ -768,9 +768,11 @@ if __name__ == "__main__":
                 text.append(decoded)
             
             ### print some decoded texts for debugging
-            print(f"Steerability evaluation for concept '{concept_set[j]}':")
-            for idx in range(min(1, num_steerability_samples)):
-                print(f"  Sample {idx+1}: {decoded_texts[idx]}")
+            ### print some decoded texts for debugging
+            # print(f"Steerability evaluation for concept '{concept_set[j]}':")
+            for idx in range(len(decoded_texts)):
+                # print(f"  Sample {idx+1}: {decoded_texts[idx]}")
+                wandb.log({f"steerability_sample_{concept_set[j]}_{idx+1}": decoded_texts[idx]})
             # Batched similarity scoring with MPNet
             generated_c = tokenizer_sim(
                 decoded_texts,

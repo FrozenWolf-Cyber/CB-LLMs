@@ -772,6 +772,7 @@ if __name__ == "__main__":
                         v[j] = intervention_value
                         text_ids, _ = cbl.generate(input_ids, preLM, intervene=v)
                         decoded_text_ids = tokenizer.decode(text_ids[0][~torch.isin(text_ids[0], torch.tensor([128000, 128001]).to(device))])
+                        wandb.log({f"steerability_sample_{concept_set[j]}_{i+1}": decoded_text_ids})
                         text.append(decoded_text_ids)
                         roberta_text_ids = torch.tensor([roberta_tokenizer.encode(decoded_text_ids)]).to(device)
                         roberta_input = {"input_ids": roberta_text_ids, "attention_mask": torch.tensor([[1]*roberta_text_ids.shape[1]]).to(device)}
