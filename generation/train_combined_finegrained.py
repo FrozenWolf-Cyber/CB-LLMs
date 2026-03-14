@@ -6,7 +6,7 @@ import numpy as np
 import evaluate
 from tqdm.auto import tqdm
 from datasets import load_dataset, concatenate_datasets
-import config as CFG
+import config_finegrained as CFG
 from transformers import LlamaConfig, LlamaModel, AutoTokenizer, RobertaTokenizerFast, AutoModel
 from peft import LoraConfig, TaskType, get_peft_model
 from modules import CBLResidual, CBL, Roberta_classifier
@@ -50,6 +50,8 @@ parser.add_argument("--grpo_gen_length", type=int, default=100, help="Max genera
 parser.add_argument("--grpo_clip_advantage", type=float, default=5.0, help="Clip GRPO advantages to [-clip, clip].")
 parser.add_argument("--automatic_concept_correction", action='store_true', help="If set, automatically set concept labels to 0 for concepts that are not present in the example according to the ground truth label. This is a form of training intervention to correct mislabeled concepts.")
 parser.add_argument("--labeling", type=str, default="mpnet", help="mpnet, angle, simcse, llm")
+parser.add_argument("--use_last_epoch", action='store_true', help="If set, load the classifier from the last epoch instead of the best epoch based on validation loss.")
+
 
 class ClassificationDataset(torch.utils.data.Dataset):
     def __init__(self, encoded_text, s):
@@ -663,7 +665,7 @@ if __name__ == "__main__":
 
 
             avg_val_loss = avg_val_concept_loss + avg_val_word_loss
-            if avg_val_loss < best_loss:
+            if (avg_val_loss < best_loss) or (args.use_last_epoch):
                 best_epoch = e + 1
                 print("save model")
                 best_loss = avg_val_loss
