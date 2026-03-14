@@ -734,8 +734,6 @@ if __name__ == "__main__":
     top1_correct = 0
     top3_correct = 0
     top5_correct = 0
-    top10_correct = 0
-    top20_correct = 0
     total_evals = 0
     
     with torch.no_grad():
@@ -743,7 +741,7 @@ if __name__ == "__main__":
             print("example", str(i), end="\r")
             with torch.no_grad():
                 input_ids = torch.tensor([tokenizer.encode("")]).to(device)
-                for j in tqdm(range(len(concept_set))):
+                for j in range(len(concept_set)):
                     v = [0] * len(concept_set)
                     v[j] = intervention_value
                     text_ids, _ = cbl.generate(input_ids, preLM, intervene=v)
@@ -769,10 +767,6 @@ if __name__ == "__main__":
                         top3_correct += 1
                     if j in sorted_indices[:5].tolist():
                         top5_correct += 1
-                    if j in sorted_indices[:10].tolist():
-                        top10_correct += 1
-                    if j in sorted_indices[:20].tolist():
-                        top20_correct += 1
                     total_evals += 1
 
     wandb.log({
@@ -781,74 +775,30 @@ if __name__ == "__main__":
         "steerability_top1_acc": top1_correct / total_evals,
         "steerability_top3_acc": top3_correct / total_evals,
         "steerability_top5_acc": top5_correct / total_evals,
-        "steerability_top10_acc": top10_correct / total_evals,
-        "steerability_top20_acc": top20_correct / total_evals,
     })
     
     print(f"Steerability Top-1 Acc: {top1_correct / total_evals}")
     print(f"Steerability Top-3 Acc: {top3_correct / total_evals}")
     print(f"Steerability Top-5 Acc: {top5_correct / total_evals}")
-    print(f"Steerability Top-10 Acc: {top10_correct / total_evals}")
-    print(f"Steerability Top-20 Acc: {top20_correct / total_evals}")
     
     
     ### TEST CONCEPT PREDICTION AFTER TRAINING
     print("eval concepts...")
     metric = evaluate.load("accuracy")
     concept_predictions = []
-    
-    concept_top1_correct = 0
-    concept_top3_correct = 0
-    concept_top5_correct = 0
-    concept_top10_correct = 0
-    concept_top20_correct = 0
-    concept_total_evals = 0
-    
-    for batch, _ in tqdm(test_loader, total=len(test_loader)):
+    for batch in tqdm(test_loader, total=len(test_loader)):
         batch = {k: v.to(device) for k, v in batch.items()}
         with torch.no_grad():
             features = preLM(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"]).last_hidden_state
             concepts, _, _, _ = cbl(features.float())
         concept_predictions.append(eos_pooling(concepts, batch["attention_mask"]))
     concept_predictions = torch.cat(concept_predictions, dim=0).detach().cpu()
-    
-    references = encoded_test_dataset["label"]
-    for idx, sample_pred in enumerate(concept_predictions):
-        sorted_indices = torch.argsort(sample_pred, descending=True)
-        true_label = references[idx]
-        
-        if true_label == sorted_indices[0].item():
-            concept_top1_correct += 1
-        if true_label in sorted_indices[:3].tolist():
-            concept_top3_correct += 1
-        if true_label in sorted_indices[:5].tolist():
-            concept_top5_correct += 1
-        if true_label in sorted_indices[:10].tolist():
-            concept_top10_correct += 1
-        if true_label in sorted_indices[:20].tolist():
-            concept_top20_correct += 1
-        concept_total_evals += 1
-        
     pred = np.argmax(concept_predictions.numpy(), axis=-1)
-    metric.add_batch(predictions=pred, references=references)
+    metric.add_batch(predictions=pred, references=encoded_test_dataset["label"])
     print("Concept prediction accuracy:")
     acc = metric.compute()
     print(acc)
-    
-    print(f"Concept Top-1 Acc: {concept_top1_correct / concept_total_evals}")
-    print(f"Concept Top-3 Acc: {concept_top3_correct / concept_total_evals}")
-    print(f"Concept Top-5 Acc: {concept_top5_correct / concept_total_evals}")
-    print(f"Concept Top-10 Acc: {concept_top10_correct / concept_total_evals}")
-    print(f"Concept Top-20 Acc: {concept_top20_correct / concept_total_evals}")
-    
-    wandb.log({
-        "concept_prediction_accuracy": acc["accuracy"],
-        "concept_top1_acc": concept_top1_correct / concept_total_evals,
-        "concept_top3_acc": concept_top3_correct / concept_total_evals,
-        "concept_top5_acc": concept_top5_correct / concept_total_evals,
-        "concept_top10_acc": concept_top10_correct / concept_total_evals,
-        "concept_top20_acc": concept_top20_correct / concept_total_evals
-    })
+    wandb.log({"concept_prediction_accuracy": acc})
     
     
     
