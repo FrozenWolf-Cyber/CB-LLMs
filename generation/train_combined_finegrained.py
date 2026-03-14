@@ -6,7 +6,7 @@ import numpy as np
 import evaluate
 from tqdm.auto import tqdm
 from datasets import load_dataset, concatenate_datasets
-import config as CFG
+import config_finegrained as CFG
 from transformers import LlamaConfig, LlamaModel, AutoTokenizer, RobertaTokenizerFast, AutoModel
 from peft import LoraConfig, TaskType, get_peft_model
 from modules import CBLResidual, CBL, Roberta_classifier
