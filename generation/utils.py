@@ -53,15 +53,25 @@ def top_k_top_p_filtering_batched(logits, top_k=0, top_p=0.0, filter_value=float
 def elastic_net_penalty(param, alpha=0.99):
     return alpha * torch.abs(param).mean() + (1-alpha) * torch.square(param).mean()
 
-def cos_sim_cubed(cbl_features, target):
+def cos_sim_cubed(cbl_features, target, reduce: bool = True):
+    """Cosine similarity after centering and cubing.
+
+    Args:
+        cbl_features: (..., D)
+        target:       (..., D)
+        reduce:       If True (default), return mean over the last non-feature dim.
+                       If False, return per-sample similarities (no final mean).
+    """
     cbl_features = cbl_features - torch.mean(cbl_features, dim=-1, keepdim=True)
     target = target - torch.mean(target, dim=-1, keepdim=True)
 
     cbl_features = F.normalize(cbl_features**3, dim=-1)
     target = F.normalize(target**3, dim=-1)
 
-    sim = torch.sum(cbl_features*target, dim=-1)
-    return sim.mean()
+    sim = torch.sum(cbl_features * target, dim=-1)  # (...,)
+    if reduce:
+        return sim.mean()
+    return sim
 
 def normalize(x, d=-1, mean=None, std=None):
     if mean is not None and std is not None:

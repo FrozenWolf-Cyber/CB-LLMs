@@ -740,14 +740,14 @@ if __name__ == "__main__":
     
     # Use batched generation for steerability evaluation: for each concept
     # generate 50 samples at once with `generate_batch`.
-    num_steerability_samples = 50
-    gen_input = torch.tensor([tokenizer.encode("")]).to(device)
-    special_tokens_mask = torch.tensor([128000, 128001]).to(device)
-    ce_loss_fn = torch.nn.CrossEntropyLoss(reduction="none")
+    num_steerability_samples = 50  # scalar
+    gen_input = torch.tensor([tokenizer.encode("")]).to(device)  # (1, prompt_len)
+    special_tokens_mask = torch.tensor([128000, 128001]).to(device)  # (2,)
+    ce_loss_fn = torch.nn.CrossEntropyLoss(reduction="none")  # CE over classes
 
     with torch.no_grad():
         for j in tqdm(range(len(concept_set)), desc="Steerability concepts"):
-            v = [0] * len(concept_set)
+            v = [0] * len(concept_set)  # (C,)
             v[j] = intervention_value
 
             # Batched generation: `num_steerability_samples` samples for this concept
@@ -757,10 +757,10 @@ if __name__ == "__main__":
                 num_samples=num_steerability_samples,
                 intervene=v,
                 length=50,
-            )
+            )  # (num_steerability_samples, gen_len)
 
             # Decode and collect texts for MPNet scoring
-            decoded_texts = []
+            decoded_texts = []  # list of length B=num_steerability_samples
             for g in range(num_steerability_samples):
                 tokens = text_ids_batch[g][~torch.isin(text_ids_batch[g], special_tokens_mask)]
                 decoded = tokenizer.decode(tokens)
@@ -778,32 +778,32 @@ if __name__ == "__main__":
                 truncation=True,
                 max_length=args.max_length,
                 return_tensors="pt",
-            )
+            )  # dict: input_ids -> (B, L), attention_mask -> (B, L)
             generated_c = {k: v.to(device) for k, v in generated_c.items()}
             generated_features = sim_model(
                 input_ids=generated_c["input_ids"],
                 attention_mask=generated_c["attention_mask"],
-            )
+            )  # last_hidden_state: (B, L, H)
             generated_features = mean_pooling(
                 generated_features.last_hidden_state,
                 generated_c["attention_mask"],
-            )
-            generated_features = F.normalize(generated_features, p=2, dim=1)
+            )  # (B, H)
+            generated_features = F.normalize(generated_features, p=2, dim=1)  # (B, H)
 
             sims = generated_features @ concept_features.T  # (B, C)
-            v_tensor = torch.tensor(v).to(device).unsqueeze(0).expand(sims.size(0), -1)
+            v_tensor = torch.tensor(v).to(device).unsqueeze(0).expand(sims.size(0), -1)  # (B, C)
 
-            # cos_sim_cubed per sample
-            cos_vals = cos_sim_cubed(sims, v_tensor.float())
+            # cos_sim_cubed per sample (no reduction)
+            cos_vals = cos_sim_cubed(sims, v_tensor.float(), reduce=False)  # (B,)
             cos_sim_cubed_values.extend(cos_vals.detach().cpu().tolist())
 
             # Cross-entropy loss per sample w.r.t. true concept j
-            targets = torch.full((sims.size(0),), j, dtype=torch.long, device=device)
-            ce_vals = ce_loss_fn(sims, targets)
+            targets = torch.full((sims.size(0),), j, dtype=torch.long, device=device)  # (B,)
+            ce_vals = ce_loss_fn(sims, targets)  # (B,)
             softmax_values.extend(ce_vals.detach().cpu().tolist())
 
             # Top-k accuracy counts (vectorized over the batch)
-            sorted_indices = torch.argsort(sims, dim=1, descending=True)
+            sorted_indices = torch.argsort(sims, dim=1, descending=True)  # (B, C)
             top1_correct += (sorted_indices[:, 0] == j).sum().item()
             top3_correct += (sorted_indices[:, :3] == j).any(dim=1).sum().item()
             top5_correct += (sorted_indices[:, :5] == j).any(dim=1).sum().item()
