@@ -7,10 +7,11 @@ import evaluate
 from tqdm.auto import tqdm
 from datasets import load_dataset, concatenate_datasets
 import config as CFG
-from transformers import LlamaConfig, LlamaModel, AutoTokenizer, RobertaTokenizerFast
+from transformers import LlamaConfig, LlamaModel, AutoTokenizer, RobertaTokenizerFast, AutoModel
 from peft import LoraConfig, TaskType, get_peft_model
 from modules import CBLResidual, CBL, Roberta_classifier
 import time
+from module_intervention import amplify_intervention
 from utils import elastic_net_penalty, mean_pooling, eos_pooling, get_labels, cos_sim_cubed
 import wandb
 def set_seed(seed):
@@ -30,19 +31,31 @@ parser.add_argument("--seed", type=int, default=42)
 parser.add_argument("--discrimination_loss", type=float, default=1.0)
 parser.add_argument("--neg_entropy_loss", type=float, default=1.0)
 parser.add_argument("--concept_loss", type=float, default=1.0)
+parser.add_argument("--word_loss", type=float, default=1.0)
 parser.add_argument("--elastic_net_alpha", type=float, default=1.0)
 parser.add_argument("--residual_dim", type=int, default=768)
 parser.add_argument("--orthogonal_loss_weight", type=float, default=0)
 parser.add_argument("--residual_penalty_weight", type=float, default=0)
 parser.add_argument("--DEBUG", action='store_true', help="If set, use a smaller subset of data for quick debugging.")
+parser.add_argument("--intervention_gen_loss", type=float, default=0.0)
+parser.add_argument("--intervention_margin", type=float, default=10.0)
+parser.add_argument("--no_detach_intervention", action='store_true', help="If set, do not detach unsup during intervention generation loss computation.")
+parser.add_argument("--intervention_spread", type=float, default=2.0)
+parser.add_argument("--classifier_weight_suffixes", type=str, default="_seed42,_seed123,_seed456", 
+                    help="Comma-separated list of classifier weight suffixes to test (e.g., '_seed42,_seed123,_seed456')")
+parser.add_argument("--grpo_loss_weight", type=float, default=0.0, help="Weight for GRPO steerability loss. 0 disables it.")
+parser.add_argument("--grpo_warmup_steps", type=int, default=300, help="Global training steps before GRPO kicks in.")
+parser.add_argument("--grpo_num_trajectories", type=int, default=4, help="Number of rollouts (G) per GRPO step.")
+parser.add_argument("--grpo_gen_length", type=int, default=100, help="Max generation length for GRPO rollouts.")
+parser.add_argument("--grpo_clip_advantage", type=float, default=5.0, help="Clip GRPO advantages to [-clip, clip].")
 parser.add_argument("--automatic_concept_correction", action='store_true', help="If set, automatically set concept labels to 0 for concepts that are not present in the example according to the ground truth label. This is a form of training intervention to correct mislabeled concepts.")
 parser.add_argument("--labeling", type=str, default="mpnet", help="mpnet, angle, simcse, llm")
 
 class ClassificationDataset(torch.utils.data.Dataset):
     def __init__(self, encoded_text, s):
         self.encoded_text = encoded_text
-
         self.s = s
+
 
     def __getitem__(self, idx):
         t = {key: torch.tensor(values[idx]) for key, values in self.encoded_text.items()}
@@ -189,12 +202,12 @@ if __name__ == "__main__":
 
     print("creating loader...")
     train_loader = build_loaders(encoded_train_dataset, train_similarity, mode="train")
-    
     if args.dataset == 'SetFit/sst2':
         val_loader = build_loaders(encoded_val_dataset, val_similarity, mode="valid")
     
     test_similarity = np.zeros((len(encoded_test_dataset["label"]), 1))
     test_loader = build_loaders(encoded_test_dataset, test_similarity, mode="test")
+
     print("preparing backbone")
     preLM = LlamaModel.from_pretrained('meta-llama/Meta-Llama-3-8B', torch_dtype=torch.bfloat16).to(device)
     preLM = get_peft_model(preLM, lora_config)
@@ -222,6 +235,28 @@ if __name__ == "__main__":
     if args.discrimination_loss > 0:
         opt_classifier = torch.optim.Adam(classifier.parameters(), lr=1e-3)
 
+    # Set intervention value once (used by both intervention_gen_loss and GRPO)
+    if args.dataset == "dbpedia_14":
+        intervention_value = 150
+    else:
+        intervention_value = 100
+
+    # Load MPNET for GRPO reward scoring
+    if args.grpo_loss_weight > 0:
+        from transformers import AutoTokenizer, AutoModel
+        tokenizer_sim_grpo = AutoTokenizer.from_pretrained('sentence-transformers/all-mpnet-base-v2')
+        sim_model_grpo = AutoModel.from_pretrained('sentence-transformers/all-mpnet-base-v2').to(device)
+        sim_model_grpo.eval()
+        for p in sim_model_grpo.parameters():
+            p.requires_grad = False
+        
+        encoded_c_grpo = tokenizer_sim_grpo(concept_set, padding=True, truncation=True, max_length=args.max_length)
+        encoded_c_grpo = {k: torch.tensor(v).to(device) for k, v in encoded_c_grpo.items()}
+        concept_features_grpo = sim_model_grpo(input_ids=encoded_c_grpo["input_ids"], attention_mask=encoded_c_grpo["attention_mask"])
+        concept_features_grpo = mean_pooling(concept_features_grpo.last_hidden_state, encoded_c_grpo["attention_mask"])
+        concept_features_grpo = F.normalize(concept_features_grpo, p=2, dim=1)
+        print("Loaded MPNET for GRPO similarity scoring.")
+
     print("start training...")
     best_loss = float('inf')
     d_name = args.dataset.replace('/', '_')
@@ -235,6 +270,29 @@ if __name__ == "__main__":
 
     model_name = "llama3"
     cbl_name = "cbl"
+
+    # ======= DEBUG: Test batched generate =======
+    if args.DEBUG:
+        print("=" * 60)
+        print("DEBUG: Testing generate_batch (no intervention)")
+        print("=" * 60)
+        test_input = torch.tensor([tokenizer.encode("")]).to(device)
+        num_test = min(args.grpo_num_trajectories, 8)
+        preLM.eval()
+        cbl.eval()
+        with torch.no_grad():
+            batch_ids, _ = cbl.generate_batch(
+                test_input, preLM, num_samples=num_test,
+                intervene=None, length=50
+            )
+        special_tokens = torch.tensor([128000, 128001]).to(device)
+        for g in range(num_test):
+            tokens = batch_ids[g][~torch.isin(batch_ids[g], special_tokens)]
+            text = tokenizer.decode(tokens)
+            print(f"  [{g+1}/{num_test}] ({len(tokens)} tokens): {text}")
+        print("=" * 60)
+        preLM.train()
+        cbl.train()
 
     start = time.time()
     best_epoch = -1
@@ -251,11 +309,17 @@ if __name__ == "__main__":
             "reg_loss": [],
             "orthogonal_loss": [],
             "residual_penalty_loss": [],
+            "intervention_gen_loss": [],
+            "grpo_loss": [],
+            "grpo_mean_reward": [],
+            "non_zero_grpo_advantages": []
         }
 
         
         for i, (batch, batch_sim) in tqdm(enumerate(train_loader), total=len(train_loader)):
             batch = {k: v.to(device) for k, v in batch.items()}
+            batch_sim = batch_sim.to(device)
+
             concept_label = torch.where(batch["attention_mask"][:, :-1] == 0, -100, batch["label"].view(-1, 1))
             word_label = torch.where(batch["attention_mask"][:, :-1] == 0, -100, batch["input_ids"][:, 1:])
             features = preLM(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"]).last_hidden_state
@@ -264,16 +328,18 @@ if __name__ == "__main__":
             # print("elastic_net_alphaunsup shape in training loop:", unsup.shape)
             # print("vocabs shape in training loop:", vocabs.shape)
             
-            # concept_loss = torch.nn.CrossEntropyLoss()(concepts[:, :-1, :].reshape(-1, len(concept_set)), concept_label.reshape(-1))
+            mask = (batch["attention_mask"][:, :-1] != 0).reshape(-1) # (B * (seq_len - 1))
+            c_slice = concepts[:, :-1, :].contiguous().view(-1, concepts.shape[-1]) # (B * (seq_len - 1), C)
+            batch_sim_slice = batch_sim.unsqueeze(1).expand(-1, concepts.shape[1] - 1, -1).contiguous().view(-1, batch_sim.shape[-1])
+            
+            valid_c = c_slice[mask]
+            valid_sim = batch_sim_slice[mask]
+            
+            concept_loss = -cos_sim_cubed(valid_c, valid_sim)
             word_loss = torch.nn.CrossEntropyLoss()(vocabs[:, :-1, :].reshape(-1, config.vocab_size), word_label.reshape(-1))
+            loss = args.concept_loss * concept_loss + word_loss*args.word_loss
             reg = elastic_net_penalty(cbl.fc.weight[:, :len(concept_set)])
             
-            # print("concepts shape: ", concepts.shape)
-            # print("concept_label shape: ", concept_label.shape)
-            # print("unsup shape: ", unsup.shape)
-            # print("matched_unsup shape: ", matched_unsup.shape)
-            
-            loss = 0
             if matched_unsup is not None:
                 orthogonal_loss = torch.cosine_similarity(concepts, matched_unsup, dim=-1).mean().abs() ## TODO: check shape
                 loss += args.orthogonal_loss_weight * orthogonal_loss
@@ -284,15 +350,28 @@ if __name__ == "__main__":
                 residual_penalty = torch.mean(torch.abs(residual_contrib)) ## TODO: check logic
                 loss += args.residual_penalty_weight * residual_penalty
                 training_losses["residual_penalty_loss"].append(residual_penalty.detach().cpu().numpy())
-            
-            batch_sim = batch_sim.to(device) # (B, C)
-            batch_sim = batch_sim.unsqueeze(1).expand(-1, concepts.shape[1], -1) # (B, seq_len, C)
-            concepts = concepts.view(-1, concepts.shape[-1]) # (B*seq_len, C)
-            batch_sim = batch_sim.contiguous().view(-1, batch_sim.shape[-1]) # (B*seq_len, C)
-            concept_loss = cos_sim_cubed(concepts, batch_sim)
-
-            
-            loss += args.concept_loss * concept_loss + word_loss
+                
+            if args.intervention_gen_loss > 0:
+                ### concepts shapes: (B, seq_len, concept_dim)
+                concept_label_raw = batch["label"].view(-1, 1) ## shape: (B, 1)
+                
+                if args.dataset == "dbpedia_14":
+                    intervention_value = 150
+                else:
+                    intervention_value = 100
+                    
+                intervened_concept = torch.zeros_like(concepts, device=device) ## shape: (B, seq_len, concept_dim)
+                for b in range(concepts.shape[0]):
+                    intervened_concept[b, :, concept_label_raw[b].item()] = intervention_value
+                    
+                # print("intervened_concept shape: ", intervened_concept.shape, intervened_concept.max(), intervened_concept.min())
+                if args.no_detach_intervention:
+                    vocab = cbl.intervene(unsup, intervened_concept.detach())
+                else:
+                    vocab = cbl.intervene(unsup.detach(), intervened_concept.detach())
+                intervention_gen_loss = torch.nn.CrossEntropyLoss()(vocab[:, :-1, :].reshape(-1, config.vocab_size), word_label.reshape(-1))
+                loss += args.intervention_gen_loss * intervention_gen_loss
+                training_losses["intervention_gen_loss"].append(intervention_gen_loss.detach().cpu().numpy())
                 
             loss += args.elastic_net_alpha * reg
             
@@ -320,6 +399,143 @@ if __name__ == "__main__":
                 (args.neg_entropy_loss * neg_entropy_loss).backward(inputs=list(cbl.unsup.parameters()))
                 opt_cbl.step()
                 training_losses["neg_entropy_loss"].append(neg_entropy_loss.detach().cpu().numpy())
+
+            # ======= GRPO STEERABILITY LOSS (activated after warmup) =======
+            grpo_step = e * len(train_loader) + i
+            if args.DEBUG or (args.grpo_loss_weight > 0 and grpo_step >= args.grpo_warmup_steps):
+                grpo_concept_idx = torch.randint(0, len(concept_set), (1,)).item()
+                grpo_intervene = [0] * len(concept_set)
+                grpo_intervene[grpo_concept_idx] = intervention_value
+
+                # Phase 1: Generate G trajectories in parallel & score with RoBERTa ensemble (no grad)
+                gen_input = torch.tensor([tokenizer.encode("")]).to(device)
+                special_tokens_mask = torch.tensor([128000, 128001]).to(device)
+
+                preLM.eval()
+                cbl.eval()
+                with torch.no_grad():
+                    # Batched generation — all trajectories at once
+                    text_ids_batch, _ = cbl.generate_batch(
+                        gen_input, preLM, num_samples=args.grpo_num_trajectories,
+                        intervene=grpo_intervene, length=args.grpo_gen_length
+                    )
+
+                    # Decode all trajectories and re-encode
+                    generated_seqs = []
+                    decoded_texts = []
+                    for g in range(args.grpo_num_trajectories):
+                        decoded = tokenizer.decode(
+                            text_ids_batch[g][~torch.isin(text_ids_batch[g], special_tokens_mask)]
+                        )
+                        re_encoded = torch.tensor([tokenizer.encode(decoded)]).to(device)
+                        generated_seqs.append(re_encoded.detach())
+                        decoded_texts.append(decoded)
+
+                    # Batched reward scoring with RoBERTa ensemble
+                    grpo_rewards = [0.0] * args.grpo_num_trajectories
+                    non_empty_indices = [g for g, t in enumerate(decoded_texts) if len(t.strip()) > 0]
+                    if non_empty_indices:
+                        non_empty_texts = [decoded_texts[g] for g in non_empty_indices]
+                        generated_c_grpo = tokenizer_sim_grpo(non_empty_texts, return_tensors='pt', truncation=True, max_length=args.max_length, padding=True).to(device)
+                        generated_features_grpo = sim_model_grpo(input_ids=generated_c_grpo["input_ids"], attention_mask=generated_c_grpo["attention_mask"])
+                        generated_features_grpo = mean_pooling(generated_features_grpo.last_hidden_state, generated_c_grpo["attention_mask"])
+                        generated_features_grpo = F.normalize(generated_features_grpo, p=2, dim=1)
+                        
+                        sims_grpo = generated_features_grpo @ concept_features_grpo.T
+                        v_target_grpo = [0] * len(concept_set)
+                        v_target_grpo[grpo_concept_idx] = 1.0
+                        v_tensor_grpo = torch.tensor(v_target_grpo).to(device).unsqueeze(0).expand(len(non_empty_texts), -1)
+
+                        for idx, g in enumerate(non_empty_indices):
+                            r = cos_sim_cubed(sims_grpo[idx:idx+1], v_tensor_grpo[idx:idx+1].float()).item()
+                            grpo_rewards[g] = r
+
+                    if args.DEBUG:
+                        for g in range(args.grpo_num_trajectories):
+                            print(f"GRPO Trajectory {g+1}/{args.grpo_num_trajectories}:")
+                            print("  Decoded text:", decoded_texts[g])
+                            print("  Reward:", grpo_rewards[g])
+                            print("-" * 50)
+                            
+                    ## log the lowest and highest reward text+reward to wandb for debugging
+                    wandb.log({
+                        "grpo_debug_lowest_reward": min(grpo_rewards),
+                        "grpo_debug_highest_reward": max(grpo_rewards),
+                        "grpo_debug_lowest_text": decoded_texts[grpo_rewards.index(min(grpo_rewards))],
+                        "grpo_debug_highest_text": decoded_texts[grpo_rewards.index(max(grpo_rewards))]
+                    })
+
+                preLM.train()
+                cbl.train()
+
+                # Phase 2: Group-relative advantages
+                grpo_rewards_t = torch.tensor(grpo_rewards, device=device, dtype=torch.float32)
+                if grpo_rewards_t.std() > 1e-8:
+                    grpo_advantages = (grpo_rewards_t - grpo_rewards_t.mean()) / (grpo_rewards_t.std() + 1e-8)
+                else:
+                    grpo_advantages = torch.zeros_like(grpo_rewards_t)
+                grpo_advantages = grpo_advantages.clamp(-args.grpo_clip_advantage, args.grpo_clip_advantage)
+
+                # Phase 3: Recompute log-probs WITH gradient (batched teacher-forced)
+                valid_indices = [g for g in range(args.grpo_num_trajectories)
+                                 if generated_seqs[g].shape[1] > 1 and grpo_advantages[g].abs().item() > 1e-8]
+
+                if valid_indices:
+                    max_seq_len = max(generated_seqs[g].shape[1] for g in valid_indices)
+                    padded_inputs = []
+                    padded_targets = []
+                    attn_masks = []
+                    valid_advantages = []
+
+                    for g in valid_indices:
+                        seq = generated_seqs[g]  # (1, seq_len)
+                        seq_len = seq.shape[1] - 1
+                        pad_len = max_seq_len - 1 - seq_len
+                        seq_input = seq[:, :-1]
+                        seq_target = seq[:, 1:]
+                        if pad_len > 0:
+                            seq_input = F.pad(seq_input, (0, pad_len), value=tokenizer.pad_token_id)
+                            seq_target = F.pad(seq_target, (0, pad_len), value=0)
+                            attn = torch.cat([torch.ones(1, seq_len, device=device),
+                                              torch.zeros(1, pad_len, device=device)], dim=1)
+                        else:
+                            attn = torch.ones(1, seq_len, device=device)
+                        padded_inputs.append(seq_input)
+                        padded_targets.append(seq_target)
+                        attn_masks.append(attn)
+                        valid_advantages.append(grpo_advantages[g])
+
+                    batch_input = torch.cat(padded_inputs, dim=0)     # (V, max_seq_len-1)
+                    batch_target = torch.cat(padded_targets, dim=0)   # (V, max_seq_len-1)
+                    batch_attn = torch.cat(attn_masks, dim=0).long()  # (V, max_seq_len-1)
+                    valid_adv = torch.stack(valid_advantages)          # (V,)
+
+                    feats_g = preLM(input_ids=batch_input, attention_mask=batch_attn).last_hidden_state
+                    _, unsup_g, _, _ = cbl(feats_g.float())
+
+                    intervened_g = torch.zeros(len(valid_indices), batch_input.shape[1], len(concept_set), device=device)
+                    intervened_g[:, :, grpo_concept_idx] = intervention_value
+
+                    vocab_logits_g = cbl.intervene(unsup_g, intervened_g)
+                    log_probs_g = F.log_softmax(vocab_logits_g, dim=-1)
+                    token_log_probs_g = log_probs_g.gather(2, batch_target.unsqueeze(-1)).squeeze(-1)
+                    # Mask out padded positions
+                    token_log_probs_g = token_log_probs_g * batch_attn.float()
+                    mean_log_probs = token_log_probs_g.sum(dim=1) / batch_attn.sum(dim=1).float()
+
+                    grpo_loss_val = (-valid_adv * mean_log_probs).mean()
+                    opt_prelm.zero_grad()
+                    opt_cbl.zero_grad()
+                    (args.grpo_loss_weight * grpo_loss_val).backward()
+                    opt_prelm.step()
+                    opt_cbl.step()
+                    training_losses["grpo_loss"].append(grpo_loss_val.detach().cpu().numpy())
+                    training_losses["grpo_mean_reward"].append(grpo_rewards_t.mean().item())
+                    
+                training_losses["non_zero_grpo_advantages"].append((grpo_advantages.abs() > 1e-8).sum().item())
+                if args.DEBUG:
+                    print(f"GRPO debug - rewards: {grpo_rewards}, advantages: {grpo_advantages.tolist()}")
+
 
             training_losses["concept_loss"].append(concept_loss.detach().cpu().numpy())
             training_losses["word_loss"].append(word_loss.detach().cpu().numpy())
@@ -349,7 +565,6 @@ if __name__ == "__main__":
         print("Epoch ", e + 1, " training losses: ", avg_metrics)
         wandb.log({f"avg_{k}": avg_metrics[k] for k in avg_metrics.keys()})
 
-
         if args.dataset == 'SetFit/sst2':
             preLM.eval()
             cbl.eval()
@@ -360,9 +575,12 @@ if __name__ == "__main__":
                 "val_reg_loss": [],
                 "val_residual_penalty_loss": [],
                 "val_orthogonal_loss": [],
+                "val_intervention_gen_loss": []
             }
             for i, (batch, batch_sim) in tqdm(enumerate(val_loader), total=len(val_loader)):
                 batch = {k: v.to(device) for k, v in batch.items()}
+                batch_sim = batch_sim.to(device)
+
                 concept_label = torch.where(batch["attention_mask"][:, :-1] == 0, -100, batch["label"].view(-1, 1))
                 word_label = torch.where(batch["attention_mask"][:, :-1] == 0, -100, batch["input_ids"][:, 1:])
                 with torch.no_grad():
@@ -370,7 +588,13 @@ if __name__ == "__main__":
                     concepts, unsup, vocabs, matched_unsup = cbl(features.float())
                     classification = classifier(mean_pooling(unsup, batch["attention_mask"]))
                 
+                mask = (batch["attention_mask"][:, :-1] != 0).reshape(-1)
+                c_slice = concepts[:, :-1, :].contiguous().view(-1, concepts.shape[-1])
+                batch_sim_slice = batch_sim.unsqueeze(1).expand(-1, concepts.shape[1] - 1, -1).contiguous().view(-1, batch_sim.shape[-1])
+                valid_c = c_slice[mask]
+                valid_sim = batch_sim_slice[mask]
                 
+                concept_loss = -cos_sim_cubed(valid_c, valid_sim)
                 word_loss = torch.nn.CrossEntropyLoss()(vocabs[:, :-1, :].reshape(-1, config.vocab_size), word_label.reshape(-1))
                 discrimination_loss = torch.nn.CrossEntropyLoss()(classification, batch["label"])
                 p = F.softmax(classification, dim=-1)
@@ -384,11 +608,39 @@ if __name__ == "__main__":
                     orthogonal_loss = torch.cosine_similarity(concepts, matched_unsup, dim=-1).mean().abs() ## TODO: check shape
                     val_losses["val_orthogonal_loss"].append(orthogonal_loss.detach().cpu().numpy())
                 
-                batch_sim = batch_sim.to(device) # (B, C)
-                batch_sim = batch_sim.unsqueeze(1).expand(-1, concepts.shape[1], -1) # (B, seq_len, C)
-                concepts = concepts.view(-1, concepts.shape[-1]) # (B*seq_len, C)
-                batch_sim = batch_sim.contiguous().view(-1, batch_sim.shape[-1]) # (B*seq_len, C)
-                concept_loss = cos_sim_cubed(concepts, batch_sim)
+                if args.intervention_gen_loss > 0:
+                    if args.dataset == "dbpedia_14":
+                        intervention_value = 150
+                    else:
+                        intervention_value = 100
+                    # print("concept_label shape: ", concept_label.shape, concepts.shape)
+                    intervened_concept = torch.zeros_like(concepts, device=device)
+
+                    # ---- BEFORE ----
+                    # print("Before intervention:")
+                    # print("  min:", intervened_concept.min().item())
+                    # print("  max:", intervened_concept.max().item())
+
+                    # Apply intervention
+                    seq_len = concept_label.size(1)
+                    mask = (concept_label == 1)
+
+                    intervened_concept[:, :seq_len, 1] = mask.float() * intervention_value
+
+                    # ---- Counter AFTER intervention ----
+                    # counter = (intervened_concept[:, :, 1] == intervention_value).sum().item()
+
+                    # print("Counter:", counter)
+                    # print("After intervention:")
+                    # print("  min:", intervened_concept.min().item())
+                    # print("  max:", intervened_concept.max().item())
+
+                    # # Optional: how many positions activated
+                    # print("Activated positions:", mask.sum().item())
+                    # print("-" * 50)
+                    vocab = cbl.intervene(unsup.detach(), intervened_concept.detach())
+                    intervention_gen_loss = torch.nn.CrossEntropyLoss()(vocab[:, :-1, :].reshape(-1, config.vocab_size), word_label.reshape(-1))
+                    val_losses["val_intervention_gen_loss"].append(intervention_gen_loss.detach().cpu().numpy())
                 
                 neg_entropy_loss = torch.sum(p * torch.log(p), dim=-1).mean()
                 reg = elastic_net_penalty(cbl.fc.weight[:, :len(concept_set)])
@@ -456,42 +708,36 @@ if __name__ == "__main__":
     cbl.eval()
         
     
-    import config as CFG
-    from transformers import AutoTokenizer, AutoModel, AutoModelForCausalLM
+    
     
     ### TEST STEERABILITY AFTER TRAINING
-
+    
+    from transformers import AutoTokenizer, AutoModel
     tokenizer_sim = AutoTokenizer.from_pretrained('sentence-transformers/all-mpnet-base-v2')
     sim_model = AutoModel.from_pretrained('sentence-transformers/all-mpnet-base-v2').to(device)
     sim_model.eval()
-    
 
     encoded_c = tokenizer_sim(concept_set, padding=True, truncation=True, max_length=args.max_length)
     encoded_c = {k: torch.tensor(v).to(device) for k, v in encoded_c.items()}
     concept_features = sim_model(input_ids=encoded_c["input_ids"], attention_mask=encoded_c["attention_mask"])
-    # print(concept_features.last_hidden_state.shape)
-    # print(concept_features.pooler_output.shape, encoded_c["attention_mask"].shape)
-    # print ("concept features shape before pooling: ", concept_features)
     concept_features = mean_pooling(concept_features.last_hidden_state, encoded_c["attention_mask"])
     concept_features = F.normalize(concept_features, p=2, dim=1)
-    # print("concept features shape after pooling: ", concept_features.shape)
-    # roberta_tokenizer = RobertaTokenizerFast.from_pretrained('roberta-base')
-    # classifier_path = args.dataset.replace('/', '_') + "_finegrained_classifier.pt"
-    # classifier = Roberta_classifier(len(concept_set)).to(device)
-    # classifier.load_state_dict(torch.load(classifier_path, map_location=device))
-    
-    # print("concept set: ", concept_set)
+
     if args.dataset == "dbpedia_14":
         intervention_value = 150
     else:
         intervention_value = 100
-    pred = []
+        
     text = []
     cos_sim_cubed_values = []
     softmax_values = []
-    acc = evaluate.load("accuracy")
+    top1_correct = 0
+    top3_correct = 0
+    top5_correct = 0
+    total_evals = 0
+    
     with torch.no_grad():
-        for i in tqdm(range(50)): ## 50 per concept
+        for i in tqdm(range(50)):
             print("example", str(i), end="\r")
             with torch.no_grad():
                 input_ids = torch.tensor([tokenizer.encode("")]).to(device)
@@ -505,40 +751,42 @@ if __name__ == "__main__":
                     generated_c = tokenizer_sim(decoded_text_ids, padding=True, truncation=True, max_length=args.max_length, return_tensors="pt").to(device)
                     generated_c = {k: v.to(device) for k, v in generated_c.items()}
                     generated_features = sim_model(input_ids=generated_c["input_ids"], attention_mask=generated_c["attention_mask"])
-                    # print("gen", generated_features.last_hidden_state.shape)
                     generated_features = mean_pooling(generated_features.last_hidden_state, generated_c["attention_mask"])
                     generated_features = F.normalize(generated_features, p=2, dim=1)
-                    # print("gen after pooling", generated_features.shape)
-                    sims = generated_features @ concept_features.T # (1, concept_num)
-                    # print("sims shape: ", sims.shape)
-                    v = torch.tensor(v).to(device).unsqueeze(0) # (1, concept_num)
-                    # print("v: ", v.shape)
-                    cos_sim_cubed_values.append(cos_sim_cubed(sims,v.float()).item())
+                    
+                    sims = generated_features @ concept_features.T
+                    v_tensor = torch.tensor(v).to(device).unsqueeze(0)
+                    
+                    cos_sim_cubed_values.append(cos_sim_cubed(sims, v_tensor.float()).item())
                     softmax_values.append(torch.nn.CrossEntropyLoss()(sims, torch.tensor([j]).to(device)).item())
                     
+                    sorted_indices = torch.argsort(sims[0], descending=True)
+                    if j == sorted_indices[0].item():
+                        top1_correct += 1
+                    if j in sorted_indices[:3].tolist():
+                        top3_correct += 1
+                    if j in sorted_indices[:5].tolist():
+                        top5_correct += 1
+                    total_evals += 1
 
-                    # roberta_text_ids = torch.tensor([roberta_tokenizer.encode(decoded_text_ids)]).to(device)
-                    # roberta_input = {"input_ids": roberta_text_ids, "attention_mask": torch.tensor([[1]*roberta_text_ids.shape[1]]).to(device)}
-                    # logits = classifier(roberta_input)
-
-                    # pred.append(logits)
-        # pred = torch.cat(pred, dim=0).detach().cpu()
-        # pred = np.argmax(pred.numpy(), axis=-1)
-        # acc.add_batch(predictions=pred, references=list(range(len(concept_set)))*(100 // len(concept_set)))
-
-    # print("Steerability test accuracy:")
-    # acc = acc.compute()
-    wandb.log({"steerability_cos_sim_cubed": sum(cos_sim_cubed_values) / len(cos_sim_cubed_values),
-               "steerability_softmax": sum(softmax_values) / len(softmax_values)})
+    wandb.log({
+        "steerability_cos_sim_cubed": sum(cos_sim_cubed_values) / len(cos_sim_cubed_values),
+        "steerability_softmax": sum(softmax_values) / len(softmax_values),
+        "steerability_top1_acc": top1_correct / total_evals,
+        "steerability_top3_acc": top3_correct / total_evals,
+        "steerability_top5_acc": top5_correct / total_evals,
+    })
     
-    
+    print(f"Steerability Top-1 Acc: {top1_correct / total_evals}")
+    print(f"Steerability Top-3 Acc: {top3_correct / total_evals}")
+    print(f"Steerability Top-5 Acc: {top5_correct / total_evals}")
     
     
     ### TEST CONCEPT PREDICTION AFTER TRAINING
     print("eval concepts...")
     metric = evaluate.load("accuracy")
     concept_predictions = []
-    for i, (batch, batch_sim) in tqdm(enumerate(test_loader), total=len(test_loader)):
+    for batch in tqdm(test_loader, total=len(test_loader)):
         batch = {k: v.to(device) for k, v in batch.items()}
         with torch.no_grad():
             features = preLM(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"]).last_hidden_state
