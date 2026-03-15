@@ -50,6 +50,7 @@ parser.add_argument("--grpo_num_trajectories", type=int, default=4, help="Number
 parser.add_argument("--grpo_gen_length", type=int, default=100, help="Max generation length for GRPO rollouts.")
 parser.add_argument("--grpo_clip_advantage", type=float, default=5.0, help="Clip GRPO advantages to [-clip, clip].")
 parser.add_argument("--automatic_concept_correction", action='store_true', help="If set, automatically set concept labels to 0 for concepts that are not present in the example according to the ground truth label. This is a form of training intervention to correct mislabeled concepts.")
+parser.add_argument("--concept_loss_type", type=str, default="cosine_cubed", help="Type of concept loss to use: 'cosine_cubed' or 'ce'.")
 parser.add_argument("--labeling", type=str, default="mpnet", help="mpnet, angle, simcse, llm")
 parser.add_argument("--use_last_epoch", action='store_true', help="If set, load the classifier from the last epoch instead of the best epoch based on validation loss.")
 
@@ -335,10 +336,18 @@ if __name__ == "__main__":
             c_slice = concepts[:, :-1, :].contiguous().view(-1, concepts.shape[-1]) # (B * (seq_len - 1), C)
             batch_sim_slice = batch_sim.unsqueeze(1).expand(-1, concepts.shape[1] - 1, -1).contiguous().view(-1, batch_sim.shape[-1])
             
-            valid_c = c_slice[mask]
-            valid_sim = batch_sim_slice[mask]
-            
-            concept_loss = -cos_sim_cubed(valid_c, valid_sim)
+            valid_c = c_slice[mask]          # (N_valid, C)
+            valid_sim = batch_sim_slice[mask]  # (N_valid, C)
+
+            if args.concept_loss_type == "cosine_cubed":
+                # Cosine-similarity-based concept loss against soft ACS labels
+                concept_loss = -cos_sim_cubed(valid_c, valid_sim)
+            elif args.concept_loss_type == "ce":
+                # Cross-entropy concept loss using hard labels from ACS top concept
+                hard_targets = torch.argmax(valid_sim, dim=-1)  # (N_valid,)
+                concept_loss = torch.nn.CrossEntropyLoss()(valid_c, hard_targets)
+            else:
+                raise ValueError(f"Unknown concept_loss_type: {args.concept_loss_type}")
             word_loss = torch.nn.CrossEntropyLoss()(vocabs[:, :-1, :].reshape(-1, config.vocab_size), word_label.reshape(-1))
             loss = args.concept_loss * concept_loss + word_loss*args.word_loss
             reg = elastic_net_penalty(cbl.fc.weight[:, :len(concept_set)])
@@ -596,8 +605,14 @@ if __name__ == "__main__":
                 batch_sim_slice = batch_sim.unsqueeze(1).expand(-1, concepts.shape[1] - 1, -1).contiguous().view(-1, batch_sim.shape[-1])
                 valid_c = c_slice[mask]
                 valid_sim = batch_sim_slice[mask]
-                
-                concept_loss = -cos_sim_cubed(valid_c, valid_sim)
+
+                if args.concept_loss_type == "cosine_cubed":
+                    concept_loss = -cos_sim_cubed(valid_c, valid_sim)
+                elif args.concept_loss_type == "ce":
+                    hard_targets = torch.argmax(valid_sim, dim=-1)
+                    concept_loss = torch.nn.CrossEntropyLoss()(valid_c, hard_targets)
+                else:
+                    raise ValueError(f"Unknown concept_loss_type: {args.concept_loss_type}")
                 word_loss = torch.nn.CrossEntropyLoss()(vocabs[:, :-1, :].reshape(-1, config.vocab_size), word_label.reshape(-1))
                 discrimination_loss = torch.nn.CrossEntropyLoss()(classification, batch["label"])
                 p = F.softmax(classification, dim=-1)
