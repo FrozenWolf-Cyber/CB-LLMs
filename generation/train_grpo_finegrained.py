@@ -40,7 +40,7 @@ from peft import LoraConfig, TaskType, get_peft_model
 from modules import CBLResidual, CBL, Roberta_classifier
 import time
 from module_intervention import amplify_intervention
-from utils import elastic_net_penalty, mean_pooling, eos_pooling, cos_sim_cubed
+from utils import elastic_net_penalty, mean_pooling, eos_pooling, get_labels, cos_sim_cubed
 import wandb
 import glob
 import copy
@@ -241,13 +241,58 @@ if __name__ == "__main__":
     encoded_test_dataset = encoded_test_dataset[:len(encoded_test_dataset)]
 
     concept_set = CFG.concept_set[args.dataset]
-    print("concept len: ", len(concept_set))
+    print("concept len: ", len(concept_set))  # concept_set: list of strings, len = num_concepts
+
+    d_name = args.dataset.replace('/', '_')
+    label_prefix = "./"
+    if args.labeling == 'mpnet':
+        label_prefix += "mpnet_acs"
+    elif args.labeling == 'simcse':
+        label_prefix += "simcse_acs"
+    elif args.labeling == 'angle':
+        label_prefix += "angle_acs"
+    elif args.labeling == 'llm':
+        label_prefix += "llm_labeling"
+
+    label_prefix += "/"
+    label_prefix += d_name
+    label_prefix += "/"
+    
+    print(f"Loading concept labels from: {label_prefix}")
+    train_similarity = np.load(label_prefix + "/concept_labels_train.npy")  # (N_train, num_concepts)
+    if args.dataset == 'SetFit/sst2':
+        val_similarity = np.load(label_prefix + "/concept_labels_val.npy")  # (N_val, num_concepts)
+
+    if args.automatic_concept_correction:
+        start = time.time()
+        print("training intervention...")
+        for i in range(train_similarity.shape[0]):
+            for j in range(len(concept_set)):
+                if get_labels(j, args.dataset) != encoded_train_dataset["label"][i]:
+                    train_similarity[i][j] = 0.0
+                else:
+                    if train_similarity[i][j] < 0.0:
+                        train_similarity[i][j] = 0.0
+        
+        if args.dataset == 'SetFit/sst2':
+            for i in range(val_similarity.shape[0]):
+                for j in range(len(concept_set)):
+                    if get_labels(j, args.dataset) != encoded_val_dataset["label"][i]:
+                        val_similarity[i][j] = 0.0
+                    else:
+                        if val_similarity[i][j] < 0.0:
+                            val_similarity[i][j] = 0.0
+        end = time.time()
+        print("time of training intervention:", (end - start) / 3600, "hours")
 
     print("creating loader...")
-    train_loader = build_loaders(encoded_train_dataset, mode="train")
+    train_loader = build_loaders(encoded_train_dataset, train_similarity, mode="train")
     if args.dataset == 'SetFit/sst2':
-        val_loader = build_loaders(encoded_val_dataset, mode="valid")
-    test_loader = build_loaders(encoded_test_dataset, mode="test")
+        val_loader = build_loaders(encoded_val_dataset, val_similarity, mode="valid")
+    
+    test_similarity = np.zeros((len(encoded_test_dataset["label"]), 1), dtype=np.float32)
+    test_loader = build_loaders(encoded_test_dataset, test_similarity, mode="test")
+
 
     # ======================================================================
     # Load pretrained checkpoint from train_combined.py
@@ -854,63 +899,74 @@ if __name__ == "__main__":
     print(f"Steerability Top-20 Acc: {top20_correct / total_evals}")
     
     
-    ### TEST CONCEPT PREDICTION AFTER TRAINING
-    print("eval concepts...")
-    metric = evaluate.load("accuracy")
-    concept_predictions = []
-    
-    concept_top1_correct = 0
-    concept_top3_correct = 0
-    concept_top5_correct = 0
-    concept_top10_correct = 0
-    concept_top20_correct = 0
-    concept_total_evals = 0
-    
-    for batch in tqdm(test_loader, total=len(test_loader)):
+    ### TEST CONCEPT PREDICTION AFTER TRAINING (COSINE-SIMILARITY-BASED)
+    print("eval concepts (cosine similarity to MPNet labels)...")
+    concept_predictions = []  # list of tensors, each (B, num_concepts)
+
+    for batch, _ in tqdm(test_loader, total=len(test_loader)):
+        # batch["input_ids"]: (B, seq_len), batch["attention_mask"]: (B, seq_len)
         batch = {k: v.to(device) for k, v in batch.items()}
         with torch.no_grad():
-            features = preLM(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"]).last_hidden_state
-            concepts, _, _, _ = cbl(features.float())
-        concept_predictions.append(eos_pooling(concepts, batch["attention_mask"]))
-    concept_predictions = torch.cat(concept_predictions, dim=0).detach().cpu()
-    
-    references = encoded_test_dataset["label"]
-    for idx, sample_pred in enumerate(concept_predictions):
-        sorted_indices = torch.argsort(sample_pred, descending=True)
-        true_label = references[idx]
-        
-        if true_label == sorted_indices[0].item():
-            concept_top1_correct += 1
-        if true_label in sorted_indices[:3].tolist():
-            concept_top3_correct += 1
-        if true_label in sorted_indices[:5].tolist():
-            concept_top5_correct += 1
-        if true_label in sorted_indices[:10].tolist():
-            concept_top10_correct += 1
-        if true_label in sorted_indices[:20].tolist():
-            concept_top20_correct += 1
-        concept_total_evals += 1
-        
-    pred = np.argmax(concept_predictions.numpy(), axis=-1)
-    metric.add_batch(predictions=pred, references=references)
-    print("Concept prediction accuracy:")
-    acc = metric.compute()
-    print(acc)
-    
-    print(f"Concept Top-1 Acc: {concept_top1_correct / concept_total_evals}")
-    print(f"Concept Top-3 Acc: {concept_top3_correct / concept_total_evals}")
-    print(f"Concept Top-5 Acc: {concept_top5_correct / concept_total_evals}")
-    print(f"Concept Top-10 Acc: {concept_top10_correct / concept_total_evals}")
-    print(f"Concept Top-20 Acc: {concept_top20_correct / concept_total_evals}")
-    
-    wandb.log({
-        "concept_prediction_accuracy": acc["accuracy"],
-        "concept_top1_acc": concept_top1_correct / concept_total_evals,
-        "concept_top3_acc": concept_top3_correct / concept_total_evals,
-        "concept_top5_acc": concept_top5_correct / concept_total_evals,
-        "concept_top10_acc": concept_top10_correct / concept_total_evals,
-        "concept_top20_acc": concept_top20_correct / concept_total_evals
-    })
+            features = preLM(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"]).last_hidden_state  # (B, seq_len, hidden_dim)
+            concepts, _, _, _ = cbl(features.float())  # concepts: (B, seq_len, num_concepts)
+        pooled_concepts = eos_pooling(concepts, batch["attention_mask"])  # (B, num_concepts)
+        concept_predictions.append(pooled_concepts.detach().cpu())
+
+    # concept_predictions: (N_test, num_concepts)
+    concept_predictions = torch.cat(concept_predictions, dim=0)  # (N_test, num_concepts)
+
+    # Load test-time MPNet/ACS concept label vectors, if available
+    test_sim_path = label_prefix + "/concept_labels_test.npy"
+    if os.path.exists(test_sim_path):
+        test_similarity_np = np.load(test_sim_path)  # (N_test, num_concepts)
+        test_similarity = torch.tensor(test_similarity_np, dtype=torch.float32)  # (N_test, num_concepts)
+
+        if test_similarity.shape != concept_predictions.shape:
+            print("[WARN] Shape mismatch between concept_predictions",
+                  f"{tuple(concept_predictions.shape)} and test_similarity {tuple(test_similarity.shape)}.")
+            print("       Skipping cosine-similarity-based concept evaluation.")
+        else:
+            # Average cosine similarity over test set (same objective as training cos_sim_cubed)
+            # concept_predictions: (N_test, num_concepts)
+            # test_similarity:     (N_test, num_concepts)
+            test_cos_sim = cos_sim_cubed(concept_predictions, test_similarity)  # scalar
+            test_cos_loss = -test_cos_sim.item()
+
+            print(f"Test concept cosine similarity (cos_sim_cubed): {test_cos_sim.item():.4f}")
+            print(f"Test concept cosine loss: {test_cos_loss:.4f}")
+
+            # --- Concept-level top-k accuracy w.r.t. ACS labels ---
+            # Ground-truth concept per example: top concept from test_similarity
+            # true_concepts: (N_test,)
+            true_concepts = torch.argmax(test_similarity, dim=-1)  # indices in [0, num_concepts-1]
+
+            # Predicted ranking over concepts per example
+            # pred_sorted: (N_test, num_concepts), each row is concept indices sorted by predicted score
+            pred_sorted = torch.argsort(concept_predictions, dim=-1, descending=True)
+
+            topk_list = [1, 3, 5, 10, 20]
+            topk_hits = {k: 0 for k in topk_list}
+            total = concept_predictions.size(0)
+
+            for i in range(total):
+                gt_idx = true_concepts[i].item()
+                row = pred_sorted[i]
+                for k in topk_list:
+                    if k <= row.size(0) and gt_idx in row[:k].tolist():
+                        topk_hits[k] += 1
+
+            topk_acc = {f"test_concept_top{k}_acc": topk_hits[k] / total for k in topk_list}
+
+            for k in topk_list:
+                print(f"Test concept Top-{k} Acc (w.r.t. ACS top concept): {topk_acc[f'test_concept_top{k}_acc']:.4f}")
+
+            wandb.log({
+                "test_concept_cosine_similarity": float(test_cos_sim.item()),
+                "test_concept_cosine_loss": float(test_cos_loss),
+                **topk_acc,
+            })
+    else:
+        print(f"[WARN] {test_sim_path} not found. Skipping cosine-similarity-based concept evaluation.")
     
     
     
@@ -935,6 +991,7 @@ if __name__ == "__main__":
     set_seed(args.seed)
     
     pred = []
+    c = 0
     perplexity = evaluate.load("perplexity", module_type="metric")
     input_ids = torch.tensor([tokenizer.encode("")]).to(device)
     for i in tqdm(range(100)):
@@ -944,6 +1001,7 @@ if __name__ == "__main__":
             pred.append(tokenizer.decode(text_ids[0], skip_special_tokens=True ))
             if len(pred[-1].split()) > 30:
                 continue
+            c += 1
             perplexity.add_batch(predictions=[pred[i]])
 
         ## print some generated texts
@@ -963,9 +1021,13 @@ if __name__ == "__main__":
     torch.cuda.empty_cache()
 
     print("Perplexity: (under 30 tokens)")
-    perplexity = perplexity.compute(model_id='meta-llama/Meta-Llama-3-8B', max_length=100)['mean_perplexity']
-    print(perplexity)
-    wandb.log({"perplexity_under_30_tokens": perplexity})
+    if c > 0:
+        perplexity = perplexity.compute(model_id='meta-llama/Meta-Llama-3-8B', max_length=100)['mean_perplexity']
+        print(perplexity)
+        wandb.log({"perplexity_under_30_tokens": perplexity})
+    else:
+        print("No generated texts under 30 tokens to compute perplexity.")
+        wandb.log({"perplexity_under_30_tokens": None})
     
     print("Now for all tokens:")
     perplexity = evaluate.load("perplexity", module_type="metric")
