@@ -67,6 +67,8 @@ parser.add_argument("--residual_dim", type=int, default=768)
 parser.add_argument("--DEBUG", action='store_true', help="If set, use a smaller subset of data for quick debugging.")
 parser.add_argument("--classifier_weight_suffixes", type=str, default="_seed42,_seed123,_seed456", 
                     help="Comma-separated list of classifier weight suffixes to test (e.g., '_seed42,_seed123,_seed456')")
+parser.add_argument("--labeling", type=str, default="mpnet", help="mpnet, angle, simcse, llm")
+parser.add_argument("--automatic_concept_correction", action='store_true', help="If set, automatically set concept labels to 0 for concepts that are not present in the example according to the ground truth label. This is a form of training intervention to correct mislabeled concepts.")
 
 # ---- Pretrained model loading ----
 parser.add_argument("--pretrained_run_id", type=str, default=None,
