@@ -535,7 +535,7 @@ if __name__ == "__main__":
                 break
 
             # ======= GRPO STEP =======
-            grpo_concept_idx = torch.randint(0, len(concept_set), (1,)).item()
+            grpo_concept_idx = (i + e * len(train_loader)) % len(concept_set)
             grpo_intervene = [0] * len(concept_set)
             grpo_intervene[grpo_concept_idx] = intervention_value
 
