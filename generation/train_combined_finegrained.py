@@ -158,27 +158,27 @@ if __name__ == "__main__":
     encoded_test_dataset = encoded_test_dataset[:len(encoded_test_dataset)]
 
     concept_set = CFG.concept_set[args.dataset]
-    print("concept len: ", len(concept_set))
+    print("concept len: ", len(concept_set))  # concept_set: list of strings, len = num_concepts
 
     d_name = args.dataset.replace('/', '_')
-    prefix = "./"
+    label_prefix = "./"
     if args.labeling == 'mpnet':
-        prefix += "mpnet_acs"
+        label_prefix += "mpnet_acs"
     elif args.labeling == 'simcse':
-        prefix += "simcse_acs"
+        label_prefix += "simcse_acs"
     elif args.labeling == 'angle':
-        prefix += "angle_acs"
+        label_prefix += "angle_acs"
     elif args.labeling == 'llm':
-        prefix += "llm_labeling"
+        label_prefix += "llm_labeling"
 
-    prefix += "/"
-    prefix += d_name
-    prefix += "/"
+    label_prefix += "/"
+    label_prefix += d_name
+    label_prefix += "/"
     
-    print(f"Loading concept labels from: {prefix}")
-    train_similarity = np.load(prefix + "/concept_labels_train.npy")
+    print(f"Loading concept labels from: {label_prefix}")
+    train_similarity = np.load(label_prefix + "/concept_labels_train.npy")  # (N_train, num_concepts)
     if args.dataset == 'SetFit/sst2':
-        val_similarity = np.load(prefix + "/concept_labels_val.npy")
+        val_similarity = np.load(label_prefix + "/concept_labels_val.npy")  # (N_val, num_concepts)
 
     if args.automatic_concept_correction:
         start = time.time()
@@ -207,7 +207,7 @@ if __name__ == "__main__":
     if args.dataset == 'SetFit/sst2':
         val_loader = build_loaders(encoded_val_dataset, val_similarity, mode="valid")
     
-    test_similarity = np.zeros((len(encoded_test_dataset["label"]), 1))
+    test_similarity = np.zeros((len(encoded_test_dataset["label"]), 1), dtype=np.float32)
     test_loader = build_loaders(encoded_test_dataset, test_similarity, mode="test")
 
     print("preparing backbone")
@@ -832,63 +832,74 @@ if __name__ == "__main__":
     print(f"Steerability Top-20 Acc: {top20_correct / total_evals}")
     
     
-    ### TEST CONCEPT PREDICTION AFTER TRAINING (CONCEPT-INDEX ACCURACY)
-    print("eval concepts...")
-    metric = evaluate.load("accuracy")
-    concept_predictions = []
-
-    concept_top1_correct = 0
-    concept_top3_correct = 0
-    concept_top5_correct = 0
-    concept_top10_correct = 0
-    concept_top20_correct = 0
-    concept_total_evals = 0
+    ### TEST CONCEPT PREDICTION AFTER TRAINING (COSINE-SIMILARITY-BASED)
+    print("eval concepts (cosine similarity to MPNet labels)...")
+    concept_predictions = []  # list of tensors, each (B, num_concepts)
 
     for batch, _ in tqdm(test_loader, total=len(test_loader)):
+        # batch["input_ids"]: (B, seq_len), batch["attention_mask"]: (B, seq_len)
         batch = {k: v.to(device) for k, v in batch.items()}
         with torch.no_grad():
-            features = preLM(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"]).last_hidden_state
-            concepts, _, _, _ = cbl(features.float())
-        concept_predictions.append(eos_pooling(concepts, batch["attention_mask"]))
-    concept_predictions = torch.cat(concept_predictions, dim=0).detach().cpu()
+            features = preLM(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"]).last_hidden_state  # (B, seq_len, hidden_dim)
+            concepts, _, _, _ = cbl(features.float())  # concepts: (B, seq_len, num_concepts)
+        pooled_concepts = eos_pooling(concepts, batch["attention_mask"])  # (B, num_concepts)
+        concept_predictions.append(pooled_concepts.detach().cpu())
 
-    references = encoded_test_dataset["label"]
-    for idx, sample_pred in enumerate(concept_predictions):
-        sorted_indices = torch.argsort(sample_pred, descending=True)
-        true_label = references[idx]
+    # concept_predictions: (N_test, num_concepts)
+    concept_predictions = torch.cat(concept_predictions, dim=0)  # (N_test, num_concepts)
 
-        if true_label == sorted_indices[0].item():
-            concept_top1_correct += 1
-        if true_label in sorted_indices[:3].tolist():
-            concept_top3_correct += 1
-        if true_label in sorted_indices[:5].tolist():
-            concept_top5_correct += 1
-        if true_label in sorted_indices[:10].tolist():
-            concept_top10_correct += 1
-        if true_label in sorted_indices[:20].tolist():
-            concept_top20_correct += 1
-        concept_total_evals += 1
+    # Load test-time MPNet/ACS concept label vectors, if available
+    test_sim_path = label_prefix + "/concept_labels_test.npy"
+    if os.path.exists(test_sim_path):
+        test_similarity_np = np.load(test_sim_path)  # (N_test, num_concepts)
+        test_similarity = torch.tensor(test_similarity_np, dtype=torch.float32)  # (N_test, num_concepts)
 
-    pred = np.argmax(concept_predictions.numpy(), axis=-1)
-    metric.add_batch(predictions=pred, references=references)
-    print("Concept prediction accuracy:")
-    acc = metric.compute()
-    print(acc)
+        if test_similarity.shape != concept_predictions.shape:
+            print("[WARN] Shape mismatch between concept_predictions",
+                  f"{tuple(concept_predictions.shape)} and test_similarity {tuple(test_similarity.shape)}.")
+            print("       Skipping cosine-similarity-based concept evaluation.")
+        else:
+            # Average cosine similarity over test set (same objective as training cos_sim_cubed)
+            # concept_predictions: (N_test, num_concepts)
+            # test_similarity:     (N_test, num_concepts)
+            test_cos_sim = cos_sim_cubed(concept_predictions, test_similarity)  # scalar
+            test_cos_loss = -test_cos_sim.item()
 
-    print(f"Concept Top-1 Acc: {concept_top1_correct / concept_total_evals}")
-    print(f"Concept Top-3 Acc: {concept_top3_correct / concept_total_evals}")
-    print(f"Concept Top-5 Acc: {concept_top5_correct / concept_total_evals}")
-    print(f"Concept Top-10 Acc: {concept_top10_correct / concept_total_evals}")
-    print(f"Concept Top-20 Acc: {concept_top20_correct / concept_total_evals}")
+            print(f"Test concept cosine similarity (cos_sim_cubed): {test_cos_sim.item():.4f}")
+            print(f"Test concept cosine loss: {test_cos_loss:.4f}")
 
-    wandb.log({
-        "concept_prediction_accuracy": acc["accuracy"],
-        "concept_top1_acc": concept_top1_correct / concept_total_evals,
-        "concept_top3_acc": concept_top3_correct / concept_total_evals,
-        "concept_top5_acc": concept_top5_correct / concept_total_evals,
-        "concept_top10_acc": concept_top10_correct / concept_total_evals,
-        "concept_top20_acc": concept_top20_correct / concept_total_evals
-    })
+            # --- Concept-level top-k accuracy w.r.t. ACS labels ---
+            # Ground-truth concept per example: top concept from test_similarity
+            # true_concepts: (N_test,)
+            true_concepts = torch.argmax(test_similarity, dim=-1)  # indices in [0, num_concepts-1]
+
+            # Predicted ranking over concepts per example
+            # pred_sorted: (N_test, num_concepts), each row is concept indices sorted by predicted score
+            pred_sorted = torch.argsort(concept_predictions, dim=-1, descending=True)
+
+            topk_list = [1, 3, 5, 10, 20]
+            topk_hits = {k: 0 for k in topk_list}
+            total = concept_predictions.size(0)
+
+            for i in range(total):
+                gt_idx = true_concepts[i].item()
+                row = pred_sorted[i]
+                for k in topk_list:
+                    if k <= row.size(0) and gt_idx in row[:k].tolist():
+                        topk_hits[k] += 1
+
+            topk_acc = {f"test_concept_top{k}_acc": topk_hits[k] / total for k in topk_list}
+
+            for k in topk_list:
+                print(f"Test concept Top-{k} Acc (w.r.t. ACS top concept): {topk_acc[f'test_concept_top{k}_acc']:.4f}")
+
+            wandb.log({
+                "test_concept_cosine_similarity": float(test_cos_sim.item()),
+                "test_concept_cosine_loss": float(test_cos_loss),
+                **topk_acc,
+            })
+    else:
+        print(f"[WARN] {test_sim_path} not found. Skipping cosine-similarity-based concept evaluation.")
     
     
     
