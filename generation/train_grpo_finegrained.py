@@ -56,6 +56,7 @@ parser = argparse.ArgumentParser()
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 parser.add_argument("--dataset", type=str, default="SetFit/sst2")
 parser.add_argument("--batch_size", type=int, default=4)
+
 parser.add_argument("--epoch_multiplier", type=int, default=1, help="Epoch multiplier to increase total training steps (for debugging).")
 parser.add_argument("--max_length", type=int, default=350)
 parser.add_argument("--num_workers", type=int, default=0)
