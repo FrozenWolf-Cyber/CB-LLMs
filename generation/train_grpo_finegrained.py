@@ -166,7 +166,7 @@ if __name__ == "__main__":
     if args.pretrained_run_id is None and args.pretrained_path is None:
         raise ValueError("Must provide either --pretrained_run_id or --pretrained_path")
 
-    wandb.init(project="cbm-generation-new", name=f"grpo-{args.dataset}-seed{args.seed}-{args.pretrained_run_id}",
+    wandb.init(project="cbm-generation-new", name=f"grpo-finegrained-{args.dataset}-seed{args.seed}-{args.pretrained_run_id}",
                config=vars(args))
     
     run_name = wandb.run.id
