@@ -832,7 +832,7 @@ if __name__ == "__main__":
     print(f"Steerability Top-20 Acc: {top20_correct / total_evals}")
     
     
-    ### TEST CONCEPT PREDICTION AFTER TRAINING (LABEL-ALIGNED)
+    ### TEST CONCEPT PREDICTION AFTER TRAINING (CONCEPT-INDEX ACCURACY)
     print("eval concepts...")
     metric = evaluate.load("accuracy")
     concept_predictions = []
@@ -844,7 +844,6 @@ if __name__ == "__main__":
     concept_top20_correct = 0
     concept_total_evals = 0
 
-    # Pool token-level concepts to sentence-level features (B, #concepts)
     for batch, _ in tqdm(test_loader, total=len(test_loader)):
         batch = {k: v.to(device) for k, v in batch.items()}
         with torch.no_grad():
@@ -853,43 +852,26 @@ if __name__ == "__main__":
         concept_predictions.append(eos_pooling(concepts, batch["attention_mask"]))
     concept_predictions = torch.cat(concept_predictions, dim=0).detach().cpu()
 
-    # Map labels to the indices of their corresponding concepts
-    num_classes = CFG.class_num[args.dataset]
-    label_to_concept_indices = {lbl: [] for lbl in range(num_classes)}
-    for c_idx in range(len(concept_set)):
-        lbl = get_labels(c_idx, args.dataset)
-        if lbl is not None and 0 <= lbl < num_classes:
-            label_to_concept_indices[lbl].append(c_idx)
-
     references = encoded_test_dataset["label"]
-    pred_labels = []
     for idx, sample_pred in enumerate(concept_predictions):
-        # Aggregate concept scores into class scores using max over concepts in each class
-        class_scores = torch.full((num_classes,), float("-inf"))
-        for lbl, c_indices in label_to_concept_indices.items():
-            if len(c_indices) > 0:
-                class_scores[lbl] = sample_pred[c_indices].max()
-
-        sorted_labels = torch.argsort(class_scores, descending=True)
+        sorted_indices = torch.argsort(sample_pred, descending=True)
         true_label = references[idx]
 
-        if true_label == sorted_labels[0].item():
+        if true_label == sorted_indices[0].item():
             concept_top1_correct += 1
-        if true_label in sorted_labels[:3].tolist():
+        if true_label in sorted_indices[:3].tolist():
             concept_top3_correct += 1
-        if true_label in sorted_labels[:5].tolist():
+        if true_label in sorted_indices[:5].tolist():
             concept_top5_correct += 1
-        if true_label in sorted_labels[:10].tolist():
+        if true_label in sorted_indices[:10].tolist():
             concept_top10_correct += 1
-        if true_label in sorted_labels[:20].tolist():
+        if true_label in sorted_indices[:20].tolist():
             concept_top20_correct += 1
-
         concept_total_evals += 1
-        pred_labels.append(sorted_labels[0].item())
 
-    pred = np.array(pred_labels)
+    pred = np.argmax(concept_predictions.numpy(), axis=-1)
     metric.add_batch(predictions=pred, references=references)
-    print("Concept prediction accuracy (via class scores):")
+    print("Concept prediction accuracy:")
     acc = metric.compute()
     print(acc)
 
