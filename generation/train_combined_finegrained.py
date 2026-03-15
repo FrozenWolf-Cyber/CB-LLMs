@@ -832,18 +832,19 @@ if __name__ == "__main__":
     print(f"Steerability Top-20 Acc: {top20_correct / total_evals}")
     
     
-    ### TEST CONCEPT PREDICTION AFTER TRAINING
+    ### TEST CONCEPT PREDICTION AFTER TRAINING (LABEL-ALIGNED)
     print("eval concepts...")
     metric = evaluate.load("accuracy")
     concept_predictions = []
-    
+
     concept_top1_correct = 0
     concept_top3_correct = 0
     concept_top5_correct = 0
     concept_top10_correct = 0
     concept_top20_correct = 0
     concept_total_evals = 0
-    
+
+    # Pool token-level concepts to sentence-level features (B, #concepts)
     for batch, _ in tqdm(test_loader, total=len(test_loader)):
         batch = {k: v.to(device) for k, v in batch.items()}
         with torch.no_grad():
@@ -851,36 +852,53 @@ if __name__ == "__main__":
             concepts, _, _, _ = cbl(features.float())
         concept_predictions.append(eos_pooling(concepts, batch["attention_mask"]))
     concept_predictions = torch.cat(concept_predictions, dim=0).detach().cpu()
-    
+
+    # Map labels to the indices of their corresponding concepts
+    num_classes = CFG.class_num[args.dataset]
+    label_to_concept_indices = {lbl: [] for lbl in range(num_classes)}
+    for c_idx in range(len(concept_set)):
+        lbl = get_labels(c_idx, args.dataset)
+        if lbl is not None and 0 <= lbl < num_classes:
+            label_to_concept_indices[lbl].append(c_idx)
+
     references = encoded_test_dataset["label"]
+    pred_labels = []
     for idx, sample_pred in enumerate(concept_predictions):
-        sorted_indices = torch.argsort(sample_pred, descending=True)
+        # Aggregate concept scores into class scores using max over concepts in each class
+        class_scores = torch.full((num_classes,), float("-inf"))
+        for lbl, c_indices in label_to_concept_indices.items():
+            if len(c_indices) > 0:
+                class_scores[lbl] = sample_pred[c_indices].max()
+
+        sorted_labels = torch.argsort(class_scores, descending=True)
         true_label = references[idx]
-        
-        if true_label == sorted_indices[0].item():
+
+        if true_label == sorted_labels[0].item():
             concept_top1_correct += 1
-        if true_label in sorted_indices[:3].tolist():
+        if true_label in sorted_labels[:3].tolist():
             concept_top3_correct += 1
-        if true_label in sorted_indices[:5].tolist():
+        if true_label in sorted_labels[:5].tolist():
             concept_top5_correct += 1
-        if true_label in sorted_indices[:10].tolist():
+        if true_label in sorted_labels[:10].tolist():
             concept_top10_correct += 1
-        if true_label in sorted_indices[:20].tolist():
+        if true_label in sorted_labels[:20].tolist():
             concept_top20_correct += 1
+
         concept_total_evals += 1
-        
-    pred = np.argmax(concept_predictions.numpy(), axis=-1)
+        pred_labels.append(sorted_labels[0].item())
+
+    pred = np.array(pred_labels)
     metric.add_batch(predictions=pred, references=references)
-    print("Concept prediction accuracy:")
+    print("Concept prediction accuracy (via class scores):")
     acc = metric.compute()
     print(acc)
-    
+
     print(f"Concept Top-1 Acc: {concept_top1_correct / concept_total_evals}")
     print(f"Concept Top-3 Acc: {concept_top3_correct / concept_total_evals}")
     print(f"Concept Top-5 Acc: {concept_top5_correct / concept_total_evals}")
     print(f"Concept Top-10 Acc: {concept_top10_correct / concept_total_evals}")
     print(f"Concept Top-20 Acc: {concept_top20_correct / concept_total_evals}")
-    
+
     wandb.log({
         "concept_prediction_accuracy": acc["accuracy"],
         "concept_top1_acc": concept_top1_correct / concept_total_evals,
@@ -913,6 +931,7 @@ if __name__ == "__main__":
     set_seed(args.seed)
     
     pred = []
+    c = 0
     perplexity = evaluate.load("perplexity", module_type="metric")
     input_ids = torch.tensor([tokenizer.encode("")]).to(device)
     for i in tqdm(range(100)):
@@ -922,6 +941,7 @@ if __name__ == "__main__":
             pred.append(tokenizer.decode(text_ids[0], skip_special_tokens=True ))
             if len(pred[-1].split()) > 30:
                 continue
+            c += 1
             perplexity.add_batch(predictions=[pred[i]])
 
         ## print some generated texts
@@ -941,9 +961,13 @@ if __name__ == "__main__":
     torch.cuda.empty_cache()
 
     print("Perplexity: (under 30 tokens)")
-    perplexity = perplexity.compute(model_id='meta-llama/Meta-Llama-3-8B', max_length=100)['mean_perplexity']
-    print(perplexity)
-    wandb.log({"perplexity_under_30_tokens": perplexity})
+    if c > 0:
+        perplexity = perplexity.compute(model_id='meta-llama/Meta-Llama-3-8B', max_length=100)['mean_perplexity']
+        print(perplexity)
+        wandb.log({"perplexity_under_30_tokens": perplexity})
+    else:
+        print("No generated texts under 30 tokens to compute perplexity.")
+        wandb.log({"perplexity_under_30_tokens": None})
     
     print("Now for all tokens:")
     perplexity = evaluate.load("perplexity", module_type="metric")
