@@ -90,24 +90,25 @@ parser.add_argument("--concept_distill_weight", type=float, default=0.0, help="W
 
 
 class ClassificationDataset(torch.utils.data.Dataset):
-    def __init__(self, encoded_text):
+    def __init__(self, encoded_text, s):
         self.encoded_text = encoded_text
+        self.s = s
 
 
     def __getitem__(self, idx):
         t = {key: torch.tensor(values[idx]) for key, values in self.encoded_text.items()}
-        return t
+        y = torch.FloatTensor(self.s[idx])
+        return t, y
 
     def __len__(self):
         return len(self.encoded_text['input_ids'])
 
 
-def build_loaders(encoded_text, mode):
-    dataset = ClassificationDataset(encoded_text)
+def build_loaders(encoded_text, s, mode):
+    dataset = ClassificationDataset(encoded_text, s)
     dataloader = torch.utils.data.DataLoader(dataset, batch_size=args.batch_size, num_workers=args.num_workers,
                                              shuffle=True if mode == "train" else False)
     return dataloader
-
 
 def find_pretrained_checkpoint(run_id, dataset):
     """Locate the pretrained checkpoint folder from a wandb run_id.
@@ -532,7 +533,7 @@ if __name__ == "__main__":
         }
 
         
-        for i, batch in tqdm(enumerate(train_loader), total=len(train_loader)):
+        for i, (batch, batch_sim) in tqdm(enumerate(train_loader), total=len(train_loader)):
             if args.grpo_steps_per_epoch > 0 and i >= args.grpo_steps_per_epoch:
                 break
 
