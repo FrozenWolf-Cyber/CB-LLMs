@@ -539,7 +539,12 @@ if __name__ == "__main__":
             "grpo_total_loss": [],
             "grpo_mean_reward": [],
             "non_zero_grpo_advantages": [],
-            "concept_distill_loss": []
+            "concept_distill_loss": [],
+            "grpo_steer_top1": [],
+            "grpo_steer_top3": [],
+            "grpo_steer_top5": [],
+            "grpo_steer_top20": [],
+            "grpo_steer_cos_sim": [],
         }
 
         
@@ -598,6 +603,23 @@ if __name__ == "__main__":
                         print("[GRPO DEBUG] concept_features_grpo shape:", concept_features_grpo.shape)
                         print("[GRPO DEBUG] sims_grpo shape:", sims_grpo.shape)
                         print("[GRPO DEBUG] v_tensor_grpo shape:", v_tensor_grpo.shape)
+
+                    # --- Steerability metrics for this GRPO step (using MPNet sims) ---
+                    # Top-k accuracy of target concept under MPNet similarities
+                    sorted_indices = torch.argsort(sims_grpo, dim=1, descending=True)  # (N_non_empty, C)
+                    steer_top1 = (sorted_indices[:, 0] == grpo_concept_idx).float().mean().item()
+                    steer_top3 = (sorted_indices[:, :3] == grpo_concept_idx).any(dim=1).float().mean().item()
+                    steer_top5 = (sorted_indices[:, :5] == grpo_concept_idx).any(dim=1).float().mean().item()
+                    steer_top20 = (sorted_indices[:, :20] == grpo_concept_idx).any(dim=1).float().mean().item()
+                    # Per-sample cosine-sim-cubed between sims and one-hot target (no reduction)
+                    steer_cos_vals = cos_sim_cubed(sims_grpo, v_tensor_grpo.float(), reduce=False)  # (N_non_empty,)
+                    steer_cos_mean = steer_cos_vals.mean().item()
+
+                    training_losses["grpo_steer_top1"].append(steer_top1)
+                    training_losses["grpo_steer_top3"].append(steer_top3)
+                    training_losses["grpo_steer_top5"].append(steer_top5)
+                    training_losses["grpo_steer_top20"].append(steer_top20)
+                    training_losses["grpo_steer_cos_sim"].append(steer_cos_mean)
 
                     # Compute GRPO rewards per trajectory according to selected reward mode
                     max_k_cutoff = 20  # only trajectories where target is within top-20 get positive reward in aggressive mode
