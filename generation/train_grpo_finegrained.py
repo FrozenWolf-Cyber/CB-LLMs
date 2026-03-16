@@ -86,6 +86,8 @@ parser.add_argument("--grpo_gen_length", type=int, default=100, help="Max genera
 parser.add_argument("--grpo_clip_advantage", type=float, default=5.0, help="Clip GRPO advantages to [-clip, clip].")
 parser.add_argument("--grpo_lr", type=float, default=1e-5, help="Learning rate for GRPO fine-tuning.")
 parser.add_argument("--grpo_steps_per_epoch", type=int, default=-1, help="Max GRPO steps per epoch. -1 = full dataset.")
+parser.add_argument("--grpo_steps_per_concept", type=int, default=-1,
+                    help="If >0, override the effective number of epochs so that total GRPO steps scale as: original_epochs * num_concepts * grpo_steps_per_concept.")
 parser.add_argument("--concept_distill_weight", type=float, default=0.0, help="Weight for concept prediction distillation loss (CE between policy and reference model concepts on real data). 0 disables it.")
 parser.add_argument("--grpo_reward_mode", type=str, default="cosine",
                     choices=["cosine", "aggressive"],
@@ -521,7 +523,12 @@ if __name__ == "__main__":
         cbl.train()
 
     start = time.time()
-    epochs = args.grpo_epochs*args.epoch_multiplier
+    # Base number of epochs
+    epochs = args.grpo_epochs * args.epoch_multiplier
+    # If requested, override effective epochs so that total GRPO steps
+    # scale with (num_concepts * grpo_steps_per_concept).
+    if args.grpo_steps_per_concept is not None and args.grpo_steps_per_concept > 0:
+        epochs = args.grpo_epochs * len(concept_set) * args.grpo_steps_per_concept
     for e in range(epochs):
         print("Epoch ", e+1, ":")
         preLM.train()
