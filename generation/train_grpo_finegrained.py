@@ -87,6 +87,9 @@ parser.add_argument("--grpo_clip_advantage", type=float, default=5.0, help="Clip
 parser.add_argument("--grpo_lr", type=float, default=1e-5, help="Learning rate for GRPO fine-tuning.")
 parser.add_argument("--grpo_steps_per_epoch", type=int, default=-1, help="Max GRPO steps per epoch. -1 = full dataset.")
 parser.add_argument("--concept_distill_weight", type=float, default=0.0, help="Weight for concept prediction distillation loss (CE between policy and reference model concepts on real data). 0 disables it.")
+parser.add_argument("--grpo_reward_mode", type=str, default="cosine",
+                    choices=["cosine", "aggressive"],
+                    help="Reward type for GRPO: 'cosine' uses cos_sim_cubed vs one-hot target; 'aggressive' uses inverse-rank * similarity for the target concept with a top-k cutoff.")
 
 
 class ClassificationDataset(torch.utils.data.Dataset):
@@ -589,8 +592,33 @@ if __name__ == "__main__":
                         print("[GRPO DEBUG] sims_grpo shape:", sims_grpo.shape)
                         print("[GRPO DEBUG] v_tensor_grpo shape:", v_tensor_grpo.shape)
 
+                    # Compute GRPO rewards per trajectory according to selected reward mode
+                    max_k_cutoff = 20  # only trajectories where target is within top-20 get positive reward in aggressive mode
                     for idx, g in enumerate(non_empty_indices):
-                        r = cos_sim_cubed(sims_grpo[idx:idx+1], v_tensor_grpo[idx:idx+1].float()).item()
+                        sims_vec = sims_grpo[idx]  # (C,)
+
+                        if args.grpo_reward_mode == "cosine":
+                            # Original reward: cosine-similarity-cubed between full distribution and one-hot target
+                            r = cos_sim_cubed(sims_vec.unsqueeze(0), v_tensor_grpo[idx:idx+1].float()).item()
+                        else:  # aggressive inverse-rank * similarity reward
+                            # Rank of target concept (1-based)
+                            sorted_vals, sorted_idx = torch.sort(sims_vec, descending=True)
+                            # position where sorted_idx == grpo_concept_idx
+                            rank_tensor = (sorted_idx == grpo_concept_idx).nonzero(as_tuple=False)
+                            if rank_tensor.numel() == 0:
+                                # target concept not found (should not happen), give zero reward
+                                r = 0.0
+                            else:
+                                rank = int(rank_tensor[0].item()) + 1  # 1-based rank
+                                if rank > max_k_cutoff:
+                                    # Outside top-k cutoff → zero reward
+                                    r = 0.0
+                                else:
+                                    sim_j = float(sims_vec[grpo_concept_idx].item())
+                                    sim_j = max(sim_j, 0.0)  # only reward positive similarity
+                                    # Option C: inverse-rank * similarity
+                                    r = (1.0 / rank) * sim_j
+
                         grpo_rewards[g] = r
 
                 if args.DEBUG:
