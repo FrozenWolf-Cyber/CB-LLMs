@@ -884,6 +884,14 @@ if __name__ == "__main__":
             print(f"Test concept cosine similarity (cos_sim_cubed): {test_cos_sim.item():.4f}")
             print(f"Test concept cosine loss: {test_cos_loss:.4f}")
 
+            # --- Raw (non-cubed) cosine similarity between prediction and ACS vectors ---
+            # Normalize along the concept dimension and compute mean cosine similarity
+            pred_norm = F.normalize(concept_predictions, p=2, dim=-1)
+            label_norm = F.normalize(test_similarity, p=2, dim=-1)
+            test_cos_raw = (pred_norm * label_norm).sum(dim=-1).mean().item()
+
+            print(f"Test concept cosine similarity (raw): {test_cos_raw:.4f}")
+
             # --- Concept-level top-k accuracy w.r.t. ACS labels ---
             # Ground-truth concept per example: top concept from test_similarity
             # true_concepts: (N_test,)
@@ -895,24 +903,40 @@ if __name__ == "__main__":
 
             topk_list = [1, 3, 5, 10, 20]
             topk_hits = {k: 0 for k in topk_list}
+            topk_iou_sums = {k: 0.0 for k in topk_list}
             total = concept_predictions.size(0)
 
             for i in range(total):
                 gt_idx = true_concepts[i].item()
                 row = pred_sorted[i]
+                # For IoU, also collect top-k sets from GT similarity and predictions
+                for k in topk_list:
+                    k_clipped = min(k, row.size(0))
+                    gt_topk = torch.topk(test_similarity[i], k=k_clipped, dim=-1).indices.tolist()
+                    pred_topk = row[:k_clipped].tolist()
+                    gt_set = set(gt_topk)
+                    pred_set = set(pred_topk)
+                    inter = len(gt_set & pred_set)
+                    union = len(gt_set | pred_set)
+                    if union > 0:
+                        topk_iou_sums[k] += inter / union
                 for k in topk_list:
                     if k <= row.size(0) and gt_idx in row[:k].tolist():
                         topk_hits[k] += 1
 
             topk_acc = {f"test_concept_top{k}_acc": topk_hits[k] / total for k in topk_list}
+            topk_iou = {f"test_concept_top{k}_iou": topk_iou_sums[k] / total for k in topk_list}
 
             for k in topk_list:
                 print(f"Test concept Top-{k} Acc (w.r.t. ACS top concept): {topk_acc[f'test_concept_top{k}_acc']:.4f}")
+                print(f"Test concept Top-{k} IoU (GT vs pred top-k concepts): {topk_iou[f'test_concept_top{k}_iou']:.4f}")
 
             wandb.log({
                 "test_concept_cosine_similarity": float(test_cos_sim.item()),
                 "test_concept_cosine_loss": float(test_cos_loss),
+                "test_concept_cosine_raw": float(test_cos_raw),
                 **topk_acc,
+                **topk_iou,
             })
     else:
         print(f"[WARN] {test_sim_path} not found. Skipping cosine-similarity-based concept evaluation.")
