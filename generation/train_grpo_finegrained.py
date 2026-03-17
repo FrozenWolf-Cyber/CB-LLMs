@@ -92,6 +92,12 @@ parser.add_argument("--concept_distill_weight", type=float, default=0.0, help="W
 parser.add_argument("--grpo_reward_mode", type=str, default="cosine",
                     choices=["cosine", "aggressive"],
                     help="Reward type for GRPO: 'cosine' uses cos_sim_cubed vs one-hot target; 'aggressive' uses inverse-rank * similarity for the target concept with a top-k cutoff.")
+parser.add_argument("--grpo_active_concepts_k", type=int, default=-1,
+                    help="If >0, restrict GRPO to intervening on only the first K concepts (by index) while still loading all concepts for evaluation.")
+parser.add_argument("--grpo_subset_renorm", action="store_true",
+                    help="If set, restrict reward computation to a top-K subset of concepts (plus the target concept) and renormalize similarities before applying the chosen reward mode.")
+parser.add_argument("--grpo_subset_topk", type=int, default=20,
+                    help="Top-K cutoff used when --grpo_subset_renorm is enabled (default 20).")
 
 
 class ClassificationDataset(torch.utils.data.Dataset):
@@ -253,6 +259,15 @@ if __name__ == "__main__":
     concept_set = CFG.concept_set[args.dataset]
     print("concept len: ", len(concept_set))  # concept_set: list of strings, len = num_concepts
 
+    # Optionally cap the active concept set used for GRPO interventions and some evaluations.
+    # We still load all concepts, but only indices in active_concept_indices will be used as targets.
+    if args.grpo_active_concepts_k is not None and args.grpo_active_concepts_k > 0:
+        k_cap = min(args.grpo_active_concepts_k, len(concept_set))
+        active_concept_indices = list(range(k_cap))
+        print(f"[GRPO] Using only first {k_cap} concepts as active GRPO targets.")
+    else:
+        active_concept_indices = list(range(len(concept_set)))
+
     d_name = args.dataset.replace('/', '_')
     label_prefix = "./"
     if args.labeling == 'mpnet':
@@ -413,6 +428,35 @@ if __name__ == "__main__":
     concept_features_grpo = F.normalize(concept_features_grpo, p=2, dim=1)  # (C, D) L2-normalized
     print("Loaded MPNET for GRPO similarity scoring.")
 
+    # Load RoBERTa concept classifiers for GRPO on-the-fly ACS-style filtering
+    grpo_classifiers = []
+    roberta_tokenizer_grpo = RobertaTokenizerFast.from_pretrained('roberta-base')
+    d_grpo = args.dataset.replace('/', '_')
+    grpo_clf_paths = [d_grpo + "_classifier.pt"]
+    clf_suffixes = [s.strip() for s in args.classifier_weight_suffixes.split(',')]
+    for suffix in clf_suffixes:
+        grpo_clf_paths.append(d_grpo + f"_classifier{suffix}.pt")
+
+    for clf_path in grpo_clf_paths:
+        if not os.path.exists(clf_path):
+            print(f"[GRPO] Warning: classifier weights not found at {clf_path}, skipping.")
+            continue
+        try:
+            clf = Roberta_classifier(len(concept_set)).to(device)
+            clf.load_state_dict(torch.load(clf_path, map_location=device))
+            clf.eval()
+            for p in clf.parameters():
+                p.requires_grad = False
+            try:
+                clf = torch.compile(clf)
+            except Exception as compile_err:
+                print(f"  [GRPO] Warning: torch.compile failed for {clf_path}, using eager mode: {compile_err}")
+            grpo_classifiers.append(clf)
+        except Exception as e:
+            print(f"[GRPO] Warning: failed to load classifier from {clf_path}: {e}")
+
+    print(f"Loaded {len(grpo_classifiers)} RoBERTa classifiers for GRPO concept filtering.")
+
     print("start GRPO training...")
     d_name = args.dataset.replace('/', '_')
     prefix = "./"
@@ -545,6 +589,7 @@ if __name__ == "__main__":
             "grpo_steer_top5": [],
             "grpo_steer_top20": [],
             "grpo_steer_cos_sim": [],
+            "grpo_reg_loss": [],
         }
 
         
@@ -553,7 +598,8 @@ if __name__ == "__main__":
                 break
 
             # ======= GRPO STEP =======
-            grpo_concept_idx = (i + e * len(train_loader)) % len(concept_set)
+            # Cycle through active_concept_indices rather than all concepts
+            grpo_concept_idx = active_concept_indices[(i + e * len(train_loader)) % len(active_concept_indices)]
             grpo_intervene = [0] * len(concept_set)
             grpo_intervene[grpo_concept_idx] = intervention_value
 
@@ -595,6 +641,42 @@ if __name__ == "__main__":
                     v_target_grpo = [0] * len(concept_set)
                     v_target_grpo[grpo_concept_idx] = 1.0
                     v_tensor_grpo = torch.tensor(v_target_grpo).to(device).unsqueeze(0).expand(len(non_empty_texts), -1)  # (N_non_empty, C)
+
+                    # If available, use RoBERTa concept classifiers to filter/weight ACS similarities
+                    if grpo_classifiers:
+                        rob_enc = roberta_tokenizer_grpo(
+                            non_empty_texts,
+                            return_tensors='pt', truncation=True,
+                            max_length=512, padding=True
+                        ).to(device)
+                        rob_input = {"input_ids": rob_enc["input_ids"], "attention_mask": rob_enc["attention_mask"]}
+
+                        total_probs = torch.zeros(len(non_empty_texts), len(concept_set), device=device)
+                        for grpo_clf in grpo_classifiers:
+                            clf_logits = grpo_clf(rob_input)  # (N_non_empty, C)
+                            probs = F.softmax(clf_logits, dim=-1)
+                            total_probs += probs
+                        total_probs /= len(grpo_classifiers)
+
+                        # Element-wise filter: downweight concepts RoBERTa deems unlikely
+                        sims_grpo = sims_grpo * total_probs
+
+                    # Optional subset renormalization: focus reward on top-K concepts (+ target)
+                    if args.grpo_subset_renorm:
+                        K = min(args.grpo_subset_topk, sims_grpo.size(1))
+                        sims_mod = torch.zeros_like(sims_grpo)
+                        for row_idx in range(sims_grpo.size(0)):
+                            sims_vec = sims_grpo[row_idx]
+                            top_vals, top_idx = torch.topk(sims_vec, K)
+                            # Ensure target concept is included in the subset
+                            if grpo_concept_idx not in top_idx:
+                                min_pos = torch.argmin(top_vals)
+                                top_idx[min_pos] = grpo_concept_idx
+                                top_vals[min_pos] = sims_vec[grpo_concept_idx]
+                            # L2-normalize the subset to reduce scale issues
+                            top_vals = top_vals / (top_vals.norm(p=2) + 1e-8)
+                            sims_mod[row_idx, top_idx] = top_vals
+                        sims_grpo = sims_mod
 
                     # DEBUG: confirm shapes for GRPO reward computation
                     if args.DEBUG and e == 0 and i == 0:
@@ -763,6 +845,10 @@ if __name__ == "__main__":
                 # --- Total GRPO loss ---
                 grpo_total_loss = args.grpo_loss_weight * policy_loss + args.grpo_kl_weight * kl_loss + args.concept_distill_weight * concept_distill_loss
 
+                # Add sparsity regularization on concept weights to encourage sparse concepts
+                reg_loss = elastic_net_penalty(cbl.fc.weight[:, :len(concept_set)])
+                grpo_total_loss = grpo_total_loss + reg_loss
+
                 opt_prelm.zero_grad()
                 opt_cbl.zero_grad()
                 grpo_total_loss.backward()
@@ -774,6 +860,7 @@ if __name__ == "__main__":
                 training_losses["concept_distill_loss"].append(concept_distill_loss.detach().cpu().numpy())
                 training_losses["grpo_total_loss"].append(grpo_total_loss.detach().cpu().numpy())
                 training_losses["grpo_mean_reward"].append(grpo_rewards_t.mean().item())
+                training_losses["grpo_reg_loss"].append(reg_loss.detach().cpu().numpy())
                 
             training_losses["non_zero_grpo_advantages"].append((grpo_advantages.abs() > 1e-8).sum().item())
             if args.DEBUG:
@@ -877,8 +964,11 @@ if __name__ == "__main__":
     special_tokens_mask = torch.tensor([128000, 128001]).to(device)  # (2,)
     ce_loss_fn = torch.nn.CrossEntropyLoss(reduction="none")  # CE over classes
 
+    # Use either the full concept set or the capped active subset for steerability testing
+    steer_concept_indices = active_concept_indices if args.grpo_active_concepts_k is not None and args.grpo_active_concepts_k > 0 else range(len(concept_set))
+
     with torch.no_grad():
-        for j in tqdm(range(len(concept_set)), desc="Steerability concepts"):
+        for j in tqdm(steer_concept_indices, desc="Steerability concepts"):
             v = [0] * len(concept_set)  # (C,)
             v[j] = intervention_value
 
