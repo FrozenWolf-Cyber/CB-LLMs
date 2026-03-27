@@ -137,27 +137,36 @@ def generate_steerability_texts(preLM, cbl, tokenizer, concept_set, dataset, sam
     special_tokens_mask = torch.tensor([128000, 128001]).to(device)
     all_texts = []
 
+    chunk_size = 25
+
     with torch.no_grad():
         for concept_idx in tqdm(range(len(concept_set)), desc="Steerability generation"):
             v = [0] * len(concept_set)
             v[concept_idx] = intervention_value
-
-            text_ids_batch, _ = cbl.generate_batch(
-                input_ids,
-                preLM,
-                num_samples=samples_per_concept,
-                intervene=v,
-                length=50,
-            )
-
             concept_texts = []
-            for sample_idx in range(samples_per_concept):
-                decoded_text_ids = tokenizer.decode(
-                    text_ids_batch[sample_idx][~torch.isin(text_ids_batch[sample_idx], special_tokens_mask)]
+            generated_so_far = 0
+
+            while generated_so_far < samples_per_concept:
+                current_batch = min(chunk_size, samples_per_concept - generated_so_far)
+                text_ids_batch, _ = cbl.generate_batch(
+                    input_ids,
+                    preLM,
+                    num_samples=current_batch,
+                    intervene=v,
+                    length=50,
                 )
-                concept_texts.append(decoded_text_ids)
-                # Keep key format aligned with train scripts
-                wandb.log({f"steerability_sample_{concept_set[concept_idx]}_{sample_idx+1}": decoded_text_ids})
+
+                for b in range(current_batch):
+                    decoded_text_ids = tokenizer.decode(
+                        text_ids_batch[b][~torch.isin(text_ids_batch[b], special_tokens_mask)]
+                    )
+                    concept_texts.append(decoded_text_ids)
+                    # Keep key format aligned with train scripts
+                    wandb.log({
+                        f"steerability_sample_{concept_set[concept_idx]}_{generated_so_far + b + 1}": decoded_text_ids
+                    })
+
+                generated_so_far += current_batch
 
             print(f"Concept '{concept_set[concept_idx]}' sample preview:")
             for k in range(min(print_k, len(concept_texts))):
