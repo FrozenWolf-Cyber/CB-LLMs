@@ -1,15 +1,13 @@
 import argparse
 import os
 import pickle
+import glob
 import torch
-import torch.nn.functional as F
 import numpy as np
 import evaluate
 from tqdm.auto import tqdm
-from datasets import load_dataset, concatenate_datasets
 import config as CFG
 from transformers import LlamaConfig, LlamaModel, AutoTokenizer, RobertaTokenizerFast
-from peft import LoraConfig, TaskType, get_peft_model
 from modules import CBLResidual, CBL, Roberta_classifier
 import wandb
 
@@ -33,138 +31,172 @@ parser.add_argument("--dataset", type=str, required=True,
 parser.add_argument("--seed", type=int, default=42, help="Random seed for steerability test generation")
 
 
-def get_model_path_for_run(run_id, dataset, epoch, is_best=False):
+def infer_run_layout(run_id, dataset, run_config):
     """
-    Construct the model path based on run_id, dataset, and epoch.
-    For SetFit/sst2, best model doesn't have 'low_score' prefix.
-    For others, we use last epoch.
-    """
-    d_name = dataset.replace('/', '_')
-    prefix = f"./from_pretained_llama3_lora_cbm_{run_id}/{d_name}/"
-    
-    model_name = "llama3"
-    cbl_name = "cbl"
-    
-    if is_best:
-        # Best model path (no low_score prefix)
-        peft_path = prefix + model_name + "_epoch_" + str(epoch)
-        cbl_path = prefix + cbl_name + "_epoch_" + str(epoch) + ".pt"
-    else:
-        # Check if it's a low_score epoch or regular
-        best_path = prefix + model_name + "_epoch_" + str(epoch)
-        low_score_path = prefix + model_name + "_low_score_epoch_" + str(epoch)
-        
-        if os.path.exists(best_path):
-            peft_path = best_path
-            cbl_path = prefix + cbl_name + "_epoch_" + str(epoch) + ".pt"
-        elif os.path.exists(low_score_path):
-            peft_path = low_score_path
-            cbl_path = prefix + cbl_name + "_low_score_epoch_" + str(epoch) + ".pt"
-        else:
-            return None, None
-    
-    return peft_path, cbl_path
-
-
-def find_best_epoch(run_id, dataset):
-    """
-    Find the best epoch for a given run.
-    For SetFit/sst2: find the epoch with best validation loss (the one without 'low_score' prefix)
-    For others: return the last available epoch
+    Infer whether this run is from train_combined.py (cbm) or train_grpo.py (grpo),
+    and return the corresponding checkpoint prefix.
     """
     d_name = dataset.replace('/', '_')
-    prefix = f"./from_pretained_llama3_lora_cbm_{run_id}/{d_name}/"
-    
-    if not os.path.exists(prefix):
-        print(f"Warning: Path {prefix} does not exist")
+    cbm_prefix = f"./from_pretained_llama3_lora_cbm_{run_id}/{d_name}/"
+    grpo_prefix = f"./from_pretained_llama3_lora_grpo_{run_id}/{d_name}/"
+
+    cbm_exists = os.path.isdir(cbm_prefix)
+    grpo_exists = os.path.isdir(grpo_prefix)
+
+    if cbm_exists and not grpo_exists:
+        return "cbm", cbm_prefix
+    if grpo_exists and not cbm_exists:
+        return "grpo", grpo_prefix
+
+    # If both/neither exist, use config hints.
+    if "grpo_epochs" in run_config and "pretrained_run_id" in run_config:
+        return "grpo", grpo_prefix
+    if "discrimination_loss" in run_config:
+        return "cbm", cbm_prefix
+
+    # Final fallback preference.
+    if cbm_exists:
+        return "cbm", cbm_prefix
+    if grpo_exists:
+        return "grpo", grpo_prefix
+    return None, None
+
+
+def parse_epoch_from_path(path, marker):
+    basename = os.path.basename(path)
+    try:
+        return int(basename.replace(marker, "").replace(".pt", ""))
+    except Exception:
         return None
-    
-    model_name = "llama3"
-    epochs = CFG.epoch[dataset]
-    
-    if dataset == 'SetFit/sst2':
-        # For SetFit/sst2, find the best epoch (the one saved without 'low_score')
-        for e in range(epochs, 0, -1):
-            best_path = prefix + model_name + "_epoch_" + str(e)
-            if os.path.exists(best_path):
-                return e
-        # Fallback: check for any available epoch
-        for e in range(epochs, 0, -1):
-            low_score_path = prefix + model_name + "_low_score_epoch_" + str(e)
-            if os.path.exists(low_score_path):
-                print(f"Warning: Only found low_score model for epoch {e}")
-                return e
+
+
+def find_eval_checkpoint(prefix, run_type, dataset):
+    """
+    Return checkpoint paths (peft_path, cbl_path, epoch, is_low_score) for evaluation.
+
+    train_combined.py:
+      - SetFit/sst2: prefers cbl_epoch_{best}.pt, fallback cbl_low_score_epoch_{last}.pt
+      - others: usually cbl_epoch_{last}.pt
+
+    train_grpo.py:
+      - uses cbl_epoch_{epoch}.pt
+    """
+    if not os.path.isdir(prefix):
+        return None, None, None, None
+
+    cbl_best_files = sorted(glob.glob(os.path.join(prefix, "cbl_epoch_*.pt")))
+    cbl_low_files = sorted(glob.glob(os.path.join(prefix, "cbl_low_score_epoch_*.pt")))
+
+    best_epoch = None
+    is_low_score = False
+
+    if cbl_best_files:
+        epochs = [parse_epoch_from_path(f, "cbl_epoch_") for f in cbl_best_files]
+        epochs = [e for e in epochs if e is not None]
+        if epochs:
+            best_epoch = max(epochs)
+            is_low_score = False
+
+    # For combined on SetFit/sst2, fallback to low_score if no best checkpoint exists.
+    if best_epoch is None and cbl_low_files:
+        low_epochs = [parse_epoch_from_path(f, "cbl_low_score_epoch_") for f in cbl_low_files]
+        low_epochs = [e for e in low_epochs if e is not None]
+        if low_epochs:
+            best_epoch = max(low_epochs)
+            is_low_score = True
+
+    if best_epoch is None:
+        return None, None, None, None
+
+    if is_low_score:
+        peft_path = os.path.join(prefix, f"llama3_low_score_epoch_{best_epoch}")
+        cbl_path = os.path.join(prefix, f"cbl_low_score_epoch_{best_epoch}.pt")
     else:
-        # For other datasets, return the last available epoch
-        for e in range(epochs, 0, -1):
-            epoch_path = prefix + model_name + "_epoch_" + str(e)
-            if os.path.exists(epoch_path):
-                return e
-    
-    return None
+        peft_path = os.path.join(prefix, f"llama3_epoch_{best_epoch}")
+        cbl_path = os.path.join(prefix, f"cbl_epoch_{best_epoch}.pt")
+
+    if not os.path.isdir(peft_path):
+        return None, None, None, None
+    if not os.path.isfile(cbl_path):
+        return None, None, None, None
+
+    return peft_path, cbl_path, best_epoch, is_low_score
 
 
-def find_all_available_epochs(run_id, dataset):
+def generate_steerability_texts(preLM, cbl, tokenizer, concept_set, dataset, samples_per_concept, print_k=3):
     """
-    Find all available epochs for a given run.
+    Generate steerability texts with batched generation for each concept.
+    Returns: list of lists, shape (num_concepts, samples_per_concept)
     """
-    d_name = dataset.replace('/', '_')
-    prefix = f"./from_pretained_llama3_lora_cbm_{run_id}/{d_name}/"
-    
-    if not os.path.exists(prefix):
-        return []
-    
-    model_name = "llama3"
-    epochs = CFG.epoch[dataset]
-    available_epochs = []
-    
-    for e in range(1, epochs + 1):
-        best_path = prefix + model_name + "_epoch_" + str(e)
-        low_score_path = prefix + model_name + "_low_score_epoch_" + str(e)
-        if os.path.exists(best_path) or os.path.exists(low_score_path):
-            available_epochs.append(e)
-    
-    return available_epochs
-
-
-def run_steerability_test(preLM, cbl, tokenizer, roberta_tokenizer, classifier, concept_set, dataset, seed=42):
-    """
-    Run steerability test and return accuracy.
-    """
-    set_seed(seed)
-    
     if dataset == "dbpedia_14":
         intervention_value = 150
     else:
         intervention_value = 100
-    
-    pred = []
-    text = []
-    acc = evaluate.load("accuracy")
-    
+
+    input_ids = torch.tensor([tokenizer.encode("")]).to(device)
+    special_tokens_mask = torch.tensor([128000, 128001]).to(device)
+    all_texts = []
+
     with torch.no_grad():
-        for i in tqdm(range(100 // len(concept_set)), desc="Steerability test"):
-            input_ids = torch.tensor([tokenizer.encode("")]).to(device)
-            for j in range(len(concept_set)):
-                v = [0] * len(concept_set)
-                v[j] = intervention_value
-                text_ids, _ = cbl.generate(input_ids, preLM, intervene=v)
+        for concept_idx in tqdm(range(len(concept_set)), desc="Steerability generation"):
+            v = [0] * len(concept_set)
+            v[concept_idx] = intervention_value
+
+            text_ids_batch, _ = cbl.generate_batch(
+                input_ids,
+                preLM,
+                num_samples=samples_per_concept,
+                intervene=v,
+                length=50,
+            )
+
+            concept_texts = []
+            for sample_idx in range(samples_per_concept):
                 decoded_text_ids = tokenizer.decode(
-                    text_ids[0][~torch.isin(text_ids[0], torch.tensor([128000, 128001]).to(device))]
+                    text_ids_batch[sample_idx][~torch.isin(text_ids_batch[sample_idx], special_tokens_mask)]
                 )
-                text.append(decoded_text_ids)
-                roberta_text_ids = torch.tensor([roberta_tokenizer.encode(decoded_text_ids)]).to(device)
-                roberta_input = {
-                    "input_ids": roberta_text_ids,
-                    "attention_mask": torch.tensor([[1] * roberta_text_ids.shape[1]]).to(device)
-                }
-                logits = classifier(roberta_input)
-                pred.append(logits)
-    
-    pred = torch.cat(pred, dim=0).detach().cpu()
-    pred = np.argmax(pred.numpy(), axis=-1)
-    acc.add_batch(predictions=pred, references=list(range(len(concept_set))) * (100 // len(concept_set)))
-    
+                concept_texts.append(decoded_text_ids)
+                # Keep key format aligned with train scripts
+                wandb.log({f"steerability_sample_{concept_set[concept_idx]}_{sample_idx+1}": decoded_text_ids})
+
+            print(f"Concept '{concept_set[concept_idx]}' sample preview:")
+            for k in range(min(print_k, len(concept_texts))):
+                print(f"  [{k+1}] {concept_texts[k]}")
+
+            all_texts.append(concept_texts)
+
+    return all_texts
+
+
+def run_steerability_test_from_texts(decoded_texts_by_concept, roberta_tokenizer, classifier, concept_set):
+    """
+    Score already generated texts with one classifier and return accuracy dict.
+    """
+    pred = []
+    ref = []
+    acc = evaluate.load("accuracy")
+
+    with torch.no_grad():
+        for concept_idx, concept_texts in enumerate(tqdm(decoded_texts_by_concept, desc="Steerability scoring")):
+            if len(concept_texts) == 0:
+                continue
+
+            roberta_enc = roberta_tokenizer(
+                concept_texts,
+                return_tensors='pt',
+                truncation=True,
+                max_length=512,
+                padding=True,
+            ).to(device)
+            roberta_input = {
+                "input_ids": roberta_enc["input_ids"],
+                "attention_mask": roberta_enc["attention_mask"],
+            }
+            logits = classifier(roberta_input)
+            pred.extend(torch.argmax(logits, dim=-1).detach().cpu().tolist())
+            ref.extend([concept_idx] * len(concept_texts))
+
+    acc.add_batch(predictions=np.array(pred), references=np.array(ref))
     return acc.compute()
 
 
@@ -182,19 +214,13 @@ def load_model_and_cbl(peft_path, cbl_path, config, concept_set, tokenizer, disc
         cbl = CBLResidual(config, len(concept_set), residual_dim, tokenizer).to(device)
     
     cbl.load_state_dict(torch.load(cbl_path, map_location=device), strict=False)
-    ### warn missing keys:
-    for name, param in cbl.named_parameters():
-        if name not in cbl.state_dict():
-            print(f"Warning: {name} is in the model but not in the state dict.")
-    for name in cbl.state_dict():
-        if name not in cbl.named_parameters():
-            print(f"Warning: {name} is in the state dict but not in the model.")
     cbl.eval()
     
     return preLM, cbl
 
 
-def process_run(run_id, classifier_suffixes, expected_dataset, seed, wandb_project, wandb_entity=None):
+def process_run(run_id, classifier_suffixes, expected_dataset, seed, wandb_project, wandb_entity=None,
+                run_idx=None, total_runs=None):
     """
     Process a single wandb run: load config, load models, run steerability tests, and log results.
     """
@@ -202,7 +228,11 @@ def process_run(run_id, classifier_suffixes, expected_dataset, seed, wandb_proje
     set_seed(seed)
     
     print(f"\n{'='*60}")
-    print(f"Processing run: {run_id} (seed={seed})")
+    if run_idx is not None and total_runs is not None:
+        runs_left = total_runs - run_idx
+        print(f"Processing run {run_idx}/{total_runs}: {run_id} (seed={seed}, remaining={runs_left})")
+    else:
+        print(f"Processing run: {run_id} (seed={seed})")
     print(f"{'='*60}")
     
     # Initialize wandb API and get run config
@@ -225,6 +255,7 @@ def process_run(run_id, classifier_suffixes, expected_dataset, seed, wandb_proje
     # Extract necessary parameters
     dataset = run_config.get('dataset', 'SetFit/sst2')
     discrimination_loss = run_config.get('discrimination_loss', 1.0)
+    arch_type = run_config.get('arch_type', None)
     residual_dim = run_config.get('residual_dim', 768)
     
     print(f"Dataset: {dataset}, Steerability seed: {seed}")
@@ -234,18 +265,21 @@ def process_run(run_id, classifier_suffixes, expected_dataset, seed, wandb_proje
         print(f"SKIPPING run {run_id}: dataset mismatch. Run used '{dataset}' but expected '{expected_dataset}'.")
         return
     
-    # Find best epoch (validation-based for SetFit/sst2, last epoch for others)
-    best_epoch = find_best_epoch(run_id, dataset)
-    print(f"Best epoch: {best_epoch}")
-    
+    # Detect run layout and checkpoint prefix
+    run_type, ckpt_prefix = infer_run_layout(run_id, dataset, run_config)
+    if run_type is None or ckpt_prefix is None:
+        print(f"Could not infer checkpoint layout for run {run_id}")
+        return
+
+    print(f"Detected run type: {run_type}")
+    print(f"Checkpoint prefix: {ckpt_prefix}")
+
+    peft_path, cbl_path, best_epoch, is_low_score = find_eval_checkpoint(ckpt_prefix, run_type, dataset)
+    print(f"Evaluation epoch: {best_epoch} (low_score={is_low_score})")
+
     if best_epoch is None:
         print(f"No model weights found for run {run_id}")
         return
-    
-    # Only test the best epoch
-    epochs_to_test = [best_epoch]
-    
-    print(f"Epoch to test: {epochs_to_test}")
     
     # Setup tokenizers and config
     config = LlamaConfig.from_pretrained('meta-llama/Meta-Llama-3-8B')
@@ -257,10 +291,14 @@ def process_run(run_id, classifier_suffixes, expected_dataset, seed, wandb_proje
     concept_set = CFG.concepts_from_labels[dataset]
     print(f"Concept set length: {len(concept_set)}")
     
-    # Load multiple roberta classifiers for steerability test
+    # Load multiple roberta classifiers for steerability test (same order as training scripts)
     classifiers = {}
+    classifier_paths = [dataset.replace('/', '_') + "_classifier.pt"]
     for suffix in classifier_suffixes:
         classifier_path = dataset.replace('/', '_') + f"_classifier{suffix}.pt"
+        classifier_paths.append(classifier_path)
+
+    for clf_idx, classifier_path in enumerate(classifier_paths):
         if not os.path.exists(classifier_path):
             print(f"Warning: Classifier not found at {classifier_path}, skipping...")
             continue
@@ -268,7 +306,11 @@ def process_run(run_id, classifier_suffixes, expected_dataset, seed, wandb_proje
         classifier = Roberta_classifier(len(concept_set)).to(device)
         classifier.load_state_dict(torch.load(classifier_path, map_location=device))
         classifier.eval()
-        classifiers[suffix] = classifier
+        try:
+            classifier = torch.compile(classifier)
+        except Exception as compile_err:
+            print(f"Warning: torch.compile failed for {classifier_path}, using eager mode: {compile_err}")
+        classifiers[clf_idx] = classifier
         print(f"Loaded classifier from {classifier_path}")
     
     if not classifiers:
@@ -283,72 +325,70 @@ def process_run(run_id, classifier_suffixes, expected_dataset, seed, wandb_proje
         resume="must"
     )
     
-    # Run steerability test for each epoch and each classifier
+    # Run steerability test (single selected checkpoint) and log keys exactly as training scripts
     results = {}
-    test_idx = 1
-    for epoch_idx, epoch in enumerate(epochs_to_test, start=1):
-        print(f"\nTesting epoch {epoch} (epoch_idx {epoch_idx})...")
-        
-        # Get model paths
-        is_best = (epoch == best_epoch) if dataset == 'SetFit/sst2' else True
-        peft_path, cbl_path = get_model_path_for_run(run_id, dataset, epoch, is_best=is_best)
-        
-        if peft_path is None or not os.path.exists(peft_path):
-            # Try alternative path
-            peft_path, cbl_path = get_model_path_for_run(run_id, dataset, epoch, is_best=False)
-        
-        if peft_path is None or not os.path.exists(peft_path):
-            print(f"Model path not found for epoch {epoch}")
-            continue
-        
-        if not os.path.exists(cbl_path):
-            print(f"CBL path not found: {cbl_path}")
-            continue
-        
-        print(f"Loading model from: {peft_path}")
-        print(f"Loading CBL from: {cbl_path}")
-        
-        try:
-            # Load models
-            preLM, cbl = load_model_and_cbl(
-                peft_path, cbl_path, config, concept_set, tokenizer,
-                discrimination_loss, residual_dim
+    print(f"\nTesting epoch {best_epoch}...")
+    print(f"Loading model from: {peft_path}")
+    print(f"Loading CBL from: {cbl_path}")
+
+    # Select CBL architecture robustly across train_combined.py and train_grpo.py variants.
+    if arch_type is not None:
+        discrimination_loss_for_loading = 1.0 if arch_type == "non_residual" else 0.0
+    else:
+        discrimination_loss_for_loading = discrimination_loss
+
+    try:
+        preLM, cbl = load_model_and_cbl(
+            peft_path, cbl_path, config, concept_set, tokenizer,
+            discrimination_loss_for_loading, residual_dim
+        )
+
+        # Generate once (batched), then reuse texts for all classifiers.
+        samples_per_concept = max(1, 100 // len(concept_set))
+        decoded_texts_by_concept = generate_steerability_texts(
+            preLM,
+            cbl,
+            tokenizer,
+            concept_set,
+            dataset,
+            samples_per_concept=samples_per_concept,
+            print_k=3,
+        )
+
+        for clf_idx, classifier in classifiers.items():
+            print(f"\n  Testing with classifier idx={clf_idx}...")
+
+            acc = run_steerability_test_from_texts(
+                decoded_texts_by_concept,
+                roberta_tokenizer,
+                classifier,
+                concept_set,
             )
-            
-            # Run steerability test with each classifier
-            for suffix, classifier in classifiers.items():
-                print(f"\n  Testing with classifier{suffix}...")
-                
-                acc = run_steerability_test(
-                    preLM, cbl, tokenizer, roberta_tokenizer, classifier,
-                    concept_set, dataset, seed
-                )
-                
-                print(f"  Steerability test accuracy (epoch={epoch}, classifier{suffix}): {acc}")
-                
-                # Log to wandb with unique index
-                log_key = f"steerability_test_accuracy_{test_idx}"
-                wandb.log({
-                    log_key: acc, 
-                    f"epoch_for_steerability_{test_idx}": epoch,
-                    f"classifier_suffix_for_steerability_{test_idx}": suffix
-                })
-                results[log_key] = {
-                    "accuracy": acc, 
-                    "epoch": epoch, 
-                    "classifier_suffix": suffix
-                }
-                test_idx += 1
-            
-            # Clean up
-            del preLM, cbl
-            torch.cuda.empty_cache()
-            
-        except Exception as e:
-            print(f"Error testing epoch {epoch}: {e}")
-            import traceback
-            traceback.print_exc()
-            continue
+
+            print(f"  Steerability test accuracy (epoch={best_epoch}, classifier_idx={clf_idx}): {acc}")
+
+            # Use exactly the key names in train_combined.py / train_grpo.py.
+            if clf_idx == 0:
+                log_key = "steerability_test_accuracy"
+            else:
+                log_key = f"steerability_test_accuracy_{clf_idx}"
+
+            wandb.log({log_key: acc})
+            results[log_key] = {
+                "accuracy": acc,
+                "epoch": best_epoch,
+                "classifier_idx": clf_idx,
+                "run_type": run_type,
+                "low_score_checkpoint": is_low_score,
+            }
+
+        del preLM, cbl
+        torch.cuda.empty_cache()
+
+    except Exception as e:
+        print(f"Error testing epoch {best_epoch}: {e}")
+        import traceback
+        traceback.print_exc()
     
     # Log summary
     if results:
@@ -382,7 +422,10 @@ def main():
     
     # Process each run
     all_results = {}
-    for run_id in run_ids:
+    total_runs = len(run_ids)
+    for idx, run_id in enumerate(run_ids, start=1):
+        runs_left_after_this = total_runs - idx
+        print(f"\nStarting run {idx}/{total_runs}. Runs left after this: {runs_left_after_this}")
         try:
             results = process_run(
                 run_id, 
@@ -390,7 +433,9 @@ def main():
                 args.dataset,
                 args.seed,
                 args.wandb_project, 
-                args.wandb_entity
+                args.wandb_entity,
+                run_idx=idx,
+                total_runs=total_runs,
             )
             all_results[run_id] = results
         except Exception as e:
