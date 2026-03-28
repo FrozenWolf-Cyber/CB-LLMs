@@ -308,10 +308,11 @@ def run_evaluation(preLM, cbl, tokenizer, concept_set, dataset, run_config, clas
             def __init__(self, encodings):
                 self.encodings = encodings
             def __getitem__(self, idx):
-                item = {key: torch.tensor(val[idx]) for key, val in self.encodings.items() if key in ['input_ids', 'attention_mask']}
+                row = self.encodings[idx]
+                item = {key: torch.tensor(row[key]) for key in ['input_ids', 'attention_mask']}
                 return item, 0 # dummy label
             def __len__(self):
-                return len(self.encodings['input_ids'])
+                return len(self.encodings)
 
         test_loader = torch.utils.data.DataLoader(
             EvalDataset(encoded_test_dataset), batch_size=4, shuffle=False
