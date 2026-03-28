@@ -14,7 +14,6 @@ import time
 import torch.nn.functional as F
 from datasets import load_dataset
 from utils import mean_pooling, get_labels, cos_sim_cubed
-from perplexity_calc import calculate_perplexity
 
 
 def set_seed(seed):
