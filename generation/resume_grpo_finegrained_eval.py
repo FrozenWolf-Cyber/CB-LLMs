@@ -416,7 +416,8 @@ def run_evaluation(preLM, cbl, tokenizer, concept_set, dataset, run_config, clas
 
     # Save generated texts
     os.makedirs("perplexity_text", exist_ok=True)
-    pickle.dump(pred, open(f"perplexity_text/{run_name}_generated_texts_{seed}.pkl", "wb"))
+    safe_run_name = run_name.replace('/', '_')
+    pickle.dump(pred, open(f"perplexity_text/{safe_run_name}_generated_texts_{seed}.pkl", "wb"))
 
     if c > 0:
         ppl_under_30 = perplexity_metric.compute(model_id='meta-llama/Meta-Llama-3-8B')['mean_perplexity']
