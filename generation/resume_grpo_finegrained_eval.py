@@ -280,8 +280,12 @@ def run_evaluation(preLM, cbl, tokenizer, concept_set, dataset, run_config, clas
     print("\nRunning Concept Prediction Evaluation...")
     labeling = run_config.get('labeling', 'mpnet')
     d_name = dataset.replace('/', '_')
+    
+    if not os.path.exists(f"./{labeling}/{d_name}") and os.path.exists(f"./{labeling}_acs/{d_name}"):
+        labeling = f"{labeling}_acs"
+        
     label_prefix = f"./" # Assuming labels are in the root, adjust if needed
-    if labeling in ['mpnet', 'simcse', 'angle', 'llm']:
+    if labeling in ['mpnet', 'simcse', 'angle', 'llm', 'mpnet_acs', 'simcse_acs', 'angle_acs', 'llm_acs']:
         label_prefix = os.path.join(label_prefix, labeling)
     label_prefix = os.path.join(label_prefix, d_name)
 
