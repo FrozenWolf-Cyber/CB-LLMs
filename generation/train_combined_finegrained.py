@@ -204,21 +204,12 @@ if __name__ == "__main__":
         end = time.time()
         print("time of training intervention:", (end - start) / 3600, "hours")
 
-    # Finegrained setup: after optional correction, we no longer need the dataset class label.
-    # Drop it to avoid accidentally using class labels in losses.
-    if "label" in encoded_train_dataset.column_names:
-        encoded_train_dataset = encoded_train_dataset.remove_columns(["label"])
-    if args.dataset == 'SetFit/sst2' and "label" in encoded_val_dataset.column_names:
-        encoded_val_dataset = encoded_val_dataset.remove_columns(["label"])
-    if "label" in encoded_test_dataset.column_names:
-        encoded_test_dataset = encoded_test_dataset.remove_columns(["label"])
-
     print("creating loader...")
     train_loader = build_loaders(encoded_train_dataset, train_similarity, mode="train")
     if args.dataset == 'SetFit/sst2':
         val_loader = build_loaders(encoded_val_dataset, val_similarity, mode="valid")
     
-    test_similarity = np.zeros((len(encoded_test_dataset["input_ids"]), 1), dtype=np.float32)
+    test_similarity = np.zeros((len(encoded_test_dataset["label"]), 1), dtype=np.float32)
     test_loader = build_loaders(encoded_test_dataset, test_similarity, mode="test")
 
     print("preparing backbone")
