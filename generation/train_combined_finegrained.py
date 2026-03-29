@@ -204,12 +204,21 @@ if __name__ == "__main__":
         end = time.time()
         print("time of training intervention:", (end - start) / 3600, "hours")
 
+    # Finegrained setup: after optional correction, we no longer need the dataset class label.
+    # Drop it to avoid accidentally using class labels in losses.
+    if "label" in encoded_train_dataset.column_names:
+        encoded_train_dataset = encoded_train_dataset.remove_columns(["label"])
+    if args.dataset == 'SetFit/sst2' and "label" in encoded_val_dataset.column_names:
+        encoded_val_dataset = encoded_val_dataset.remove_columns(["label"])
+    if "label" in encoded_test_dataset.column_names:
+        encoded_test_dataset = encoded_test_dataset.remove_columns(["label"])
+
     print("creating loader...")
     train_loader = build_loaders(encoded_train_dataset, train_similarity, mode="train")
     if args.dataset == 'SetFit/sst2':
         val_loader = build_loaders(encoded_val_dataset, val_similarity, mode="valid")
     
-    test_similarity = np.zeros((len(encoded_test_dataset["label"]), 1), dtype=np.float32)
+    test_similarity = np.zeros((len(encoded_test_dataset["input_ids"]), 1), dtype=np.float32)
     test_loader = build_loaders(encoded_test_dataset, test_similarity, mode="test")
 
     print("preparing backbone")
@@ -239,27 +248,12 @@ if __name__ == "__main__":
     if args.discrimination_loss > 0:
         opt_classifier = torch.optim.Adam(classifier.parameters(), lr=1e-3)
 
-    # Set intervention value once (used by both intervention_gen_loss and GRPO)
+
     if args.dataset == "dbpedia_14":
         intervention_value = 150
     else:
         intervention_value = 100
 
-    # Load MPNET for GRPO reward scoring
-    if args.grpo_loss_weight > 0:
-        from transformers import AutoTokenizer, AutoModel
-        tokenizer_sim_grpo = AutoTokenizer.from_pretrained('sentence-transformers/all-mpnet-base-v2')
-        sim_model_grpo = AutoModel.from_pretrained('sentence-transformers/all-mpnet-base-v2').to(device)
-        sim_model_grpo.eval()
-        for p in sim_model_grpo.parameters():
-            p.requires_grad = False
-        
-        encoded_c_grpo = tokenizer_sim_grpo(concept_set, padding=True, truncation=True, max_length=args.max_length)
-        encoded_c_grpo = {k: torch.tensor(v).to(device) for k, v in encoded_c_grpo.items()}
-        concept_features_grpo = sim_model_grpo(input_ids=encoded_c_grpo["input_ids"], attention_mask=encoded_c_grpo["attention_mask"])
-        concept_features_grpo = mean_pooling(concept_features_grpo.last_hidden_state, encoded_c_grpo["attention_mask"])
-        concept_features_grpo = F.normalize(concept_features_grpo, p=2, dim=1)
-        print("Loaded MPNET for GRPO similarity scoring.")
 
     print("start training...")
     best_loss = float('inf')
@@ -275,28 +269,7 @@ if __name__ == "__main__":
     model_name = "llama3"
     cbl_name = "cbl"
 
-    # ======= DEBUG: Test batched generate =======
-    if args.DEBUG:
-        print("=" * 60)
-        print("DEBUG: Testing generate_batch (no intervention)")
-        print("=" * 60)
-        test_input = torch.tensor([tokenizer.encode("")]).to(device)
-        num_test = min(args.grpo_num_trajectories, 8)
-        preLM.eval()
-        cbl.eval()
-        with torch.no_grad():
-            batch_ids, _ = cbl.generate_batch(
-                test_input, preLM, num_samples=num_test,
-                intervene=None, length=50
-            )
-        special_tokens = torch.tensor([128000, 128001]).to(device)
-        for g in range(num_test):
-            tokens = batch_ids[g][~torch.isin(batch_ids[g], special_tokens)]
-            text = tokenizer.decode(tokens)
-            print(f"  [{g+1}/{num_test}] ({len(tokens)} tokens): {text}")
-        print("=" * 60)
-        preLM.train()
-        cbl.train()
+
 
     start = time.time()
     best_epoch = -1
@@ -314,9 +287,6 @@ if __name__ == "__main__":
             "orthogonal_loss": [],
             "residual_penalty_loss": [],
             "intervention_gen_loss": [],
-            "grpo_loss": [],
-            "grpo_mean_reward": [],
-            "non_zero_grpo_advantages": []
         }
 
         
@@ -324,7 +294,6 @@ if __name__ == "__main__":
             batch = {k: v.to(device) for k, v in batch.items()}
             batch_sim = batch_sim.to(device)
 
-            concept_label = torch.where(batch["attention_mask"][:, :-1] == 0, -100, batch["label"].view(-1, 1))
             word_label = torch.where(batch["attention_mask"][:, :-1] == 0, -100, batch["input_ids"][:, 1:])
             features = preLM(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"]).last_hidden_state
             concepts, unsup, vocabs, matched_unsup = cbl(features.float())
@@ -365,16 +334,18 @@ if __name__ == "__main__":
                 
             if args.intervention_gen_loss > 0:
                 ### concepts shapes: (B, seq_len, concept_dim)
-                concept_label_raw = batch["label"].view(-1, 1) ## shape: (B, 1)
-                
                 if args.dataset == "dbpedia_14":
                     intervention_value = 150
                 else:
                     intervention_value = 100
-                    
-                intervened_concept = torch.zeros_like(concepts, device=device) ## shape: (B, seq_len, concept_dim)
-                for b in range(concepts.shape[0]):
-                    intervened_concept[b, :, concept_label_raw[b].item()] = intervention_value
+
+                # Intervene on exactly ONE concept per example (top-1 by batch_sim),
+                # matching the test-time "one concept at a time" evaluation.
+                # batch_sim: (B, C) -> top_idx: (B,)
+                top_idx = torch.argmax(batch_sim, dim=-1)
+                intervened_concept = torch.zeros_like(concepts, device=device)
+                b_idx = torch.arange(concepts.shape[0], device=device)
+                intervened_concept[b_idx, :, top_idx] = float(intervention_value)
                     
                 # print("intervened_concept shape: ", intervened_concept.shape, intervened_concept.max(), intervened_concept.min())
                 if args.no_detach_intervention:
@@ -397,7 +368,16 @@ if __name__ == "__main__":
 
             if args.discrimination_loss > 0:
                 classification = classifier(mean_pooling(unsup.detach(), batch["attention_mask"]))
-                discrimination_loss = torch.nn.CrossEntropyLoss()(classification, batch["label"])
+
+                # Probe loss: train the classifier to predict finegrained concept similarities from unsup.
+                # This keeps the probe consistent with the concept supervision and avoids class labels.
+                if args.concept_loss_type == "cosine_cubed":
+                    discrimination_loss = -cos_sim_cubed(classification, batch_sim)
+                elif args.concept_loss_type == "ce":
+                    hard_targets = torch.argmax(batch_sim, dim=-1)
+                    discrimination_loss = torch.nn.CrossEntropyLoss()(classification, hard_targets)
+                else:
+                    raise ValueError(f"Unknown concept_loss_type: {args.concept_loss_type}")
                 opt_classifier.zero_grad()
                 (args.discrimination_loss * discrimination_loss).backward(inputs=list(classifier.parameters()))
                 opt_classifier.step()
@@ -411,142 +391,6 @@ if __name__ == "__main__":
                 (args.neg_entropy_loss * neg_entropy_loss).backward(inputs=list(cbl.unsup.parameters()))
                 opt_cbl.step()
                 training_losses["neg_entropy_loss"].append(neg_entropy_loss.detach().cpu().numpy())
-
-            # ======= GRPO STEERABILITY LOSS (activated after warmup) =======
-            grpo_step = e * len(train_loader) + i
-            if args.DEBUG or (args.grpo_loss_weight > 0 and grpo_step >= args.grpo_warmup_steps):
-                grpo_concept_idx = torch.randint(0, len(concept_set), (1,)).item()
-                grpo_intervene = [0] * len(concept_set)
-                grpo_intervene[grpo_concept_idx] = intervention_value
-
-                # Phase 1: Generate G trajectories in parallel & score with RoBERTa ensemble (no grad)
-                gen_input = torch.tensor([tokenizer.encode("")]).to(device)
-                special_tokens_mask = torch.tensor([128000, 128001]).to(device)
-
-                preLM.eval()
-                cbl.eval()
-                with torch.no_grad():
-                    # Batched generation — all trajectories at once
-                    text_ids_batch, _ = cbl.generate_batch(
-                        gen_input, preLM, num_samples=args.grpo_num_trajectories,
-                        intervene=grpo_intervene, length=args.grpo_gen_length
-                    )
-
-                    # Decode all trajectories and re-encode
-                    generated_seqs = []
-                    decoded_texts = []
-                    for g in range(args.grpo_num_trajectories):
-                        decoded = tokenizer.decode(
-                            text_ids_batch[g][~torch.isin(text_ids_batch[g], special_tokens_mask)]
-                        )
-                        re_encoded = torch.tensor([tokenizer.encode(decoded)]).to(device)
-                        generated_seqs.append(re_encoded.detach())
-                        decoded_texts.append(decoded)
-
-                    # Batched reward scoring with RoBERTa ensemble
-                    grpo_rewards = [0.0] * args.grpo_num_trajectories
-                    non_empty_indices = [g for g, t in enumerate(decoded_texts) if len(t.strip()) > 0]
-                    if non_empty_indices:
-                        non_empty_texts = [decoded_texts[g] for g in non_empty_indices]
-                        generated_c_grpo = tokenizer_sim_grpo(non_empty_texts, return_tensors='pt', truncation=True, max_length=args.max_length, padding=True).to(device)
-                        generated_features_grpo = sim_model_grpo(input_ids=generated_c_grpo["input_ids"], attention_mask=generated_c_grpo["attention_mask"])
-                        generated_features_grpo = mean_pooling(generated_features_grpo.last_hidden_state, generated_c_grpo["attention_mask"])
-                        generated_features_grpo = F.normalize(generated_features_grpo, p=2, dim=1)
-                        
-                        sims_grpo = generated_features_grpo @ concept_features_grpo.T
-                        v_target_grpo = [0] * len(concept_set)
-                        v_target_grpo[grpo_concept_idx] = 1.0
-                        v_tensor_grpo = torch.tensor(v_target_grpo).to(device).unsqueeze(0).expand(len(non_empty_texts), -1)
-
-                        for idx, g in enumerate(non_empty_indices):
-                            r = cos_sim_cubed(sims_grpo[idx:idx+1], v_tensor_grpo[idx:idx+1].float()).item()
-                            grpo_rewards[g] = r
-
-                    if args.DEBUG:
-                        for g in range(args.grpo_num_trajectories):
-                            print(f"GRPO Trajectory {g+1}/{args.grpo_num_trajectories}:")
-                            print("  Decoded text:", decoded_texts[g])
-                            print("  Reward:", grpo_rewards[g])
-                            print("-" * 50)
-                            
-                    ## log the lowest and highest reward text+reward to wandb for debugging
-                    wandb.log({
-                        "grpo_debug_lowest_reward": min(grpo_rewards),
-                        "grpo_debug_highest_reward": max(grpo_rewards),
-                        "grpo_debug_lowest_text": decoded_texts[grpo_rewards.index(min(grpo_rewards))],
-                        "grpo_debug_highest_text": decoded_texts[grpo_rewards.index(max(grpo_rewards))]
-                    })
-
-                preLM.train()
-                cbl.train()
-
-                # Phase 2: Group-relative advantages
-                grpo_rewards_t = torch.tensor(grpo_rewards, device=device, dtype=torch.float32)
-                if grpo_rewards_t.std() > 1e-8:
-                    grpo_advantages = (grpo_rewards_t - grpo_rewards_t.mean()) / (grpo_rewards_t.std() + 1e-8)
-                else:
-                    grpo_advantages = torch.zeros_like(grpo_rewards_t)
-                grpo_advantages = grpo_advantages.clamp(-args.grpo_clip_advantage, args.grpo_clip_advantage)
-
-                # Phase 3: Recompute log-probs WITH gradient (batched teacher-forced)
-                valid_indices = [g for g in range(args.grpo_num_trajectories)
-                                 if generated_seqs[g].shape[1] > 1 and grpo_advantages[g].abs().item() > 1e-8]
-
-                if valid_indices:
-                    max_seq_len = max(generated_seqs[g].shape[1] for g in valid_indices)
-                    padded_inputs = []
-                    padded_targets = []
-                    attn_masks = []
-                    valid_advantages = []
-
-                    for g in valid_indices:
-                        seq = generated_seqs[g]  # (1, seq_len)
-                        seq_len = seq.shape[1] - 1
-                        pad_len = max_seq_len - 1 - seq_len
-                        seq_input = seq[:, :-1]
-                        seq_target = seq[:, 1:]
-                        if pad_len > 0:
-                            seq_input = F.pad(seq_input, (0, pad_len), value=tokenizer.pad_token_id)
-                            seq_target = F.pad(seq_target, (0, pad_len), value=0)
-                            attn = torch.cat([torch.ones(1, seq_len, device=device),
-                                              torch.zeros(1, pad_len, device=device)], dim=1)
-                        else:
-                            attn = torch.ones(1, seq_len, device=device)
-                        padded_inputs.append(seq_input)
-                        padded_targets.append(seq_target)
-                        attn_masks.append(attn)
-                        valid_advantages.append(grpo_advantages[g])
-
-                    batch_input = torch.cat(padded_inputs, dim=0)     # (V, max_seq_len-1)
-                    batch_target = torch.cat(padded_targets, dim=0)   # (V, max_seq_len-1)
-                    batch_attn = torch.cat(attn_masks, dim=0).long()  # (V, max_seq_len-1)
-                    valid_adv = torch.stack(valid_advantages)          # (V,)
-
-                    feats_g = preLM(input_ids=batch_input, attention_mask=batch_attn).last_hidden_state
-                    _, unsup_g, _, _ = cbl(feats_g.float())
-
-                    intervened_g = torch.zeros(len(valid_indices), batch_input.shape[1], len(concept_set), device=device)
-                    intervened_g[:, :, grpo_concept_idx] = intervention_value
-
-                    vocab_logits_g = cbl.intervene(unsup_g, intervened_g)
-                    log_probs_g = F.log_softmax(vocab_logits_g, dim=-1)
-                    token_log_probs_g = log_probs_g.gather(2, batch_target.unsqueeze(-1)).squeeze(-1)
-                    # Mask out padded positions
-                    token_log_probs_g = token_log_probs_g * batch_attn.float()
-                    mean_log_probs = token_log_probs_g.sum(dim=1) / batch_attn.sum(dim=1).float()
-
-                    grpo_loss_val = (-valid_adv * mean_log_probs).mean()
-                    opt_prelm.zero_grad()
-                    opt_cbl.zero_grad()
-                    (args.grpo_loss_weight * grpo_loss_val).backward()
-                    opt_prelm.step()
-                    opt_cbl.step()
-                    training_losses["grpo_loss"].append(grpo_loss_val.detach().cpu().numpy())
-                    training_losses["grpo_mean_reward"].append(grpo_rewards_t.mean().item())
-                    
-                training_losses["non_zero_grpo_advantages"].append((grpo_advantages.abs() > 1e-8).sum().item())
-                if args.DEBUG:
-                    print(f"GRPO debug - rewards: {grpo_rewards}, advantages: {grpo_advantages.tolist()}")
 
 
             training_losses["concept_loss"].append(concept_loss.detach().cpu().numpy())
@@ -593,7 +437,6 @@ if __name__ == "__main__":
                 batch = {k: v.to(device) for k, v in batch.items()}
                 batch_sim = batch_sim.to(device)
 
-                concept_label = torch.where(batch["attention_mask"][:, :-1] == 0, -100, batch["label"].view(-1, 1))
                 word_label = torch.where(batch["attention_mask"][:, :-1] == 0, -100, batch["input_ids"][:, 1:])
                 with torch.no_grad():
                     features = preLM(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"]).last_hidden_state
@@ -614,7 +457,6 @@ if __name__ == "__main__":
                 else:
                     raise ValueError(f"Unknown concept_loss_type: {args.concept_loss_type}")
                 word_loss = torch.nn.CrossEntropyLoss()(vocabs[:, :-1, :].reshape(-1, config.vocab_size), word_label.reshape(-1))
-                discrimination_loss = torch.nn.CrossEntropyLoss()(classification, batch["label"])
                 p = F.softmax(classification, dim=-1)
                 
                 if args.residual_penalty_weight > 0:
@@ -631,31 +473,11 @@ if __name__ == "__main__":
                         intervention_value = 150
                     else:
                         intervention_value = 100
-                    # print("concept_label shape: ", concept_label.shape, concepts.shape)
+
+                    top_idx = torch.argmax(batch_sim, dim=-1)
                     intervened_concept = torch.zeros_like(concepts, device=device)
-
-                    # ---- BEFORE ----
-                    # print("Before intervention:")
-                    # print("  min:", intervened_concept.min().item())
-                    # print("  max:", intervened_concept.max().item())
-
-                    # Apply intervention
-                    seq_len = concept_label.size(1)
-                    mask = (concept_label == 1)
-
-                    intervened_concept[:, :seq_len, 1] = mask.float() * intervention_value
-
-                    # ---- Counter AFTER intervention ----
-                    # counter = (intervened_concept[:, :, 1] == intervention_value).sum().item()
-
-                    # print("Counter:", counter)
-                    # print("After intervention:")
-                    # print("  min:", intervened_concept.min().item())
-                    # print("  max:", intervened_concept.max().item())
-
-                    # # Optional: how many positions activated
-                    # print("Activated positions:", mask.sum().item())
-                    # print("-" * 50)
+                    b_idx = torch.arange(concepts.shape[0], device=device)
+                    intervened_concept[b_idx, :, top_idx] = float(intervention_value)
                     vocab = cbl.intervene(unsup.detach(), intervened_concept.detach())
                     intervention_gen_loss = torch.nn.CrossEntropyLoss()(vocab[:, :-1, :].reshape(-1, config.vocab_size), word_label.reshape(-1))
                     val_losses["val_intervention_gen_loss"].append(intervention_gen_loss.detach().cpu().numpy())
