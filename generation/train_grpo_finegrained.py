@@ -744,7 +744,8 @@ if __name__ == "__main__":
                     "grpo_debug_lowest_reward": min(grpo_rewards),
                     "grpo_debug_highest_reward": max(grpo_rewards),
                     "grpo_debug_lowest_text": decoded_texts[grpo_rewards.index(min(grpo_rewards))],
-                    "grpo_debug_highest_text": decoded_texts[grpo_rewards.index(max(grpo_rewards))]
+                    "grpo_debug_highest_text": decoded_texts[grpo_rewards.index(max(grpo_rewards))],
+                    "grpo_concept_idx": grpo_concept_idx,
                 })
 
             preLM.train()
