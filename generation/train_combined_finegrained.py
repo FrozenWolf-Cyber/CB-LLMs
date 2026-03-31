@@ -54,6 +54,101 @@ def set_seed(seed):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     np.random.seed(seed)
+
+
+def build_intervened_concepts_from_similarity(
+    concepts: torch.Tensor,
+    batch_sim: torch.Tensor,
+    intervention_value: float,
+    keep_other_concepts: bool,
+    use_topk: bool,
+    topk_k: int,
+    log_wandb: bool = False,
+    wandb_prefix: str = "train",
+) -> torch.Tensor:
+    """Construct an intervention concept tensor for `cbl.intervene`.
+
+        Current behavior (defaults):
+            - pick top-1 concept per example (argmax over batch_sim)
+            - set that concept to `intervention_value` for all time steps
+            - set all other concepts to 0
+
+        Optional strategies:
+            - keep_other_concepts=True: start from `concepts` and only overwrite targeted dims
+            - use_topk=True: stochastic top-K mode.
+                    For each example:
+                        1) take the top-K concepts by `batch_sim`
+                        2) softmax the K scores into probabilities
+                        3) sample a rank r ~ Categorical(probs)
+                        4) intervene on the top-(r+1) concepts (a prefix of the top-K)
+
+    Args:
+        concepts: (B, T, C)
+        batch_sim: (B, C)
+    """
+    if concepts.dim() != 3:
+        raise ValueError(f"Expected concepts to have shape (B, T, C); got {tuple(concepts.shape)}")
+    if batch_sim.dim() != 2:
+        raise ValueError(f"Expected batch_sim to have shape (B, C); got {tuple(batch_sim.shape)}")
+    if concepts.size(0) != batch_sim.size(0) or concepts.size(-1) != batch_sim.size(-1):
+        raise ValueError(
+            f"Shape mismatch: concepts {tuple(concepts.shape)} vs batch_sim {tuple(batch_sim.shape)}"
+        )
+
+    if keep_other_concepts:
+        intervened = concepts.detach().clone()
+    else:
+        intervened = torch.zeros_like(concepts)
+
+    value = float(intervention_value)
+    B = concepts.size(0)
+    C = concepts.size(-1)
+
+    if not use_topk:
+        indices = torch.argmax(batch_sim, dim=-1)  # (B,)
+        for b in range(B):
+            intervened[b, :, int(indices[b].item())] = value
+        return intervened
+
+    k = int(topk_k)
+    if k <= 0:
+        k = 1
+    k = min(k, C)
+
+    # Stochastic top-K cutoff selection per example.
+    sampled_ranks = []
+    sampled_probs = []
+    for b in range(B):
+        topk = torch.topk(batch_sim[b], k=k, dim=-1)
+        topk_scores = topk.values  # (k,)
+        topk_indices = topk.indices  # (k,)
+
+        probs = F.softmax(topk_scores, dim=-1)
+        sampled_rank = torch.multinomial(probs, num_samples=1).item()  # int in [0, k-1]
+        cutoff = int(sampled_rank) + 1
+        selected = topk_indices[:cutoff].tolist()
+
+        sampled_ranks.append(int(sampled_rank))
+        sampled_probs.append(float(probs[int(sampled_rank)].item()))
+
+        for idx in selected:
+            intervened[b, :, int(idx)] = value
+
+    if log_wandb and len(sampled_ranks) > 0 and wandb.run is not None:
+        # Log a small amount of debug info per training step.
+        # `sampled_rank` corresponds to choosing top-(rank+1) concepts among the top-K.
+        mean_rank = float(sum(sampled_ranks) / len(sampled_ranks))
+        mean_prob = float(sum(sampled_probs) / len(sampled_probs))
+        wandb.log(
+            {
+                f"{wandb_prefix}_intervention_topk_sampled_rank_b0": sampled_ranks[0],
+                f"{wandb_prefix}_intervention_topk_sampled_prob_b0": sampled_probs[0],
+                f"{wandb_prefix}_intervention_topk_sampled_rank_mean": mean_rank,
+                f"{wandb_prefix}_intervention_topk_sampled_prob_mean": mean_prob,
+            },
+            commit=False,
+        )
+    return intervened
     
 
 parser = argparse.ArgumentParser()
@@ -84,6 +179,26 @@ parser.add_argument("--intervention_gen_loss", type=float, default=0.0)
 parser.add_argument("--intervention_margin", type=float, default=10.0)
 parser.add_argument("--no_detach_intervention", action='store_true', help="If set, do not detach unsup during intervention generation loss computation.")
 parser.add_argument("--intervention_spread", type=float, default=2.0)
+parser.add_argument(
+    "--intervention_keep_other_concepts",
+    action="store_true",
+    help="If set, intervention overwrites only the selected concept(s) and keeps all other concept activations as-is (instead of setting them to 0).",
+)
+parser.add_argument(
+    "--intervention_topk_concepts",
+    action="store_true",
+    help=(
+        "If set, use stochastic top-K selection when constructing the intervention tensor: "
+        "take the top-K concepts by similarity, softmax their scores, sample a rank, and intervene on the top-(rank+1) concepts. "
+        "If not set, intervene on only the top-1 concept."
+    ),
+)
+parser.add_argument(
+    "--intervention_topk_k",
+    type=int,
+    default=3,
+    help="K for --intervention_topk_concepts (default 3).",
+)
 parser.add_argument("--classifier_weight_suffixes", type=str, default="_seed42,_seed123,_seed456", 
                     help="Comma-separated list of classifier weight suffixes to test (e.g., '_seed42,_seed123,_seed456')")
 parser.add_argument("--grpo_loss_weight", type=float, default=0.0, help="Weight for GRPO steerability loss. 0 disables it.")
@@ -411,13 +526,16 @@ if __name__ == "__main__":
                 else:
                     intervention_value = 100
 
-                # Intervene on exactly ONE concept per example (top-1 by batch_sim),
-                # matching the test-time "one concept at a time" evaluation.
-                # batch_sim: (B, C) -> top_idx: (B,)
-                top_idx = torch.argmax(batch_sim, dim=-1)
-                intervened_concept = torch.zeros_like(concepts, device=device)
-                b_idx = torch.arange(concepts.shape[0], device=device)
-                intervened_concept[b_idx, :, top_idx] = float(intervention_value)
+                intervened_concept = build_intervened_concepts_from_similarity(
+                    concepts=concepts,
+                    batch_sim=batch_sim,
+                    intervention_value=intervention_value,
+                    keep_other_concepts=args.intervention_keep_other_concepts,
+                    use_topk=args.intervention_topk_concepts,
+                    topk_k=args.intervention_topk_k,
+                    log_wandb=args.intervention_topk_concepts,
+                    wandb_prefix="train",
+                )
                     
                 # print("intervened_concept shape: ", intervened_concept.shape, intervened_concept.max(), intervened_concept.min())
                 if args.no_detach_intervention:
@@ -546,10 +664,14 @@ if __name__ == "__main__":
                     else:
                         intervention_value = 100
 
-                    top_idx = torch.argmax(batch_sim, dim=-1)
-                    intervened_concept = torch.zeros_like(concepts, device=device)
-                    b_idx = torch.arange(concepts.shape[0], device=device)
-                    intervened_concept[b_idx, :, top_idx] = float(intervention_value)
+                    intervened_concept = build_intervened_concepts_from_similarity(
+                        concepts=concepts,
+                        batch_sim=batch_sim,
+                        intervention_value=intervention_value,
+                        keep_other_concepts=args.intervention_keep_other_concepts,
+                        use_topk=args.intervention_topk_concepts,
+                        topk_k=args.intervention_topk_k,
+                    )
                     vocab = cbl.intervene(unsup.detach(), intervened_concept.detach())
                     intervention_gen_loss = torch.nn.CrossEntropyLoss()(vocab[:, :-1, :].reshape(-1, config.vocab_size), word_label.reshape(-1))
                     val_losses["val_intervention_gen_loss"].append(intervention_gen_loss.detach().cpu().numpy())
@@ -669,6 +791,7 @@ if __name__ == "__main__":
                 num_samples=num_steerability_samples,
                 intervene=v,
                 length=50,
+                keep_other_concepts=args.intervention_keep_other_concepts,
             )  # (num_steerability_samples, gen_len)
 
             # Decode and collect texts for MPNet scoring

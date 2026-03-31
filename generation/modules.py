@@ -53,7 +53,7 @@ class Llama_baseline_generation(nn.Module):
         x = self.fc(x)
         return x
 
-    def generate(self, ids, preLM, length=100, temp=0.7, topk=100, topp=0.9, repetition_penalty=1.5):
+    def generate(self, ids, preLM, length=100, temp=0.7, topk=100, topp=0.9, repetition_penalty=1.5, eos_token_id=128001):
         past_key_values = None
         for i in range(length):
             outputs = preLM(ids[:, -1:] if past_key_values is not None else ids, past_key_values=past_key_values, use_cache=True)
@@ -122,7 +122,20 @@ class CBL(nn.Module):
                 break
         return ids, self.relu(concepts)[0]
 
-    def generate_batch(self, ids, preLM, num_samples=1, intervene=None, length=100, temp=0.7, topk=100, topp=0.9, repetition_penalty=1.5, eos_token_id=128001):
+    def generate_batch(
+        self,
+        ids,
+        preLM,
+        num_samples=1,
+        intervene=None,
+        length=100,
+        temp=0.7,
+        topk=100,
+        topp=0.9,
+        repetition_penalty=1.5,
+        eos_token_id=128001,
+        keep_other_concepts: bool = False,
+    ):
         """Generate num_samples trajectories in parallel (batched autoregressive)."""
         ids = ids.expand(num_samples, -1).contiguous()  # (B, prompt_len)
         finished = torch.zeros(num_samples, dtype=torch.bool, device=ids.device)
@@ -135,9 +148,20 @@ class CBL(nn.Module):
             features = outputs.last_hidden_state.float()
             concepts = self.cbl(features)
             unsup_features = self.unsup(features)
-            if intervene:
+
+            # Intervention application (default behavior preserved):
+            # - keep_other_concepts=False: overwrite *all* concept dims from `intervene` (including zeros)
+            # - keep_other_concepts=True: overwrite only dims where `intervene[j] != 0`, leaving others as-is
+            if intervene and not keep_other_concepts:
                 for j in range(self.concept_dim):
                     concepts[:, :, j] = intervene[j]
+            elif intervene and keep_other_concepts:
+                for j in range(self.concept_dim):
+                    val = intervene[j]
+                    if isinstance(val, torch.Tensor):
+                        val = val.item()
+                    if val != 0:
+                        concepts[:, :, j] = val
             logits = self.fc(torch.cat((self.relu(concepts), unsup_features), dim=-1))
             # Per-sample repetition penalty
             for b in range(num_samples):
@@ -209,7 +233,20 @@ class CBLResidual(nn.Module):
                 break
         return ids, self.relu(concepts)[0]
 
-    def generate_batch(self, ids, preLM, num_samples=1, intervene=None, length=100, temp=0.7, topk=100, topp=0.9, repetition_penalty=1.5, eos_token_id=128001):
+    def generate_batch(
+        self,
+        ids,
+        preLM,
+        num_samples=1,
+        intervene=None,
+        length=100,
+        temp=0.7,
+        topk=100,
+        topp=0.9,
+        repetition_penalty=1.5,
+        eos_token_id=128001,
+        keep_other_concepts: bool = False,
+    ):
         """Generate num_samples trajectories in parallel (batched autoregressive)."""
         ids = ids.expand(num_samples, -1).contiguous()  # (B, prompt_len)
         finished = torch.zeros(num_samples, dtype=torch.bool, device=ids.device)
@@ -222,9 +259,20 @@ class CBLResidual(nn.Module):
             features = outputs.last_hidden_state.float()
             concepts = self.cbl(features)
             unsup_features = self.cbl_residual(features)
-            if intervene:
+
+            # Intervention application (default behavior preserved):
+            # - keep_other_concepts=False: overwrite *all* concept dims from `intervene` (including zeros)
+            # - keep_other_concepts=True: overwrite only dims where `intervene[j] != 0`, leaving others as-is
+            if intervene and not keep_other_concepts:
                 for j in range(self.concept_dim):
                     concepts[:, :, j] = intervene[j]
+            elif intervene and keep_other_concepts:
+                for j in range(self.concept_dim):
+                    val = intervene[j]
+                    if isinstance(val, torch.Tensor):
+                        val = val.item()
+                    if val != 0:
+                        concepts[:, :, j] = val
             logits = self.fc(torch.cat((self.relu(concepts), unsup_features), dim=-1))
             # Per-sample repetition penalty
             for b in range(num_samples):
