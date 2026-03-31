@@ -5,7 +5,7 @@ import torch.nn.functional as F
 import numpy as np
 import evaluate
 from tqdm.auto import tqdm
-from datasets import load_dataset, concatenate_datasets
+from datasets import load_dataset
 import config_finegrained as CFG
 from transformers import LlamaConfig, LlamaModel, AutoTokenizer, RobertaTokenizerFast, AutoModel
 from peft import LoraConfig, TaskType, get_peft_model
@@ -14,6 +14,42 @@ import time
 from module_intervention import amplify_intervention
 from utils import elastic_net_penalty, mean_pooling, eos_pooling, get_labels, cos_sim_cubed
 import wandb
+
+
+def _num_rows_encoded(encoded):
+    """Return number of examples for either a HF Dataset or a dict-of-columns."""
+    if isinstance(encoded, dict):
+        if "input_ids" in encoded:
+            return len(encoded["input_ids"])
+        if "label" in encoded:
+            return len(encoded["label"])
+        first_key = next(iter(encoded.keys()))
+        return len(encoded[first_key])
+    return len(encoded)
+
+
+def _truncate_encoded(encoded, n: int):
+    if isinstance(encoded, dict):
+        return {k: v[:n] for k, v in encoded.items()}
+    return encoded.select(range(n))
+
+
+def _align_similarity_and_encoded(similarity: np.ndarray, encoded, split_name: str):
+    n_sim = int(similarity.shape[0])
+    n_data = int(_num_rows_encoded(encoded))
+    if n_sim == n_data:
+        return similarity, encoded
+
+    n = min(n_sim, n_data)
+    print(
+        f"WARNING: {split_name} concept-label rows ({n_sim}) != {split_name} dataset rows ({n_data}). "
+        f"Truncating both to {n}. "
+        "(This usually means the dataset is filtered/subsampled in this script but the concept labels were generated "
+        "for the original split.)"
+    )
+    return similarity[:n], _truncate_encoded(encoded, n)
+
+
 def set_seed(seed):
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
@@ -29,6 +65,12 @@ parser.add_argument("--epoch_multiplier", type=int, default=1, help="Epoch multi
 parser.add_argument("--max_length", type=int, default=350)
 parser.add_argument("--num_workers", type=int, default=0)
 parser.add_argument("--seed", type=int, default=42)
+parser.add_argument(
+    "--train_size",
+    type=int,
+    default=100000,
+    help="For non-SetFit/sst2 datasets, optionally subsample the train split to this many examples (roughly class-balanced, order-preserving). Set <=0 to disable.",
+)
 parser.add_argument("--discrimination_loss", type=float, default=1.0)
 parser.add_argument("--neg_entropy_loss", type=float, default=1.0)
 parser.add_argument("--concept_loss", type=float, default=1.0)
@@ -93,12 +135,27 @@ if __name__ == "__main__":
     if args.dataset == 'SetFit/sst2':
         val_dataset = load_dataset(args.dataset, split='validation')
 
-    if args.dataset != 'SetFit/sst2':
-        d_list = []
-        for i in range(CFG.class_num[args.dataset]):
-            d_list.append(
-                train_dataset.filter(lambda e: e['label'] == i).select(range(100000 // CFG.class_num[args.dataset])))
-        train_dataset = concatenate_datasets(d_list)
+    # If we subsample, do it via indices on the *original* train split so that
+    # precomputed concept label matrices (generated on the original split) can
+    # be subset using the same indices.
+    train_select_indices = None
+    original_train_len = len(train_dataset)
+    if args.dataset != 'SetFit/sst2' and args.train_size and args.train_size > 0 and original_train_len > args.train_size:
+        class_count = CFG.class_num[args.dataset]
+        per_class = args.train_size // class_count
+        if per_class <= 0:
+            raise ValueError(f"train_size={args.train_size} is too small for class_count={class_count}.")
+        labels = np.asarray(train_dataset["label"], dtype=np.int64)
+        selected = []
+        for class_id in range(class_count):
+            class_indices = np.flatnonzero(labels == class_id)
+            if len(class_indices) == 0:
+                raise ValueError(f"No examples found for label={class_id} in dataset {args.dataset}.")
+            selected.extend(class_indices[:per_class].tolist())
+        # Keep original ordering to match how concept labels were generated.
+        selected = sorted(selected)
+        train_select_indices = selected
+        train_dataset = train_dataset.select(train_select_indices)
 
     if args.dataset == 'ag_news':
         def replace_bad_string(example):
@@ -179,28 +236,52 @@ if __name__ == "__main__":
     
     print(f"Loading concept labels from: {label_prefix}")
     train_similarity = np.load(label_prefix + "/concept_labels_train.npy")  # (N_train, num_concepts)
+    print("train_similarity shape: ", train_similarity.shape)
     if args.dataset == 'SetFit/sst2':
         val_similarity = np.load(label_prefix + "/concept_labels_val.npy")  # (N_val, num_concepts)
+
+    # If we subsampled the train set by indices, subset the full-split concept labels identically.
+    if train_select_indices is not None and int(train_similarity.shape[0]) == int(original_train_len):
+        train_similarity = train_similarity[train_select_indices]
+        print("train_similarity shape after subsample: ", train_similarity.shape)
+
+    # Align label matrices with the (potentially subsampled) encoded datasets.
+    train_similarity, encoded_train_dataset = _align_similarity_and_encoded(
+        train_similarity, encoded_train_dataset, split_name="train"
+    )
+    if args.dataset == 'SetFit/sst2':
+        val_similarity, encoded_val_dataset = _align_similarity_and_encoded(
+            val_similarity, encoded_val_dataset, split_name="val"
+        )
+
+    # Basic shape sanity checks.
+    if train_similarity.ndim != 2 or train_similarity.shape[1] != len(concept_set):
+        raise ValueError(
+            f"Unexpected train_similarity shape {train_similarity.shape}; expected (N, {len(concept_set)}). "
+            f"Check {label_prefix}/concept_labels_train.npy and config_finegrained.concept_set for {args.dataset}."
+        )
+    if args.dataset == 'SetFit/sst2':
+        if val_similarity.ndim != 2 or val_similarity.shape[1] != len(concept_set):
+            raise ValueError(
+                f"Unexpected val_similarity shape {val_similarity.shape}; expected (N, {len(concept_set)}). "
+                f"Check {label_prefix}/concept_labels_val.npy and config_finegrained.concept_set for {args.dataset}."
+            )
 
     if args.automatic_concept_correction:
         start = time.time()
         print("training intervention...")
-        for i in range(train_similarity.shape[0]):
-            for j in range(len(concept_set)):
-                if get_labels(j, args.dataset) != encoded_train_dataset["label"][i]:
-                    train_similarity[i][j] = 0.0
-                else:
-                    if train_similarity[i][j] < 0.0:
-                        train_similarity[i][j] = 0.0
+        train_labels = np.asarray(encoded_train_dataset["label"], dtype=np.int64)
+        train_similarity = np.maximum(train_similarity, 0.0)
+        for j in range(len(concept_set)):
+            allowed_label = get_labels(j, args.dataset)
+            train_similarity[train_labels != allowed_label, j] = 0.0
         
         if args.dataset == 'SetFit/sst2':
-            for i in range(val_similarity.shape[0]):
-                for j in range(len(concept_set)):
-                    if get_labels(j, args.dataset) != encoded_val_dataset["label"][i]:
-                        val_similarity[i][j] = 0.0
-                    else:
-                        if val_similarity[i][j] < 0.0:
-                            val_similarity[i][j] = 0.0
+            val_labels = np.asarray(encoded_val_dataset["label"], dtype=np.int64)
+            val_similarity = np.maximum(val_similarity, 0.0)
+            for j in range(len(concept_set)):
+                allowed_label = get_labels(j, args.dataset)
+                val_similarity[val_labels != allowed_label, j] = 0.0
         end = time.time()
         print("time of training intervention:", (end - start) / 3600, "hours")
 
