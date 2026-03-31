@@ -569,6 +569,7 @@ if __name__ == "__main__":
     # Base number of epochs
     epochs = CFG.epoch[args.dataset] * args.epoch_multiplier
     total_steps = epochs * len(train_loader)
+    print(f"Initial epochs: {epochs}, total GRPO steps: {total_steps} (before adjustment)")
     if args.grpo_steps_per_concept > 0:
         target_total_steps = len(active_concept_indices) * args.grpo_steps_per_concept
         if total_steps < target_total_steps:
