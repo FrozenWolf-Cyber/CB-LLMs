@@ -85,7 +85,6 @@ parser.add_argument("--grpo_num_trajectories", type=int, default=4, help="Number
 parser.add_argument("--grpo_gen_length", type=int, default=100, help="Max generation length for GRPO rollouts.")
 parser.add_argument("--grpo_clip_advantage", type=float, default=5.0, help="Clip GRPO advantages to [-clip, clip].")
 parser.add_argument("--grpo_lr", type=float, default=1e-5, help="Learning rate for GRPO fine-tuning.")
-parser.add_argument("--grpo_steps_per_epoch", type=int, default=-1, help="Max GRPO steps per epoch. -1 = full dataset.")
 parser.add_argument("--grpo_steps_per_concept", type=int, default=-1,
                     help="If >0, override the effective number of epochs so that total GRPO steps scale as: original_epochs * num_concepts * grpo_steps_per_concept.")
 parser.add_argument("--concept_distill_weight", type=float, default=0.0, help="Weight for concept prediction distillation loss (CE between policy and reference model concepts on real data). 0 disables it.")
@@ -568,11 +567,15 @@ if __name__ == "__main__":
 
     start = time.time()
     # Base number of epochs
-    epochs = args.grpo_epochs * args.epoch_multiplier
-    # If requested, override effective epochs so that total GRPO steps
-    # scale with (num_concepts * grpo_steps_per_concept).
-    if args.grpo_steps_per_concept is not None and args.grpo_steps_per_concept > 0:
-        epochs = args.grpo_epochs * len(concept_set) * args.grpo_steps_per_concept
+    epochs = CFG.epoch[args.dataset] * args.epoch_multiplier
+    total_steps = epochs * len(train_loader)
+    if args.grpo_steps_per_concept > 0:
+        target_total_steps = len(active_concept_indices) * args.grpo_steps_per_concept
+        if total_steps < target_total_steps:
+            import math
+            epochs = math.ceil(target_total_steps / len(train_loader))
+            print(f"Adjusting epochs to {epochs} to meet target total GRPO steps of {target_total_steps} with {len(active_concept_indices)} active concepts.")
+            
     for e in range(epochs):
         print("Epoch ", e+1, ":")
         preLM.train()
@@ -592,11 +595,11 @@ if __name__ == "__main__":
             "grpo_reg_loss": [],
         }
 
-        
-        for i, (batch, batch_sim) in tqdm(enumerate(train_loader), total=len(train_loader)):
-            if args.grpo_steps_per_epoch > 0 and i >= args.grpo_steps_per_epoch:
-                break
 
+        for i, (batch, batch_sim) in tqdm(enumerate(train_loader), total=len(train_loader)):
+            if e*len(train_loader) + i >= total_steps:
+                print(f"Reached total step limit of {total_steps}, ending training.")
+                break
             # ======= GRPO STEP =======
             # Cycle through active_concept_indices rather than all concepts
             grpo_concept_idx = active_concept_indices[(i + e * len(train_loader)) % len(active_concept_indices)]
@@ -897,6 +900,10 @@ if __name__ == "__main__":
         torch.save(cbl.state_dict(), prefix + cbl_name + "_epoch_" + str(e + 1) + ".pt")
 
         if args.DEBUG:
+            break
+        
+        if (e+1)*len(train_loader) >= total_steps:
+            print(f"Reached total step limit of {total_steps}, ending training.")
             break
 
     end = time.time()
