@@ -575,7 +575,14 @@ if __name__ == "__main__":
         if total_steps < target_total_steps:
             import math
             epochs = math.ceil(target_total_steps / len(train_loader))
-            print(f"Adjusting epochs to {epochs} to meet target total GRPO steps of {target_total_steps} with {len(active_concept_indices)} active concepts.")
+            total_steps = epochs * len(train_loader)
+            print(
+                f"Adjusting epochs to {epochs} to meet target total GRPO steps of {target_total_steps} "
+                f"with {len(active_concept_indices)} active concepts. New total GRPO steps: {total_steps}."
+            )
+
+    # Track what we actually saved so post-training reload can't point at non-existent epochs.
+    last_saved_epoch = 0
             
     for e in range(epochs):
         print("Epoch ", e+1, ":")
@@ -899,6 +906,7 @@ if __name__ == "__main__":
         print("save model")
         preLM.save_pretrained(prefix + model_name + "_epoch_" + str(e + 1))
         torch.save(cbl.state_dict(), prefix + cbl_name + "_epoch_" + str(e + 1) + ".pt")
+        last_saved_epoch = e + 1
 
         if args.DEBUG:
             break
@@ -922,7 +930,8 @@ if __name__ == "__main__":
     gc.collect()
     
     ## lOAD BEST MODEL AND
-    best_epoch = epochs
+    # GRPO doesn't track a validation metric here; evaluate the best (latest) checkpoint we actually saved.
+    best_epoch = last_saved_epoch if last_saved_epoch > 0 else epochs
     preLM = LlamaModel.from_pretrained('meta-llama/Meta-Llama-3-8B', torch_dtype=torch.bfloat16).to(device)
     peft_path = prefix + model_name + "_epoch_" + str(best_epoch)
     preLM.load_adapter(peft_path)
