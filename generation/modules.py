@@ -46,12 +46,14 @@ class Llama_baseline_generation(nn.Module):
         self.gelu = nn.GELU()
         self.fc = nn.Linear(768, config.vocab_size)
 
-    def forward(self, t):
+    def forward(self, t, llama_logits=None):
         projected = self.projection(t)
         x = self.gelu(projected)
         x = self.dropout(x)
-        x = self.fc(x)
-        return x
+        logits = self.fc(x)
+        if llama_logits is not None:
+            logits = logits + llama_logits.to(dtype=logits.dtype)
+        return logits
 
     def generate(self, ids, preLM, length=100, temp=0.7, topk=100, topp=0.9, repetition_penalty=1.5, eos_token_id=128001):
         past_key_values = None
@@ -88,18 +90,24 @@ class CBL(nn.Module):
             print("Warning: concept_dim and unsup feature dim are not equal so creating a linear layer to match dimensions.")
             self.match_layer = nn.Linear(768, concept_dim)
 
-    def forward(self, features):
+    def forward(self, features, llama_logits=None):
         concepts = self.cbl(features)
         unsup_features = self.unsup(features)
         e = torch.cat((self.relu(concepts), unsup_features), dim=-1)
-        return self.relu(concepts), unsup_features, self.fc(e), self.match_layer(unsup_features) if self.match_layer else unsup_features
+        logits = self.fc(e)
+        if llama_logits is not None:
+            logits = logits + llama_logits.to(dtype=logits.dtype)
+        return self.relu(concepts), unsup_features, logits, self.match_layer(unsup_features) if self.match_layer else unsup_features
 
-    def intervene(self, unsup_features, intervene):
+    def intervene(self, unsup_features, intervene, llama_logits=None):
         concepts = intervene
         e = torch.cat((self.relu(concepts), unsup_features), dim=-1)
-        return self.fc(e)
+        logits = self.fc(e)
+        if llama_logits is not None:
+            logits = logits + llama_logits.to(dtype=logits.dtype)
+        return logits
 
-    def generate(self, ids, preLM, intervene=None, length=100, temp=0.7, topk=100, topp=0.9, repetition_penalty=1.5, eos_token_id=128001):
+    def generate(self, ids, preLM, intervene=None, length=100, temp=0.7, topk=100, topp=0.9, repetition_penalty=1.5, eos_token_id=128001, llama_vocab_weight=None):
         past_key_values = None
         for i in range(length):
             outputs = preLM(ids[:, -1:] if past_key_values is not None else ids, past_key_values=past_key_values, use_cache=True)
@@ -111,6 +119,9 @@ class CBL(nn.Module):
                 for j in range(self.concept_dim):
                     concepts[0, :, j] = intervene[j]
             logits = self.fc(torch.cat((self.relu(concepts), unsup_features), dim=-1))
+            if llama_vocab_weight is not None:
+                llama_logits = F.linear(outputs.last_hidden_state.to(llama_vocab_weight.dtype), llama_vocab_weight)
+                logits = logits + llama_logits.to(dtype=logits.dtype)
             score = logits[:, -1, ids[0]]
             score = torch.where(score < 0, score * repetition_penalty, score / repetition_penalty)
             logits[:, -1, ids[0]] = score
@@ -135,6 +146,7 @@ class CBL(nn.Module):
         repetition_penalty=1.5,
         eos_token_id=128001,
         keep_other_concepts: bool = False,
+        llama_vocab_weight=None,
     ):
         """Generate num_samples trajectories in parallel (batched autoregressive)."""
         ids = ids.expand(num_samples, -1).contiguous()  # (B, prompt_len)
@@ -163,6 +175,9 @@ class CBL(nn.Module):
                     if val != 0:
                         concepts[:, :, j] = val
             logits = self.fc(torch.cat((self.relu(concepts), unsup_features), dim=-1))
+            if llama_vocab_weight is not None:
+                llama_logits = F.linear(outputs.last_hidden_state.to(llama_vocab_weight.dtype), llama_vocab_weight)
+                logits = logits + llama_logits.to(dtype=logits.dtype)
             # Per-sample repetition penalty
             for b in range(num_samples):
                 if not finished[b]:
@@ -196,21 +211,27 @@ class CBLResidual(nn.Module):
             print("Warning: concept_dim and residual_dim are not equal so creating a linear layer to match dimensions.")
             self.match_layer = nn.Linear(residual_dim, concept_dim)
 
-    def forward(self, features):
+    def forward(self, features, llama_logits=None):
         concepts = self.cbl(features)
         unsup_features = self.cbl_residual(features)
         # print("concepts shape:", concepts.shape)
         # print("unsup_features shape:", unsup_features.shape)
         e = torch.cat((self.relu(concepts), unsup_features), dim=-1)
-        return self.relu(concepts), unsup_features, self.fc(e), self.match_layer(unsup_features) if self.match_layer else unsup_features
+        logits = self.fc(e)
+        if llama_logits is not None:
+            logits = logits + llama_logits.to(dtype=logits.dtype)
+        return self.relu(concepts), unsup_features, logits, self.match_layer(unsup_features) if self.match_layer else unsup_features
 
-    def intervene(self, unsup_features, intervene):
+    def intervene(self, unsup_features, intervene, llama_logits=None):
         concepts = intervene
         e = torch.cat((self.relu(concepts), unsup_features), dim=-1)
-        return self.fc(e)
+        logits = self.fc(e)
+        if llama_logits is not None:
+            logits = logits + llama_logits.to(dtype=logits.dtype)
+        return logits
 
 
-    def generate(self, ids, preLM, intervene=None, length=100, temp=0.7, topk=100, topp=0.9, repetition_penalty=1.5, eos_token_id=128001):
+    def generate(self, ids, preLM, intervene=None, length=100, temp=0.7, topk=100, topp=0.9, repetition_penalty=1.5, eos_token_id=128001, llama_vocab_weight=None):
         past_key_values = None
         for i in range(length):
             outputs = preLM(ids[:, -1:] if past_key_values is not None else ids, past_key_values=past_key_values, use_cache=True)
@@ -222,6 +243,9 @@ class CBLResidual(nn.Module):
                 for j in range(self.concept_dim):
                     concepts[0, :, j] = intervene[j]
             logits = self.fc(torch.cat((self.relu(concepts), unsup_features), dim=-1))
+            if llama_vocab_weight is not None:
+                llama_logits = F.linear(outputs.last_hidden_state.to(llama_vocab_weight.dtype), llama_vocab_weight)
+                logits = logits + llama_logits.to(dtype=logits.dtype)
             score = logits[:, -1, ids[0]]
             score = torch.where(score < 0, score * repetition_penalty, score / repetition_penalty)
             logits[:, -1, ids[0]] = score
@@ -246,6 +270,7 @@ class CBLResidual(nn.Module):
         repetition_penalty=1.5,
         eos_token_id=128001,
         keep_other_concepts: bool = False,
+        llama_vocab_weight=None,
     ):
         """Generate num_samples trajectories in parallel (batched autoregressive)."""
         ids = ids.expand(num_samples, -1).contiguous()  # (B, prompt_len)
@@ -274,6 +299,9 @@ class CBLResidual(nn.Module):
                     if val != 0:
                         concepts[:, :, j] = val
             logits = self.fc(torch.cat((self.relu(concepts), unsup_features), dim=-1))
+            if llama_vocab_weight is not None:
+                llama_logits = F.linear(outputs.last_hidden_state.to(llama_vocab_weight.dtype), llama_vocab_weight)
+                logits = logits + llama_logits.to(dtype=logits.dtype)
             # Per-sample repetition penalty
             for b in range(num_samples):
                 if not finished[b]:

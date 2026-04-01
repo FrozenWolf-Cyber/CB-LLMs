@@ -7,7 +7,7 @@ import evaluate
 from tqdm.auto import tqdm
 from datasets import load_dataset
 import config_finegrained as CFG
-from transformers import LlamaConfig, LlamaModel, AutoTokenizer, RobertaTokenizerFast, AutoModel
+from transformers import LlamaConfig, LlamaModel, AutoTokenizer, RobertaTokenizerFast, AutoModel, AutoModelForCausalLM
 from peft import LoraConfig, TaskType, get_peft_model
 from modules import CBLResidual, CBL, Roberta_classifier
 import time
@@ -210,6 +210,14 @@ parser.add_argument("--automatic_concept_correction", action='store_true', help=
 parser.add_argument("--concept_loss_type", type=str, default="cosine_cubed", help="Type of concept loss to use: 'cosine_cubed' or 'ce'.")
 parser.add_argument("--labeling", type=str, default="mpnet", help="mpnet, angle, simcse, llm")
 parser.add_argument("--use_last_epoch", action='store_true', help="If set, load the classifier from the last epoch instead of the best epoch based on validation loss.")
+parser.add_argument(
+    "--add_llama_logits",
+    action="store_true",
+    help=(
+        "If set, add the original Llama vocab projection logits (from the backbone hidden states) to the CBL/CBLResidual logits. "
+        "This keeps CBL unchanged (no extra parameters) and acts like a residual-on-logits."
+    ),
+)
 
 
 class ClassificationDataset(torch.utils.data.Dataset):
@@ -414,6 +422,18 @@ if __name__ == "__main__":
     preLM.print_trainable_parameters()
     lora_layers = filter(lambda p: p.requires_grad, preLM.parameters())
     opt_prelm = torch.optim.Adam(lora_layers, lr=5e-5)
+
+    llama_vocab_weight = None
+    if args.add_llama_logits:
+        # IMPORTANT: For Llama-3, lm_head weights are not necessarily tied to input embeddings.
+        # We therefore grab the *output* projection (lm_head) weights from a CausalLM head.
+        # This does not add parameters to CBL; it's just an external tensor used in forward.
+        lm_head_model = AutoModelForCausalLM.from_pretrained(
+            'meta-llama/Meta-Llama-3-8B',
+            torch_dtype=torch.bfloat16,
+        ).to(device)
+        llama_vocab_weight = lm_head_model.get_output_embeddings().weight.detach()
+        del lm_head_model
     
     if args.discrimination_loss > 0:
         cbl = CBL(config, len(concept_set), tokenizer).to(device)
@@ -483,7 +503,8 @@ if __name__ == "__main__":
 
             word_label = torch.where(batch["attention_mask"][:, :-1] == 0, -100, batch["input_ids"][:, 1:])
             features = preLM(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"]).last_hidden_state
-            concepts, unsup, vocabs, matched_unsup = cbl(features.float())
+            llama_logits = F.linear(features, llama_vocab_weight) if llama_vocab_weight is not None else None
+            concepts, unsup, vocabs, matched_unsup = cbl(features.float(), llama_logits=llama_logits)
             # print("concepts shape in training loop:", concepts.shape)
             # print("elastic_net_alphaunsup shape in training loop:", unsup.shape)
             # print("vocabs shape in training loop:", vocabs.shape)
@@ -538,10 +559,14 @@ if __name__ == "__main__":
                 )
                     
                 # print("intervened_concept shape: ", intervened_concept.shape, intervened_concept.max(), intervened_concept.min())
+                llama_logits_for_intervene = None
+                if llama_logits is not None:
+                    llama_logits_for_intervene = llama_logits if args.no_detach_intervention else llama_logits.detach()
+
                 if args.no_detach_intervention:
-                    vocab = cbl.intervene(unsup, intervened_concept.detach())
+                    vocab = cbl.intervene(unsup, intervened_concept.detach(), llama_logits=llama_logits_for_intervene)
                 else:
-                    vocab = cbl.intervene(unsup.detach(), intervened_concept.detach())
+                    vocab = cbl.intervene(unsup.detach(), intervened_concept.detach(), llama_logits=llama_logits_for_intervene)
                 intervention_gen_loss = torch.nn.CrossEntropyLoss()(vocab[:, :-1, :].reshape(-1, config.vocab_size), word_label.reshape(-1))
                 loss += args.intervention_gen_loss * intervention_gen_loss
                 training_losses["intervention_gen_loss"].append(intervention_gen_loss.detach().cpu().numpy())
@@ -630,7 +655,8 @@ if __name__ == "__main__":
                 word_label = torch.where(batch["attention_mask"][:, :-1] == 0, -100, batch["input_ids"][:, 1:])
                 with torch.no_grad():
                     features = preLM(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"]).last_hidden_state
-                    concepts, unsup, vocabs, matched_unsup = cbl(features.float())
+                    llama_logits = F.linear(features, llama_vocab_weight) if llama_vocab_weight is not None else None
+                    concepts, unsup, vocabs, matched_unsup = cbl(features.float(), llama_logits=llama_logits)
                     classification = classifier(mean_pooling(unsup, batch["attention_mask"]))
                 
                 mask = (batch["attention_mask"][:, :-1] != 0).reshape(-1)
@@ -672,7 +698,7 @@ if __name__ == "__main__":
                         use_topk=args.intervention_topk_concepts,
                         topk_k=args.intervention_topk_k,
                     )
-                    vocab = cbl.intervene(unsup.detach(), intervened_concept.detach())
+                    vocab = cbl.intervene(unsup.detach(), intervened_concept.detach(), llama_logits=llama_logits)
                     intervention_gen_loss = torch.nn.CrossEntropyLoss()(vocab[:, :-1, :].reshape(-1, config.vocab_size), word_label.reshape(-1))
                     val_losses["val_intervention_gen_loss"].append(intervention_gen_loss.detach().cpu().numpy())
                 
@@ -734,6 +760,15 @@ if __name__ == "__main__":
     peft_path = prefix + model_name + "_epoch_" + str(best_epoch)
     preLM.load_adapter(peft_path)
     preLM.eval()
+
+    llama_vocab_weight = None
+    if args.add_llama_logits:
+        lm_head_model = AutoModelForCausalLM.from_pretrained(
+            'meta-llama/Meta-Llama-3-8B',
+            torch_dtype=torch.bfloat16,
+        ).to(device)
+        llama_vocab_weight = lm_head_model.get_output_embeddings().weight.detach()
+        del lm_head_model
     if args.discrimination_loss > 0:
         cbl = CBL(config, len(concept_set), tokenizer).to(device)
     else:
@@ -792,6 +827,7 @@ if __name__ == "__main__":
                 intervene=v,
                 length=50,
                 keep_other_concepts=args.intervention_keep_other_concepts,
+                llama_vocab_weight=llama_vocab_weight,
             )  # (num_steerability_samples, gen_len)
 
             # Decode and collect texts for MPNet scoring
