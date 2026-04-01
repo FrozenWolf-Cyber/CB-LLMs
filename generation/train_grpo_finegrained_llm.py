@@ -145,7 +145,7 @@ class ClassificationDataset(torch.utils.data.Dataset):
 
 def build_loaders(encoded_text, s, mode):
     dataset = ClassificationDataset(encoded_text, s)
-    dataloader = torch.utils.data.DataLoader(dataset, batch_size=args.batch_size, num_workers=args.num_workers,
+    dataloader = torch.utils.data.DataLoader(dataset, batch_size=max(args.batch_size, args.grpo_mix_k), num_workers=args.num_workers,
                                              shuffle=True if mode == "train" else False)
     return dataloader
 
