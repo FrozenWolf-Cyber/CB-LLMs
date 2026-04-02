@@ -1023,7 +1023,7 @@ if __name__ == "__main__":
     for i in tqdm(range(100)):
         print("example", str(i), end="\r")
         with torch.no_grad():
-            text_ids, _ = cbl.generate(input_ids, preLM)
+            text_ids, _ = cbl.generate(input_ids, preLM, llama_vocab_weight=llama_vocab_weight)
             pred.append(tokenizer.decode(text_ids[0], skip_special_tokens=True ))
             if len(pred[-1].split()) > 30:
                 continue

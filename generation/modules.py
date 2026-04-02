@@ -55,7 +55,7 @@ class Llama_baseline_generation(nn.Module):
             logits = logits + llama_logits.to(dtype=logits.dtype)
         return logits
 
-    def generate(self, ids, preLM, length=100, temp=0.7, topk=100, topp=0.9, repetition_penalty=1.5, eos_token_id=128001):
+    def generate(self, ids, preLM, length=100, temp=0.7, topk=100, topp=0.9, repetition_penalty=1.5, eos_token_id=128001, llama_vocab_weight=None):
         past_key_values = None
         for i in range(length):
             outputs = preLM(ids[:, -1:] if past_key_values is not None else ids, past_key_values=past_key_values, use_cache=True)
@@ -65,6 +65,9 @@ class Llama_baseline_generation(nn.Module):
             x = self.gelu(projected)
             x = self.dropout(x)
             logits = self.fc(x)
+            if llama_vocab_weight is not None:
+                llama_logits = F.linear(outputs.last_hidden_state.to(llama_vocab_weight.dtype), llama_vocab_weight)
+                logits = logits + llama_logits.to(dtype=logits.dtype)
             score = logits[:, -1, ids[0]]
             score = torch.where(score < 0, score * repetition_penalty, score / repetition_penalty)
             logits[:, -1, ids[0]] = score
