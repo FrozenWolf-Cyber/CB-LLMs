@@ -7,9 +7,27 @@ import numpy as np
 import evaluate
 from tqdm.auto import tqdm
 import config as CFG
-from transformers import LlamaConfig, LlamaModel, AutoTokenizer, RobertaTokenizerFast
+from transformers import LlamaConfig, LlamaModel, AutoTokenizer, RobertaTokenizerFast, AutoModelForCausalLM
 from modules import CBLResidual, CBL, Roberta_classifier
 import wandb
+
+
+_CACHED_LLAMA_VOCAB_WEIGHT = None
+
+
+def get_llama_vocab_weight():
+    global _CACHED_LLAMA_VOCAB_WEIGHT
+    if _CACHED_LLAMA_VOCAB_WEIGHT is not None:
+        return _CACHED_LLAMA_VOCAB_WEIGHT
+
+    lm_head_model = AutoModelForCausalLM.from_pretrained(
+        'meta-llama/Meta-Llama-3-8B',
+        torch_dtype=torch.bfloat16,
+    ).to(device)
+    _CACHED_LLAMA_VOCAB_WEIGHT = lm_head_model.get_output_embeddings().weight.detach()
+    del lm_head_model
+    torch.cuda.empty_cache()
+    return _CACHED_LLAMA_VOCAB_WEIGHT
 
 
 def set_seed(seed):
@@ -123,7 +141,7 @@ def find_eval_checkpoint(prefix, run_type, dataset):
     return peft_path, cbl_path, best_epoch, is_low_score
 
 
-def generate_steerability_texts(preLM, cbl, tokenizer, concept_set, dataset, samples_per_concept, print_k=3):
+def generate_steerability_texts(preLM, cbl, tokenizer, concept_set, dataset, samples_per_concept, print_k=3, llama_vocab_weight=None):
     """
     Generate steerability texts with batched generation for each concept.
     Returns: list of lists, shape (num_concepts, samples_per_concept)
@@ -154,6 +172,7 @@ def generate_steerability_texts(preLM, cbl, tokenizer, concept_set, dataset, sam
                     num_samples=current_batch,
                     intervene=v,
                     length=50,
+                    llama_vocab_weight=llama_vocab_weight,
                 )
 
                 for b in range(current_batch):
@@ -222,7 +241,16 @@ def load_model_and_cbl(peft_path, cbl_path, config, concept_set, tokenizer, disc
     else:
         cbl = CBLResidual(config, len(concept_set), residual_dim, tokenizer).to(device)
     
-    cbl.load_state_dict(torch.load(cbl_path, map_location=device), strict=False)
+    state_dict = torch.load(cbl_path, map_location=device)
+    try:
+        cbl.load_state_dict(state_dict, strict=True)
+    except RuntimeError as e:
+        print(f"Warning: strict load_state_dict failed for {cbl_path}: {e}")
+        incompatible = cbl.load_state_dict(state_dict, strict=False)
+        print(
+            "Falling back to strict=False: "
+            f"missing={len(incompatible.missing_keys)} unexpected={len(incompatible.unexpected_keys)}"
+        )
     cbl.eval()
     
     return preLM, cbl
@@ -266,6 +294,9 @@ def process_run(run_id, classifier_suffixes, expected_dataset, seed, wandb_proje
     discrimination_loss = run_config.get('discrimination_loss', 1.0)
     arch_type = run_config.get('arch_type', None)
     residual_dim = run_config.get('residual_dim', 768)
+
+    add_llama_logits = bool(run_config.get('add_llama_logits', False))
+    print(f"Add llama logits: {add_llama_logits} (source=wandb_config_default_false)")
     
     print(f"Dataset: {dataset}, Steerability seed: {seed}")
     
@@ -297,8 +328,9 @@ def process_run(run_id, classifier_suffixes, expected_dataset, seed, wandb_proje
     
     roberta_tokenizer = RobertaTokenizerFast.from_pretrained('roberta-base')
     
-    concept_set = CFG.concepts_from_labels[dataset]
-    print(f"Concept set length: {len(concept_set)}")
+    # Match train_combined_finegrained.py: concept_set drives CBL output dimension.
+    concept_set = CFG.concept_set.get(dataset, CFG.concepts_from_labels[dataset])
+    print(f"Concept len: {len(concept_set)}")
     
     # Load multiple roberta classifiers for steerability test (same order as training scripts)
     classifiers = {}
@@ -354,6 +386,7 @@ def process_run(run_id, classifier_suffixes, expected_dataset, seed, wandb_proje
 
         # Generate once (batched), then reuse texts for all classifiers.
         samples_per_concept = max(1, 100 // len(concept_set))
+        llama_vocab_weight = get_llama_vocab_weight() if add_llama_logits else None
         decoded_texts_by_concept = generate_steerability_texts(
             preLM,
             cbl,
@@ -362,6 +395,7 @@ def process_run(run_id, classifier_suffixes, expected_dataset, seed, wandb_proje
             dataset,
             samples_per_concept=samples_per_concept,
             print_k=3,
+            llama_vocab_weight=llama_vocab_weight,
         )
 
         for clf_idx, classifier in classifiers.items():

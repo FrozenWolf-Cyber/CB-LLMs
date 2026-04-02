@@ -153,7 +153,16 @@ def load_model_and_cbl(peft_path, cbl_path, config, concept_set, tokenizer, disc
     else:
         cbl = CBLResidual(config, len(concept_set), residual_dim, tokenizer).to(device)
     
-    cbl.load_state_dict(torch.load(cbl_path, map_location=device), strict=False)
+    state_dict = torch.load(cbl_path, map_location=device)
+    try:
+        cbl.load_state_dict(state_dict, strict=True)
+    except RuntimeError as e:
+        print(f"Warning: strict load_state_dict failed for {cbl_path}: {e}")
+        incompatible = cbl.load_state_dict(state_dict, strict=False)
+        print(
+            "Falling back to strict=False: "
+            f"missing={len(incompatible.missing_keys)} unexpected={len(incompatible.unexpected_keys)}"
+        )
     cbl.eval()
     
     return preLM, cbl
@@ -297,8 +306,9 @@ def process_run(
     tokenizer = AutoTokenizer.from_pretrained('meta-llama/Meta-Llama-3-8B')
     tokenizer.pad_token = tokenizer.eos_token
     
-    concept_set = CFG.concepts_from_labels[dataset]
-    print(f"Concept set length: {len(concept_set)}")
+    # Match train_combined_finegrained.py: concept_set drives the CBL output dimension.
+    concept_set = CFG.concept_set.get(dataset, CFG.concepts_from_labels[dataset])
+    print(f"Concept len: {len(concept_set)}")
     
     # Resume wandb run
     resumed_run = wandb.init(
