@@ -244,25 +244,30 @@ def compute_llm_rewards_batch(base_lm_model, base_lm_tokenizer, texts, concept_n
     # Few-shot completion prompt.
     # Two demonstrations teach the pattern; prompt ends with '[' so the
     # base model just continues the completion.
+# OLD
+# Three entries per demo with varied non-alternating scores to prevent
+    # the model from learning a positional pattern (9,0,9,0,...).
     few_shot = (
         'Concept: "technology"\n'
         '(1) The smartphone revolution transformed how billions communicate daily.\n'
         '(2) She baked a rich chocolate cake with extra frosting for the party.\n'
-        'Scores: [{"concept_relevance":9,"coherence":8,"grammar":9},{"concept_relevance":0,"coherence":8,"grammar":9}]\n\n'
+        '(3) Engineers debated the tradeoffs of the new processor architecture.\n'
+        'Scores: [{"concept_relevance":9,"coherence":8,"grammar":9},{"concept_relevance":1,"coherence":8,"grammar":9},{"concept_relevance":7,"coherence":7,"grammar":8}]\n\n'
         'Concept: "nature"\n'
         '(1) Towering oaks and mossy boulders lined the winding forest trail.\n'
         '(2) The quarterly earnings report exceeded analyst expectations by 12 percent.\n'
-        'Scores: [{"concept_relevance":9,"coherence":9,"grammar":8},{"concept_relevance":0,"coherence":8,"grammar":8}]\n\n'
+        '(3) A gentle rain softened the dusty summer soil.\n'
+        'Scores: [{"concept_relevance":9,"coherence":9,"grammar":8},{"concept_relevance":0,"coherence":8,"grammar":8},{"concept_relevance":8,"coherence":8,"grammar":9}]\n\n'
     )
 
     prompt = (
-        f"Score each text for concept_relevance, coherence, and grammar (integers 0-9).\n\n"
+        f"Score each text for concept_relevance, coherence, and grammar (integers 0-9).\n"
+        f"Output exactly {n} JSON objects then close the array with ].\n\n"
         f"{few_shot}"
         f'Concept: "{concept_name}"\n'
         f"{trajectory_block}"
         f'Scores: [{{"'
     )
-
     if debug:
         print(f"\n[LLM reward DEBUG] ===== INPUT PROMPT =====\n{prompt}\n{'='*60}")
 
