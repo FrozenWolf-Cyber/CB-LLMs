@@ -239,19 +239,19 @@ def compute_llm_rewards_batch(base_lm_model, base_lm_tokenizer, texts, concept_n
     trajectory_block = ""
     for idx, t in enumerate(texts):
         trunc = t[:max_text_len].replace('"', "'").replace("\n", " ")
-        trajectory_block += f"[{idx + 1}] {trunc}\n"
+        trajectory_block += f"({idx + 1}) {trunc}\n"
 
     # Few-shot completion prompt.
     # Two demonstrations teach the pattern; prompt ends with '[' so the
     # base model just continues the completion.
     few_shot = (
         'Concept: "technology"\n'
-        '[1] The smartphone revolution transformed how billions communicate daily.\n'
-        '[2] She baked a rich chocolate cake with extra frosting for the party.\n'
+        '(1) The smartphone revolution transformed how billions communicate daily.\n'
+        '(2) She baked a rich chocolate cake with extra frosting for the party.\n'
         'Scores: [{"concept_relevance":9,"coherence":8,"grammar":9},{"concept_relevance":0,"coherence":8,"grammar":9}]\n\n'
         'Concept: "nature"\n'
-        '[1] Towering oaks and mossy boulders lined the winding forest trail.\n'
-        '[2] The quarterly earnings report exceeded analyst expectations by 12 percent.\n'
+        '(1) Towering oaks and mossy boulders lined the winding forest trail.\n'
+        '(2) The quarterly earnings report exceeded analyst expectations by 12 percent.\n'
         'Scores: [{"concept_relevance":9,"coherence":9,"grammar":8},{"concept_relevance":0,"coherence":8,"grammar":8}]\n\n'
     )
 
@@ -260,7 +260,7 @@ def compute_llm_rewards_batch(base_lm_model, base_lm_tokenizer, texts, concept_n
         f"{few_shot}"
         f'Concept: "{concept_name}"\n'
         f"{trajectory_block}"
-        f"Scores: ["
+        f'Scores: [{{"'
     )
 
     if debug:
@@ -293,7 +293,7 @@ def compute_llm_rewards_batch(base_lm_model, base_lm_tokenizer, texts, concept_n
         print(f"[LLM reward DEBUG] ===== RAW MODEL OUTPUT =====\n{response}\n{'='*60}")
 
     # Prepend the '[' we held back — the model completed the array body
-    candidate = "[" + response
+    candidate = '[{"' + response
 
     parsed = None
     try:
