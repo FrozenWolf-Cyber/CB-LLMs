@@ -200,112 +200,130 @@ def find_pretrained_checkpoint(run_id, dataset):
 
 
 def compute_llm_rewards_batch(base_lm_model, base_lm_tokenizer, texts, concept_name, device,
-                               max_text_len=200, max_new_tokens=256):
-    """Compute LLM-as-judge rewards with a single joint prompt covering all trajectories.
+                               max_text_len=200, max_new_tokens=512, debug=False):
+    """Compute LLM-as-judge rewards using few-shot completion prompting.
 
-    All non-empty texts are presented together in one prompt so the model can score
-    them relatively.  The model is instructed to reply with a JSON array where each
-    element has three integer fields (0-9 each):
-
-        [{"concept_relevance": <int>, "coherence": <int>, "grammar": <int>}, ...]
-
-    The final reward for each trajectory is the unweighted mean of the three criteria,
-    normalised to [0, 1].  If parsing fails the reward falls back to 0.
+    Uses two few-shot demonstrations so that base (non-instruct) Llama-3-8B reliably
+    completes the JSON array pattern without instruction-following capability.
+    The prompt ends with '[' (opening of the scores array) so greedy decoding
+    simply continues the established pattern.
 
     Args:
         base_lm_model     : AutoModelForCausalLM (frozen, on device).
         base_lm_tokenizer : matching tokenizer (pad_token must be set).
-        texts             : list[str] — all G trajectories (may include empty strings).
-        concept_name      : str, the target concept label used for concept_relevance.
+        texts             : list[str] — trajectories to score (caller handles filtering;
+                            no internal .strip() filtering to avoid index misalignment).
+        concept_name      : str, the target concept label for concept_relevance scoring.
         device            : torch.device.
         max_text_len      : max chars of each trajectory included in the prompt.
-        max_new_tokens    : budget for the model's JSON reply.
+        max_new_tokens    : token budget for the model's JSON completion.
+        debug             : if True, print the full input prompt and raw model output.
 
     Returns:
-        rewards : list[float] of the same length as `texts`, values in [0, 1].
+        rewards    : list[float] same length as `texts`, values in [0, 1].
         raw_scores : list[dict|None] — parsed per-trajectory score dicts (for logging).
     """
     import json, re
 
-    # Make sure any previous step's intermediates are gone
     cuda_gc()
 
-    rewards = [0.0] * len(texts)
-    raw_scores = [None] * len(texts)
+    n = len(texts)
+    rewards = [0.0] * n
+    raw_scores = [None] * n
 
-    valid_idx = [i for i, t in enumerate(texts) if t.strip()]
-    if not valid_idx:
+    if n == 0:
         cuda_gc()
         return rewards, raw_scores
 
-    # Build the numbered list of trajectories to embed in the prompt
+    # Build numbered trajectory block — no internal filtering so indices stay aligned
     trajectory_block = ""
-    for rank, idx in enumerate(valid_idx):
-        trunc = texts[idx][:max_text_len].replace('"', "'").replace("\n", " ")
-        trajectory_block += f"[{rank + 1}] {trunc}\n"
+    for idx, t in enumerate(texts):
+        trunc = t[:max_text_len].replace('"', "'").replace("\n", " ")
+        trajectory_block += f"[{idx + 1}] {trunc}\n"
 
-    prompt = (
-        f"You are an expert evaluator for a language model steered towards the concept: \"{concept_name}\".\n\n"
-        f"Below are {len(valid_idx)} generated text samples numbered [1]–[{len(valid_idx)}].\n\n"
-        f"{trajectory_block}\n"
-        f"Score EACH sample on the following three criteria, each from 0 (worst) to 9 (best):\n"
-        f"  - concept_relevance : How well does the text discuss or relate to \"{concept_name}\"?\n"
-        f"  - coherence         : Is the text logically coherent and on-topic throughout?\n"
-        f"  - grammar           : Is the text grammatically correct and fluent?\n\n"
-        f"Reply ONLY with a valid JSON array of exactly {len(valid_idx)} objects in order, like:\n"
-        f'[{{"concept_relevance":5,"coherence":7,"grammar":8}}, ...]\n'
-        f"No extra text, no markdown, no explanation — just the JSON array."
+    # Few-shot completion prompt.
+    # Two demonstrations teach the pattern; prompt ends with '[' so the
+    # base model just continues the completion.
+    few_shot = (
+        'Concept: "technology"\n'
+        '[1] The smartphone revolution transformed how billions communicate daily.\n'
+        '[2] She baked a rich chocolate cake with extra frosting for the party.\n'
+        'Scores: [{"concept_relevance":9,"coherence":8,"grammar":9},{"concept_relevance":0,"coherence":8,"grammar":9}]\n\n'
+        'Concept: "nature"\n'
+        '[1] Towering oaks and mossy boulders lined the winding forest trail.\n'
+        '[2] The quarterly earnings report exceeded analyst expectations by 12 percent.\n'
+        'Scores: [{"concept_relevance":9,"coherence":9,"grammar":8},{"concept_relevance":0,"coherence":8,"grammar":8}]\n\n'
     )
 
-    enc = base_lm_tokenizer(prompt, return_tensors="pt", truncation=True, max_length=1024).to(device)
+    prompt = (
+        f"Score each text for concept_relevance, coherence, and grammar (integers 0-9).\n\n"
+        f"{few_shot}"
+        f'Concept: "{concept_name}"\n'
+        f"{trajectory_block}"
+        f"Scores: ["
+    )
+
+    if debug:
+        print(f"\n[LLM reward DEBUG] ===== INPUT PROMPT =====\n{prompt}\n{'='*60}")
+
+    # Dynamic budget: leave max_new_tokens of headroom in context window
+    model_max = getattr(base_lm_tokenizer, 'model_max_length', 8192)
+    max_prompt_tokens = max(512, model_max - max_new_tokens)
+
+    enc = base_lm_tokenizer(
+        prompt, return_tensors="pt",
+        truncation=True, max_length=max_prompt_tokens
+    ).to(device)
 
     with torch.inference_mode():
         out_ids = base_lm_model.generate(
             **enc,
             max_new_tokens=max_new_tokens,
-            do_sample=False,             # greedy — deterministic and cheap
+            do_sample=False,
             temperature=1.0,
             pad_token_id=base_lm_tokenizer.eos_token_id,
         )
 
-    # Decode only the newly generated tokens (strip prompt prefix)
+    # Decode only newly generated tokens (strip prompt prefix)
     new_ids = out_ids[0][enc["input_ids"].shape[1]:]
-    response = base_lm_tokenizer.decode(new_ids, skip_special_tokens=True).strip()
+    response = base_lm_tokenizer.decode(new_ids, skip_special_tokens=True)
 
-    # Parse JSON — be tolerant of minor formatting issues
+    if debug:
+        print(f"[LLM reward DEBUG] ===== RAW MODEL OUTPUT =====\n{response}\n{'='*60}")
+
+    # Prepend the '[' we held back — the model completed the array body
+    candidate = "[" + response
+
     parsed = None
     try:
-        parsed = json.loads(response)
+        parsed = json.loads(candidate)
     except json.JSONDecodeError:
-        # Try to extract the first [...] block in case the model added preamble
-        match = re.search(r'\[.*\]', response, re.DOTALL)
+        # Tolerate trailing text: grab the first complete [...] block
+        match = re.search(r'\[.*?\]', candidate, re.DOTALL)
         if match:
             try:
                 parsed = json.loads(match.group(0))
             except json.JSONDecodeError:
                 parsed = None
 
-    if parsed is not None and isinstance(parsed, list) and len(parsed) == len(valid_idx):
-        for rank, idx in enumerate(valid_idx):
-            entry = parsed[rank]
+    parse_ok = parsed is not None and isinstance(parsed, list) and len(parsed) == n
+    if parse_ok:
+        for idx, entry in enumerate(parsed):
             if isinstance(entry, dict):
-                cr = float(entry.get("concept_relevance", 0))
-                co = float(entry.get("coherence", 0))
-                gr = float(entry.get("grammar", 0))
-                # Clamp to [0, 9] and normalise to [0, 1]
-                cr = max(0.0, min(9.0, cr)) / 9.0
-                co = max(0.0, min(9.0, co)) / 9.0
-                gr = max(0.0, min(9.0, gr)) / 9.0
+                cr = max(0.0, min(9.0, float(entry.get("concept_relevance", 0)))) / 9.0
+                co = max(0.0, min(9.0, float(entry.get("coherence", 0)))) / 9.0
+                gr = max(0.0, min(9.0, float(entry.get("grammar", 0)))) / 9.0
                 rewards[idx] = (cr + co + gr) / 3.0
                 raw_scores[idx] = {"concept_relevance": cr, "coherence": co, "grammar": gr}
     else:
-        print(f"[LLM reward] JSON parse failed or wrong length. response[:200]: {response[:200]}")
+        got_len = len(parsed) if isinstance(parsed, list) else type(parsed).__name__
+        print(f"[LLM reward] JSON parse failed or wrong length (got {got_len}, expected {n}).")
+        print(f"[LLM reward] candidate[:400]: {candidate[:400]}")
 
-    # Free intermediate tensors from the generation
-    del enc, out_ids, new_ids
+    del enc, out_ids, new_ids, candidate, response
     if 'match' in locals():
         del match
-    del trajectory_block, prompt, response, parsed
+    del trajectory_block, prompt, few_shot
     cuda_gc()
 
     return rewards, raw_scores
@@ -582,33 +600,33 @@ if __name__ == "__main__":
     print("Loaded MPNET for GRPO similarity scoring.")
 
     # Load RoBERTa concept classifiers for GRPO on-the-fly ACS-style filtering
-    grpo_classifiers = []
-    roberta_tokenizer_grpo = RobertaTokenizerFast.from_pretrained('roberta-base')
-    d_grpo = args.dataset.replace('/', '_')
-    grpo_clf_paths = [d_grpo + "_classifier.pt"]
-    clf_suffixes = [s.strip() for s in args.classifier_weight_suffixes.split(',')]
-    for suffix in clf_suffixes:
-        grpo_clf_paths.append(d_grpo + f"_classifier{suffix}.pt")
+    # grpo_classifiers = []
+    # roberta_tokenizer_grpo = RobertaTokenizerFast.from_pretrained('roberta-base')
+    # d_grpo = args.dataset.replace('/', '_')
+    # grpo_clf_paths = [d_grpo + "_classifier.pt"]
+    # clf_suffixes = [s.strip() for s in args.classifier_weight_suffixes.split(',')]
+    # for suffix in clf_suffixes:
+    #     grpo_clf_paths.append(d_grpo + f"_classifier{suffix}.pt")
 
-    for clf_path in grpo_clf_paths:
-        if not os.path.exists(clf_path):
-            print(f"[GRPO] Warning: classifier weights not found at {clf_path}, skipping.")
-            continue
-        try:
-            clf = Roberta_classifier(len(concept_set)).to(device)
-            clf.load_state_dict(torch.load(clf_path, map_location=device))
-            clf.eval()
-            for p in clf.parameters():
-                p.requires_grad = False
-            try:
-                clf = torch.compile(clf)
-            except Exception as compile_err:
-                print(f"  [GRPO] Warning: torch.compile failed for {clf_path}, using eager mode: {compile_err}")
-            grpo_classifiers.append(clf)
-        except Exception as e:
-            print(f"[GRPO] Warning: failed to load classifier from {clf_path}: {e}")
+    # for clf_path in grpo_clf_paths:
+    #     if not os.path.exists(clf_path):
+    #         print(f"[GRPO] Warning: classifier weights not found at {clf_path}, skipping.")
+    #         continue
+    #     try:
+    #         clf = Roberta_classifier(len(concept_set)).to(device)
+    #         clf.load_state_dict(torch.load(clf_path, map_location=device))
+    #         clf.eval()
+    #         for p in clf.parameters():
+    #             p.requires_grad = False
+    #         try:
+    #             clf = torch.compile(clf)
+    #         except Exception as compile_err:
+    #             print(f"  [GRPO] Warning: torch.compile failed for {clf_path}, using eager mode: {compile_err}")
+    #         grpo_classifiers.append(clf)
+    #     except Exception as e:
+    #         print(f"[GRPO] Warning: failed to load classifier from {clf_path}: {e}")
 
-    print(f"Loaded {len(grpo_classifiers)} RoBERTa classifiers for GRPO concept filtering.")
+    # print(f"Loaded {len(grpo_classifiers)} RoBERTa classifiers for GRPO concept filtering.")
 
     # ---- Base LLM (AutoModelForCausalLM) for 'llm' reward mode ----
     # This single model serves TWO roles:
@@ -850,13 +868,16 @@ if __name__ == "__main__":
                         # Move base LLM to GPU for reward scoring, then offload back to CPU.
                         cuda_gc()
                         base_lm_model.to(device)
+                        # Print prompt + output for the first 3 steps to verify parsing
+                        _llm_debug = (e == 0 and i < 3)
                         llm_rewards, llm_raw_scores = compute_llm_rewards_batch(
                             base_lm_model, base_lm_tokenizer,
                             non_empty_texts,
                             concept_name=concept_set[grpo_concept_idx],
                             device=device,
                             max_text_len=args.grpo_llm_max_text_len,
-                            max_new_tokens=256,
+                            max_new_tokens=512,
+                            debug=_llm_debug,
                         )
                         base_lm_model.to("cpu")
                         cuda_gc()
@@ -910,27 +931,28 @@ if __name__ == "__main__":
                         v_tensor_grpo = torch.tensor(v_target_grpo).to(device).unsqueeze(0).expand(len(non_empty_texts), -1)  # (N_non_empty, C)
 
                         # If available, use RoBERTa concept classifiers to filter/weight ACS similarities
-                        if grpo_classifiers:
-                            rob_enc = roberta_tokenizer_grpo(
-                                non_empty_texts,
-                                return_tensors='pt', truncation=True,
-                                max_length=512, padding=True
-                            ).to(device)
-                            rob_input = {"input_ids": rob_enc["input_ids"], "attention_mask": rob_enc["attention_mask"]}
+                        ## TODO : FIX DOWNSCALING SIMILARITY SCORES, FOR INCORRECT CONCEPT TO LABEL MAPPING
+                        # if grpo_classifiers:
+                        #     rob_enc = roberta_tokenizer_grpo(
+                        #         non_empty_texts,
+                        #         return_tensors='pt', truncation=True,
+                        #         max_length=512, padding=True
+                        #     ).to(device)
+                        #     rob_input = {"input_ids": rob_enc["input_ids"], "attention_mask": rob_enc["attention_mask"]}
 
-                            total_probs = torch.zeros(len(non_empty_texts), len(concept_set), device=device)
-                            for grpo_clf in grpo_classifiers:
-                                clf_logits = grpo_clf(rob_input)  # (N_non_empty, C)
-                                probs = F.softmax(clf_logits, dim=-1)
-                                total_probs += probs
-                            total_probs /= len(grpo_classifiers)
+                        #     total_probs = torch.zeros(len(non_empty_texts), len(concept_set), device=device)
+                        #     for grpo_clf in grpo_classifiers:
+                        #         clf_logits = grpo_clf(rob_input)  # (N_non_empty, C)
+                        #         probs = F.softmax(clf_logits, dim=-1)
+                        #         total_probs += probs
+                        #     total_probs /= len(grpo_classifiers)
 
-                            # Element-wise filter: downweight concepts RoBERTa deems unlikely
-                            sims_grpo = sims_grpo * total_probs
+                        #     # Element-wise filter: downweight concepts RoBERTa deems unlikely
+                        #     sims_grpo = sims_grpo * total_probs
 
-                            # Drop classifier intermediates
-                            del rob_enc, rob_input, total_probs, clf_logits, probs
-                            cuda_gc()
+                        #     # Drop classifier intermediates
+                        #     del rob_enc, rob_input, total_probs, clf_logits, probs
+                        #     cuda_gc()
 
                         # Optional subset renormalization: focus reward on top-K concepts (+ target)
                         if args.grpo_subset_renorm:
