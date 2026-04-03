@@ -267,9 +267,10 @@ def compute_llm_rewards_batch(base_lm_model, base_lm_tokenizer, texts, concept_n
         print(f"\n[LLM reward DEBUG] ===== INPUT PROMPT =====\n{prompt}\n{'='*60}")
 
     # Dynamic budget: leave max_new_tokens of headroom in context window
+    # model_max_length on base Llama-3 is a huge sentinel (~1e30), so cap it.
     model_max = getattr(base_lm_tokenizer, 'model_max_length', 8192)
+    model_max = min(model_max, 8192)
     max_prompt_tokens = max(512, model_max - max_new_tokens)
-
     enc = base_lm_tokenizer(
         prompt, return_tensors="pt",
         truncation=True, max_length=max_prompt_tokens
