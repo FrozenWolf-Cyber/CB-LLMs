@@ -845,7 +845,7 @@ if __name__ == "__main__":
                     mix_k = min(args.grpo_mix_k, args.grpo_num_trajectories, batch["input_ids"].shape[0])
                     # Decode raw training ids (strip padding & special tokens)
                     for mix_i in range(mix_k):
-                        real_ids = batch["input_ids"][mix_i]  # (seq_len,)
+                        real_ids = batch["input_ids"][mix_i].to(device)  # move to GPU
                         # Remove padding (id == pad_token_id) and EOS / BOS special tokens
                         real_ids_clean = real_ids[
                             (real_ids != tokenizer.pad_token_id) &
