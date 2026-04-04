@@ -436,6 +436,9 @@ def compute_reward_model_scores(
             Keys: "rm_score" (all), "relevance_score"/"grammar_score" (separate/hybrid).
     """
     n = len(texts)
+    if debug:
+        print(f"\n[RM reward DEBUG] compute_reward_model_scores called with {n} trajectories, criteria_mode={criteria_mode}, rm_batch_size={rm_batch_size}")
+        print(f"  concept_name: {concept_name}")    
     rewards = [0.0] * n
     raw_scores_list = [None] * n
 
