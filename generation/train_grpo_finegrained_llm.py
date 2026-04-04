@@ -29,7 +29,7 @@ Usage:
 Reward modes:
     cosine        : cos_sim_cubed vs one-hot target (MPNet embeddings)
     aggressive    : inverse-rank * similarity (MPNet embeddings)
-    llm           : base Llama-3-8B as judge (steerability + coherence + grammar)
+    llm           : ContextualAI LMUnit (Qwen2.5-72B) as judge via Query/Response/Unit Test
     reward_model  : Skywork-Reward-V2-Llama-3.1-8B as judge.
                     Controlled by two extra flags:
                       --rm_criteria_mode {separate, together, separate_hybrid, relevance_only}
@@ -129,12 +129,16 @@ parser.add_argument("--grpo_reward_mode", type=str, default="cosine",
                         "Reward type for GRPO:\n"
                         "  cosine       : cos_sim_cubed vs one-hot target (MPNet).\n"
                         "  aggressive   : inverse-rank * similarity (MPNet).\n"
-                        "  llm          : base Llama-3-8B as few-shot JSON judge.\n"
+                        "  llm          : ContextualAI LMUnit (HF causal LM) chat-template judge (1–5 score).\n"
                         "  reward_model : Skywork-Reward-V2-Llama-3.1-8B as judge.\n"
                         "                 See --rm_criteria_mode and --rm_batch_mode."
                     ))
 parser.add_argument("--grpo_llm_max_text_len", type=int, default=200,
-                    help="Max chars of each generated trajectory passed to the LLM judge prompt (used when --grpo_reward_mode llm).")
+                    help="Max chars of each generated trajectory (Response field) for LMUnit (used when --grpo_reward_mode llm).")
+parser.add_argument("--grpo_llm_judge_model", type=str, default="ContextualAI/LMUnit-qwen2.5-72b",
+                    help="HuggingFace model id for LMUnit-style judging (--grpo_reward_mode llm).")
+parser.add_argument("--grpo_llm_max_new_tokens", type=int, default=40,
+                    help="Generation budget for LMUnit score decoding (--grpo_reward_mode llm).")
 
 # ---- NEW: Reward-model reward mode flags ----
 parser.add_argument("--rm_model_name", type=str,
@@ -157,12 +161,12 @@ parser.add_argument("--rm_max_text_len", type=int, default=500,
                     help="Max chars of each trajectory passed into the RM prompt (reward_model mode).")
 parser.add_argument("--rm_device", type=str, default=("cuda" if torch.cuda.is_available() else "cpu"),
                 help="Device to keep the reward/judge model on. "
-                    "Used for --grpo_reward_mode reward_model (Skywork RM) and llm (base Llama judge). "
+                    "Used for --grpo_reward_mode reward_model (Skywork RM) and llm (LMUnit judge). "
                     "Set to 'cuda:1', 'cuda:2', etc. to keep it resident on a specific GPU.")
 parser.add_argument("--ref_device", type=str, default=("cuda" if torch.cuda.is_available() else "cpu"),
                 help="Device to keep the KL reference model (pi_ref) on. "
                     "Set to 'cuda:2', etc. to put the reference on a different GPU. "
-                    "In llm reward mode, this may load a separate base Llama copy for pi_ref.")
+                    "In llm reward mode, pi_ref is Meta-Llama-3-8B (same vocab as the policy); LMUnit stays on --rm_device.")
 parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu",
                     help="Device to run the model on.")
 # ---- Dataset mixing ----
@@ -250,32 +254,60 @@ def find_pretrained_checkpoint(run_id, dataset):
     return peft_path, cbl_path
 
 
-def compute_llm_rewards_batch(base_lm_model, base_lm_tokenizer, texts, concept_name, device,
-                               max_text_len=200, max_new_tokens=512, debug=False):
-    """Compute LLM-as-judge rewards using few-shot completion prompting.
+# LMUnit judge: fixed Query / Unit Test wording ({concept_name} filled per step).
+_LMUNIT_QUERY_TEMPLATE = (
+    'Generate open-ended text from an empty prompt while the model is steered toward the concept "{concept_name}".'
+)
+_LMUNIT_UNIT_TEST_TEMPLATE = (
+    'Does the generated text clearly reflect or align with the concept "{concept_name}"?'
+)
 
-    Uses two few-shot demonstrations so that base (non-instruct) Llama-3-8B reliably
-    completes the JSON array pattern without instruction-following capability.
-    The prompt ends with '[' (opening of the scores array) so greedy decoding
-    simply continues the established pattern.
+
+def _parse_lmunit_score_1_to_5(text):
+    """Parse LMUnit's scalar score in [1, 5] from generated text; return reward in [0, 1]."""
+    import re
+    if not text:
+        return 0.0, None
+    # Prefer an explicit x/5 style, then any decimal in [1, 5].
+    m = re.search(r"\b([1-5])\s*/\s*5\b", text, re.IGNORECASE)
+    if m:
+        v = float(m.group(1))
+        return (v - 1.0) / 4.0, v
+    for m in re.finditer(r"\b([1-5])(\.\d+)?\b", text):
+        v = float(m.group(0))
+        if 1.0 <= v <= 5.0:
+            return (v - 1.0) / 4.0, v
+    return 0.0, None
+
+
+def compute_llm_rewards_batch(
+    lmunit_model,
+    lmunit_tokenizer,
+    texts,
+    concept_name,
+    max_text_len=200,
+    max_new_tokens=40,
+    debug=False,
+):
+    """Score trajectories with ContextualAI LMUnit (HF causal LM + chat template).
+
+    Prompt layout matches the official HF example: Query / Response / Unit Test in the
+    user message, ``apply_chat_template(..., add_generation_prompt=True)``, then
+    ``generate``. The model is trained to output a score in [1, 5]; we map linearly to
+    [0, 1] via (s - 1) / 4.
 
     Args:
-        base_lm_model     : AutoModelForCausalLM (frozen, on device).
-        base_lm_tokenizer : matching tokenizer (pad_token must be set).
-        texts             : list[str] — trajectories to score (caller handles filtering;
-                            no internal .strip() filtering to avoid index misalignment).
-        concept_name      : str, the target concept label for concept_relevance scoring.
-        device            : torch.device.
-        max_text_len      : max chars of each trajectory included in the prompt.
-        max_new_tokens    : token budget for the model's JSON completion.
-        debug             : if True, print the full input prompt and raw model output.
+        lmunit_model, lmunit_tokenizer : frozen judge (inputs are placed on the model's device).
+        texts              : list[str] — responses to score (indices preserved).
+        concept_name       : substituted into hard-coded query and unit test strings.
+        max_text_len       : max chars of each response string.
+        max_new_tokens     : generation budget (HF example uses 40).
+        debug              : print first trajectory's user content and raw decode.
 
     Returns:
-        rewards    : list[float] same length as `texts`, values in [0, 1].
-        raw_scores : list[dict|None] — parsed per-trajectory score dicts (for logging).
+        rewards    : list[float] in [0, 1], same length as ``texts``.
+        raw_scores : list[dict|None] with keys ``lmunit_score_1_5``, ``lmunit_decode``.
     """
-    import json, re
-
     cuda_gc()
 
     n = len(texts)
@@ -286,103 +318,54 @@ def compute_llm_rewards_batch(base_lm_model, base_lm_tokenizer, texts, concept_n
         cuda_gc()
         return rewards, raw_scores
 
-    # Build numbered trajectory block — no internal filtering so indices stay aligned
-    trajectory_block = ""
+    query = _LMUNIT_QUERY_TEMPLATE.format(concept_name=concept_name)
+    unit_test = _LMUNIT_UNIT_TEST_TEMPLATE.format(concept_name=concept_name)
+
+    model_device = next(lmunit_model.parameters()).device
+    pad_id = lmunit_tokenizer.pad_token_id
+    if pad_id is None:
+        pad_id = lmunit_tokenizer.eos_token_id
+
     for idx, t in enumerate(texts):
-        trunc = t[:max_text_len].replace('"', "'").replace("\n", " ")
-        trajectory_block += f"({idx + 1}) {trunc}\n"
+        response = t[:max_text_len]
+        content = f"Query: {query}\n\nResponse: {response}\n\nUnit Test: {unit_test}"
+        messages = [{"role": "user", "content": content}]
+        if debug and idx == 0:
+            print(f"\n[LLM reward DEBUG] ===== USER CONTENT [0] =====\n{content}\n{'='*60}")
 
-    # Few-shot completion prompt.
-    # Two demonstrations teach the pattern; prompt ends with '[' so the
-    # base model just continues the completion.
-# OLD
-# Three entries per demo with varied non-alternating scores to prevent
-    # the model from learning a positional pattern (9,0,9,0,...).
-    few_shot = (
-        'Concept: "technology"\n'
-        '(1) The smartphone revolution transformed how billions communicate daily.\n'
-        '(2) She baked a rich chocolate cake with extra frosting for the party.\n'
-        '(3) Engineers debated the tradeoffs of the new processor architecture.\n'
-        'Scores: [{"concept_relevance":9,"coherence":8,"grammar":9},{"concept_relevance":1,"coherence":8,"grammar":9},{"concept_relevance":7,"coherence":7,"grammar":8}]\n\n'
-        'Concept: "nature"\n'
-        '(1) Towering oaks and mossy boulders lined the winding forest trail.\n'
-        '(2) The quarterly earnings report exceeded analyst expectations by 12 percent.\n'
-        '(3) A gentle rain softened the dusty summer soil.\n'
-        'Scores: [{"concept_relevance":9,"coherence":9,"grammar":8},{"concept_relevance":0,"coherence":8,"grammar":8},{"concept_relevance":8,"coherence":8,"grammar":9}]\n\n'
-    )
-
-    prompt = (
-        f"Score each text for concept_relevance, coherence, and grammar (integers 0-9).\n"
-        f"Output exactly {n} JSON objects then close the array with ].\n\n"
-        f"{few_shot}"
-        f'Concept: "{concept_name}"\n'
-        f"{trajectory_block}"
-        f'Scores: [{{"'
-    )
-    if debug:
-        print(f"\n[LLM reward DEBUG] ===== INPUT PROMPT =====\n{prompt}\n{'='*60}")
-
-    # Dynamic budget: leave max_new_tokens of headroom in context window
-    # model_max_length on base Llama-3 is a huge sentinel (~1e30), so cap it.
-    model_max = getattr(base_lm_tokenizer, 'model_max_length', 8192)
-    model_max = min(model_max, 8192)
-    max_prompt_tokens = max(512, model_max - max_new_tokens)
-    enc = base_lm_tokenizer(
-        prompt, return_tensors="pt",
-        truncation=True, max_length=max_prompt_tokens
-    ).to(device)
-
-    with torch.inference_mode():
-        out_ids = base_lm_model.generate(
-            **enc,
-            max_new_tokens=max_new_tokens,
-            do_sample=False,
-            temperature=1.0,
-            pad_token_id=base_lm_tokenizer.eos_token_id,
+        inputs = lmunit_tokenizer.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            tokenize=True,
+            return_dict=True,
+            return_tensors="pt",
         )
+        inputs = {k: v.to(model_device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
+        in_len = inputs["input_ids"].shape[-1]
 
-    # Decode only newly generated tokens (strip prompt prefix)
-    new_ids = out_ids[0][enc["input_ids"].shape[1]:]
-    response = base_lm_tokenizer.decode(new_ids, skip_special_tokens=True)
+        with torch.inference_mode():
+            out_ids = lmunit_model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                pad_token_id=pad_id,
+            )
 
-    if debug:
-        print(f"[LLM reward DEBUG] ===== RAW MODEL OUTPUT =====\n{response}\n{'='*60}")
+        new_ids = out_ids[0][in_len:]
+        decoded = lmunit_tokenizer.decode(new_ids, skip_special_tokens=True)
+        r01, s15 = _parse_lmunit_score_1_to_5(decoded)
+        rewards[idx] = r01
+        raw_scores[idx] = {
+            "lmunit_score_1_5": s15,
+            "lmunit_decode": decoded.strip()[:500],
+        }
 
-    # Prepend the '[' we held back — the model completed the array body
-    candidate = '[{"' + response
+        if debug and idx == 0:
+            print(f"[LLM reward DEBUG] ===== RAW MODEL OUTPUT [0] =====\n{decoded}\n{'='*60}")
 
-    parsed = None
-    try:
-        parsed = json.loads(candidate)
-    except json.JSONDecodeError:
-        # Tolerate trailing text: grab the first complete [...] block
-        match = re.search(r'\[.*?\]', candidate, re.DOTALL)
-        if match:
-            try:
-                parsed = json.loads(match.group(0))
-            except json.JSONDecodeError:
-                parsed = None
+        del inputs, out_ids, new_ids
 
-    parse_ok = parsed is not None and isinstance(parsed, list) and len(parsed) == n
-    if parse_ok:
-        for idx, entry in enumerate(parsed):
-            if isinstance(entry, dict):
-                cr = max(0.0, min(9.0, float(entry.get("concept_relevance", 0)))) / 9.0
-                co = max(0.0, min(9.0, float(entry.get("coherence", 0)))) / 9.0
-                gr = max(0.0, min(9.0, float(entry.get("grammar", 0)))) / 9.0
-                rewards[idx] = (cr + co + gr) / 3.0
-                raw_scores[idx] = {"concept_relevance": cr, "coherence": co, "grammar": gr}
-    else:
-        got_len = len(parsed) if isinstance(parsed, list) else type(parsed).__name__
-        print(f"[LLM reward] JSON parse failed or wrong length (got {got_len}, expected {n}).")
-        print(f"[LLM reward] candidate[:400]: {candidate[:400]}")
-
-    del enc, out_ids, new_ids, candidate, response
-    if 'match' in locals():
-        del match
-    del trajectory_block, prompt, few_shot
     cuda_gc()
-
     return rewards, raw_scores
 
 
@@ -812,9 +795,8 @@ if __name__ == "__main__":
     # ======================================================================
     # Build REFERENCE model (frozen π_ref) and POLICY model (trainable π_θ)
     # ======================================================================
-    # In 'llm' reward mode the KL reference is base Llama-3-8B (AutoModelForCausalLM),
-    # which is loaded later as `base_lm_model`.  The CBL-based ref_preLM / ref_cbl are
-    # NOT loaded to save memory.
+    # In 'llm' reward mode the KL reference is base Llama-3-8B (AutoModelForCausalLM) on
+    # `--ref_device`; LMUnit lives on `--rm_device`. CBL-based ref_preLM / ref_cbl are not loaded.
     ref_preLM = None
     ref_cbl = None
     if args.grpo_reward_mode != "llm":
@@ -834,7 +816,7 @@ if __name__ == "__main__":
         for p in ref_cbl.parameters():
             p.requires_grad = False
     else:
-        print("Skipping CBL reference model load (llm reward mode uses base_lm_model as π_ref).")
+        print("Skipping CBL reference model load (llm reward mode uses Llama-3-8B CausalLM as π_ref).")
 
     print("preparing policy model (trainable)...")
     preLM = LlamaModel.from_pretrained('meta-llama/Meta-Llama-3-8B', torch_dtype=torch.bfloat16).to(device)
@@ -929,18 +911,31 @@ if __name__ == "__main__":
 
     # print(f"Loaded {len(grpo_classifiers)} RoBERTa classifiers for GRPO concept filtering.")
 
-    # ---- Base LLM (AutoModelForCausalLM) for 'llm' reward mode ----
-    # This single model serves TWO roles:
-    #   (a) reward judge  — generates JSON scores for all trajectories in one pass
-    #   (b) KL reference  — frozen π_ref for the KL divergence penalty
-    # NOTE: In `llm` reward mode we keep the base LLM resident on `--rm_device`
-    # (and optionally a separate KL reference copy on `--ref_device`).
+    # ---- LMUnit judge + Llama π_ref for 'llm' reward mode ----
+    # LMUnit (on `--rm_device`) scores each trajectory; Llama-3-8B CausalLM on `--ref_device`
+    # is π_ref for KL (same tokenizer/vocab as the policy backbone).
     base_lm_model = None
     base_lm_ref_model = None
     base_lm_tokenizer = None
+    lmunit_model = None
+    lmunit_tokenizer = None
     if args.grpo_reward_mode == "llm":
-        print("Loading base Llama-3-8B (AutoModelForCausalLM) for LLM reward + KL reference...")
         from transformers import AutoModelForCausalLM
+
+        print(f"Loading LMUnit judge: {args.grpo_llm_judge_model} ...")
+        lmunit_tokenizer = AutoTokenizer.from_pretrained(args.grpo_llm_judge_model)
+        lmunit_model = AutoModelForCausalLM.from_pretrained(
+            args.grpo_llm_judge_model,
+            torch_dtype=torch.bfloat16,
+            trust_remote_code=True,
+        )
+        lmunit_model.eval()
+        for p in lmunit_model.parameters():
+            p.requires_grad = False
+        lmunit_model.to(reward_device)
+        print(f"LMUnit judge loaded on {reward_device}.")
+
+        print("Loading Meta-Llama-3-8B (AutoModelForCausalLM) for KL reference π_ref...")
         base_lm_tokenizer = AutoTokenizer.from_pretrained('meta-llama/Meta-Llama-3-8B')
         base_lm_tokenizer.pad_token = base_lm_tokenizer.eos_token
         base_lm_model = AutoModelForCausalLM.from_pretrained(
@@ -949,25 +944,11 @@ if __name__ == "__main__":
         base_lm_model.eval()
         for p in base_lm_model.parameters():
             p.requires_grad = False
-        base_lm_model.to(reward_device)
-        print(f"base_lm_model loaded on {reward_device} (kept resident; no CPU offload).")
+        base_lm_model.to(ref_device)
+        print(f"base_lm_model (π_ref) loaded on {ref_device}.")
 
-        # Optional separate copy for KL reference if ref_device differs.
-        # This is intentional: it lets you place reward judge and pi_ref on different GPUs.
-        if ref_device == reward_device:
-            base_lm_ref_model = base_lm_model
-        else:
-            base_lm_ref_model = AutoModelForCausalLM.from_pretrained(
-                'meta-llama/Meta-Llama-3-8B', torch_dtype=torch.bfloat16
-            )
-            base_lm_ref_model.eval()
-            for p in base_lm_ref_model.parameters():
-                p.requires_grad = False
-            base_lm_ref_model.to(ref_device)
-            print(f"base_lm_ref_model loaded on {ref_device} (separate copy for KL reference).")
+        base_lm_ref_model = None
 
-        # When offloading between CPU/GPU, compiling the reference forward tends to recompile
-        # or be device-sensitive. Keep it in eager mode for stability.
         base_lm_logits_model = None
     else:
         base_lm_logits_model = None
@@ -1227,12 +1208,12 @@ if __name__ == "__main__":
                         # Print prompt + output for the first 3 steps to verify parsing
                         _llm_debug = args.DEBUG
                         llm_rewards, llm_raw_scores = compute_llm_rewards_batch(
-                            base_lm_model, base_lm_tokenizer,
+                            lmunit_model,
+                            lmunit_tokenizer,
                             non_empty_texts,
                             concept_name=concept_set[grpo_concept_idx],
-                            device=reward_device,
                             max_text_len=args.grpo_llm_max_text_len,
-                            max_new_tokens=512,
+                            max_new_tokens=args.grpo_llm_max_new_tokens,
                             debug=_llm_debug,
                         )
                         cuda_gc()
@@ -1256,10 +1237,11 @@ if __name__ == "__main__":
                                 best_rank = rank
                                 best_g = g
                         best_raw = llm_raw_scores[best_rank] or {}
+                        _s15 = best_raw.get("lmunit_score_1_5")
+                        _s01 = (_s15 - 1.0) / 4.0 if _s15 is not None else best_reward
                         wandb.log({
-                            "llm_reward_best_concept_relevance": best_raw.get("concept_relevance", 0.0),
-                            "llm_reward_best_coherence": best_raw.get("coherence", 0.0),
-                            "llm_reward_best_grammar": best_raw.get("grammar", 0.0),
+                            "llm_reward_best_lmunit_1_5": float(_s15) if _s15 is not None else 0.0,
+                            "llm_reward_best_normalized": float(_s01),
                         })
 
                         del llm_raw_scores, best_raw
@@ -1515,8 +1497,7 @@ if __name__ == "__main__":
                 # --- Reference model forward (no grad) ---
                 with torch.no_grad():
                     if args.grpo_reward_mode == "llm":
-                        # Use base Llama-3-8B (AutoModelForCausalLM) as KL reference.
-                        # It produces vocab logits directly without any CBL intervention.
+                        # Llama-3-8B CausalLM as KL reference (same vocab as policy); LMUnit is judge-only.
                         cuda_gc()
                         ref_llm = base_lm_ref_model if base_lm_ref_model is not None else base_lm_model
                         if ref_device != device:
@@ -1705,6 +1686,11 @@ if __name__ == "__main__":
         pass
     if base_lm_model is not None:
         del base_lm_model
+    try:
+        if lmunit_model is not None:
+            del lmunit_model
+    except Exception:
+        pass
 
     cuda_gc()
     
