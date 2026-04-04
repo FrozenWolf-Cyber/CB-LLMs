@@ -34,7 +34,7 @@ Reward modes:
                     Controlled by two extra flags:
                       --rm_criteria_mode {separate, together, separate_hybrid}
                         separate        : score relevance + grammar with two RM prompts;
-                                          softmax each over the batch → multiply (relative).
+                                          min–max each to [0,1] over the batch → multiply.
                         together        : single combined RM prompt; softmax over the batch.
                         separate_hybrid : RM scores grammar only (softmax over batch); steerability
                                           is computed with MPNet cosine (same as cosine mode);
@@ -147,7 +147,7 @@ parser.add_argument("--rm_criteria_mode", type=str, default="separate",
                     help=(
                         "How to construct RM prompts (reward_model mode only).\n"
                         "  separate        : two RM prompts per trajectory — relevance + grammar.\n"
-                        "                    Softmax each over the batch, then multiply (relative).\n"
+                        "                    Min–max each criterion to [0,1] over the batch, then multiply.\n"
                         "  together        : single combined RM prompt; softmax over the batch.\n"
                         "  separate_hybrid : RM scores grammar only (softmax over batch); MPNet cosine\n"
                         "                    (same as cosine mode) scores steerability;\n"
@@ -406,9 +406,10 @@ def compute_reward_model_scores(
 ):
     """Score trajectories with a Skywork-style sequence-classification reward model.
 
-    Raw RM logits span a wide numeric range (e.g. 3 → 23). A batch softmax over
-    all trajectories in this call yields relative weights (positive, sum to 1 per
-    criterion), so rewards compare rollouts within the same GRPO group.
+    Raw RM logits span a wide numeric range (e.g. 3 → 23). For ``separate`` mode,
+    each criterion is min–max normalized to [0, 1] across trajectories in this call,
+    then multiplied. For ``together`` / ``separate_hybrid``, a batch softmax still
+    applies (see those branches).
 
     Args:
         rm_model       : AutoModelForSequenceClassification, already on `device`.
@@ -419,7 +420,7 @@ def compute_reward_model_scores(
         device         : torch.device — the main training device (RM is already here).
         criteria_mode  : "separate", "together", or "separate_hybrid".
             separate        : two RM prompts per trajectory (relevance + grammar);
-                              softmax each criterion over the batch, then multiply.
+                              min–max each criterion to [0, 1] over the batch, then multiply.
             together        : single combined RM prompt; softmax of that score over the batch.
             separate_hybrid : RM scores grammar only (softmax over batch). Steerability
                               (cosine) is computed externally by the caller and
@@ -431,9 +432,9 @@ def compute_reward_model_scores(
         debug          : bool — print prompts/scores and best/worst sentences per criterion.
 
     Returns:
-        rewards          : list[float], same length as `texts` — relative weights
-                           (softmax per criterion; separate mode uses product of two).
-                           For separate_hybrid, grammar-only softmax weights.
+        rewards          : list[float], same length as `texts` — separate mode uses
+                           product of two min–max scores in [0, 1]. Together / hybrid
+                           use softmax grammar (or combined) weights.
         raw_scores_list  : list[dict|None] — per-trajectory raw RM scores.
             Keys: "rm_score" (all), "relevance_score"/"grammar_score" (separate/hybrid).
     """
@@ -469,6 +470,17 @@ def compute_reward_model_scores(
             return []
         t = torch.tensor(scores, dtype=torch.float32)
         return torch.softmax(t, dim=0).tolist()
+
+    def _minmax_01(scores: list) -> list:
+        """Map scores to [0, 1] via (x - min) / (max - min) within this batch."""
+        if not scores:
+            return []
+        lo = min(scores)
+        hi = max(scores)
+        if hi <= lo + 1e-12:
+            return [1.0] * len(scores)
+        span = hi - lo
+        return [(float(x) - lo) / span for x in scores]
 
     def _rm_debug_snippet(s: str, max_chars: int = 220) -> str:
         s = (s or "").replace("\n", " ").strip()
@@ -521,23 +533,23 @@ def compute_reward_model_scores(
         rel_scores  = _score_formatted(rel_formatted)
         gram_scores = _score_formatted(gram_formatted)
 
-        rel_soft = _softmax_1d(rel_scores)
-        gram_soft = _softmax_1d(gram_scores)
+        rel_norm = _minmax_01(rel_scores)
+        gram_norm = _minmax_01(gram_scores)
         together_logits = [(rel_scores[i] + gram_scores[i]) / 2.0 for i in range(n)]
-        together_soft = _softmax_1d(together_logits)
-        hybrid_weights = [rel_soft[i] * gram_soft[i] for i in range(n)]
+        together_norm = _minmax_01(together_logits)
+        hybrid_weights = [rel_norm[i] * gram_norm[i] for i in range(n)]
 
         if debug:
-            _rm_debug_best_worst("relevance (softmax over batch)", rel_soft, texts)
-            _rm_debug_best_worst("grammar (softmax over batch)", gram_soft, texts)
+            _rm_debug_best_worst("relevance (min–max to [0,1] over batch)", rel_norm, texts)
+            _rm_debug_best_worst("grammar (min–max to [0,1] over batch)", gram_norm, texts)
             _rm_debug_best_worst(
-                "together (softmax over mean relevance+grammar logit)", together_soft, texts
+                "together (min–max over mean relevance+grammar logit)", together_norm, texts
             )
-            _rm_debug_best_worst("hybrid (relevance_softmax × grammar_softmax)", hybrid_weights, texts)
+            _rm_debug_best_worst("hybrid (relevance_norm × grammar_norm)", hybrid_weights, texts)
 
         for i in range(n):
-            r_rel  = rel_soft[i]
-            r_gram = gram_soft[i]
+            r_rel  = rel_norm[i]
+            r_gram = gram_norm[i]
             rewards[i] = r_rel * r_gram
             raw_scores_list[i] = {
                 "relevance_score": rel_scores[i],
