@@ -1,19 +1,11 @@
 """
-Resume wandb runs and score steerability generations with the same Skywork RM path as
-train_grpo_finegrained_llm (compute_reward_model_scores).
+Resume wandb runs and score steerability generations with a Skywork-style RM for benchmarking.
 
-Mirrors resume_steerability_test.py: run_ids pickle, checkpoint discovery, generation,
-wandb resume="must", and summary logging — but replaces RoBERTa steerability accuracy
-with reward-model statistics.
+Uses the same chat templates / user prompts as train_grpo_finegrained_llm (relevance, grammar,
+combined), but **no batch min–max**: metrics are sequence-classification logits **clipped to
+[-100, 100]**, then averaged across all generated trajectories (logged per criterion as ``rm_*``).
 
-Checkpoint layout matches train_combined_finegrained.py, train_grpo_finegrained.py, and
-train_grpo_finegrained_llm.py (``from_pretained_llama3_lora_{cbm|grpo}_{run_id}/``).
-Uses ``config_finegrained`` when present (same concept_set as config.py today).
-
-Not covered: runs with no saved checkpoints, wrong working directory (paths are
-relative to cwd), ``--dataset`` not equal to the run's dataset string, or very old
-GRPO runs missing ``arch_type`` (falls back to ``discrimination_loss`` for CBL vs
-CBLResidual — usually OK for default residual GRPO).
+Mirrors resume_steerability_test.py for checkpoint discovery, generation, and wandb resume.
 """
 import argparse
 import os
@@ -30,7 +22,6 @@ except ImportError:
 from transformers import AutoModelForSequenceClassification, AutoTokenizer, LlamaConfig
 
 from resume_steerability_test import (
-    device,
     find_eval_checkpoint,
     generate_steerability_texts,
     get_llama_vocab_weight,
@@ -38,11 +29,61 @@ from resume_steerability_test import (
     load_model_and_cbl,
     set_seed,
 )
-from train_grpo_finegrained_llm import compute_reward_model_scores
+
+# Same user turns as train_grpo_finegrained_llm.compute_reward_model_scores (for comparability).
+RM_USER_RELEVANCE = "Write a text about the concept: {concept_name}"
+RM_USER_GRAMMAR = "Write a grammatically correct and fluent paragraph."
+RM_USER_TOGETHER = "Write a grammatically correct and fluent text about the concept: {concept_name}"
+
+RM_LOGIT_CLIP_MIN = -100.0
+RM_LOGIT_CLIP_MAX = 100.0
+
+
+def _make_formatted(rm_tokenizer, user_turn: str, response_text: str, max_text_len: int) -> str:
+    conv = [
+        {"role": "user", "content": user_turn},
+        {"role": "assistant", "content": response_text[:max_text_len]},
+    ]
+    formatted = rm_tokenizer.apply_chat_template(conv, tokenize=False)
+    if rm_tokenizer.bos_token and formatted.startswith(rm_tokenizer.bos_token):
+        formatted = formatted[len(rm_tokenizer.bos_token) :]
+    return formatted
+
+
+def _raw_logits_for_texts(
+    rm_model,
+    rm_tokenizer,
+    texts,
+    user_turn: str,
+    device: torch.device,
+    rm_batch_size: int,
+    max_text_len: int,
+):
+    """Single RM criterion: one user prompt for all texts; returns logits[:, 0] clipped to [-100, 100]."""
+    if not texts:
+        return []
+    formatted = [_make_formatted(rm_tokenizer, user_turn, t, max_text_len) for t in texts]
+    chunk = rm_batch_size if rm_batch_size > 0 else len(formatted)
+    all_scores = []
+    for start in range(0, len(formatted), chunk):
+        chunk_list = formatted[start : start + chunk]
+        tokenized = rm_tokenizer(
+            chunk_list,
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=2048,
+        ).to(device)
+        with torch.no_grad():
+            logits = rm_model(**tokenized).logits
+        clipped = logits[:, 0].float().clamp(RM_LOGIT_CLIP_MIN, RM_LOGIT_CLIP_MAX)
+        all_scores.extend(clipped.detach().cpu().tolist())
+        del tokenized, logits
+    return all_scores
 
 
 def load_reward_model(rm_model_name: str, rm_device: torch.device):
-    """Load Skywork-style sequence classification RM (same as train_grpo_finegrained_llm)."""
+    """Load Skywork-style sequence classification RM (same loader as train_grpo_finegrained_llm)."""
     print(f"Loading reward model: {rm_model_name} ...")
     rm_tokenizer = AutoTokenizer.from_pretrained(rm_model_name)
     _kwargs = dict(torch_dtype=torch.bfloat16, num_labels=1)
@@ -70,60 +111,80 @@ def run_rm_metrics_from_texts(
     rm_model,
     rm_tokenizer,
     rm_device,
-    criteria_mode,
     rm_batch_size,
     rm_max_text_len,
-    debug=False,
 ):
     """
-    Score each concept's generations with the RM. Min–max is within each concept's batch
-    (same as GRPO training).
-    Returns dict with per-concept lists and aggregates.
+    For each concept, score generations under three RM prompts (relevance, grammar, together).
+    Logits are clipped to [RM_LOGIT_CLIP_MIN, RM_LOGIT_CLIP_MAX]; global metrics = mean (and std) over all trajectories.
     """
+    all_rel, all_gram, all_tog = [], [], []
     per_concept = {}
-    all_rewards = []
 
     for concept_idx, concept_name in enumerate(concept_set):
         texts = decoded_texts_by_concept[concept_idx] if concept_idx < len(decoded_texts_by_concept) else []
         if not texts:
-            per_concept[concept_name] = {"mean": float("nan"), "std": float("nan"), "n": 0, "rewards": []}
+            per_concept[concept_name] = {
+                "n": 0,
+                "rm_relevance_mean": float("nan"),
+                "rm_grammar_mean": float("nan"),
+                "rm_together_mean": float("nan"),
+            }
             continue
 
-        rewards, raw_list = compute_reward_model_scores(
-            rm_model=rm_model,
-            rm_tokenizer=rm_tokenizer,
-            texts=texts,
-            concept_name=concept_name,
-            device=rm_device,
-            criteria_mode=criteria_mode,
-            rm_batch_size=rm_batch_size,
-            max_text_len=rm_max_text_len,
-            debug=debug and concept_idx == 0,
+        u_rel = RM_USER_RELEVANCE.format(concept_name=concept_name)
+        u_tog = RM_USER_TOGETHER.format(concept_name=concept_name)
+
+        rel = _raw_logits_for_texts(
+            rm_model, rm_tokenizer, texts, u_rel, rm_device, rm_batch_size, rm_max_text_len
+        )
+        gram = _raw_logits_for_texts(
+            rm_model, rm_tokenizer, texts, RM_USER_GRAMMAR, rm_device, rm_batch_size, rm_max_text_len
+        )
+        tog = _raw_logits_for_texts(
+            rm_model, rm_tokenizer, texts, u_tog, rm_device, rm_batch_size, rm_max_text_len
         )
 
-        arr = np.array(rewards, dtype=np.float64)
+        all_rel.extend(rel)
+        all_gram.extend(gram)
+        all_tog.extend(tog)
+
         per_concept[concept_name] = {
-            "mean": float(arr.mean()) if arr.size else float("nan"),
-            "std": float(arr.std()) if arr.size > 1 else 0.0,
-            "n": int(arr.size),
-            "rewards": rewards,
-            "raw_scores": raw_list,
+            "n": len(texts),
+            "rm_relevance_mean": float(np.mean(rel)) if rel else float("nan"),
+            "rm_grammar_mean": float(np.mean(gram)) if gram else float("nan"),
+            "rm_together_mean": float(np.mean(tog)) if tog else float("nan"),
         }
-        all_rewards.extend(rewards)
 
-        for b, (text, r) in enumerate(zip(texts, rewards)):
-            wandb.log({
-                f"rm_metric_sample_{concept_name}_{b + 1}": text,
-                f"rm_metric_reward_{concept_name}_{b + 1}": r,
-            })
+        for b, (t, r, g, o) in enumerate(zip(texts, rel, gram, tog)):
+            wandb.log(
+                {
+                    f"rm_sample_{concept_name}_{b + 1}": t,
+                    f"rm_relevance_logit_{concept_name}_{b + 1}": r,
+                    f"rm_grammar_logit_{concept_name}_{b + 1}": g,
+                    f"rm_together_logit_{concept_name}_{b + 1}": o,
+                }
+            )
 
-    overall_mean = float(np.mean(all_rewards)) if all_rewards else float("nan")
-    overall_std = float(np.std(all_rewards)) if len(all_rewards) > 1 else 0.0
+    def _ms(xs):
+        if not xs:
+            return float("nan"), 0.0
+        a = np.array(xs, dtype=np.float64)
+        return float(a.mean()), float(a.std()) if a.size > 1 else 0.0
+
+    r_m, r_s = _ms(all_rel)
+    g_m, g_s = _ms(all_gram)
+    t_m, t_s = _ms(all_tog)
+    n = len(all_rel)
 
     return {
-        "rm_metric_mean_reward": overall_mean,
-        "rm_metric_std_reward": overall_std,
-        "rm_metric_total_n": len(all_rewards),
+        "rm_relevance_mean": r_m,
+        "rm_relevance_std": r_s,
+        "rm_grammar_mean": g_m,
+        "rm_grammar_std": g_s,
+        "rm_together_mean": t_m,
+        "rm_together_std": t_s,
+        "rm_total_n": n,
         "per_concept": per_concept,
     }
 
@@ -135,11 +196,9 @@ def process_run(
     wandb_project,
     wandb_entity,
     rm_model_name,
-    rm_criteria_mode,
     rm_batch_size,
     rm_max_text_len,
     rm_device_str,
-    debug_rm,
     run_idx=None,
     total_runs=None,
 ):
@@ -211,8 +270,8 @@ def process_run(
     )
 
     results = {}
-    print(f"\nRM metric — epoch {best_epoch}")
-    print(f"  criteria_mode={rm_criteria_mode} rm_batch_size={rm_batch_size} max_text_len={rm_max_text_len}")
+    print(f"\nRM steerability benchmark — epoch {best_epoch} (logits clipped to [{RM_LOGIT_CLIP_MIN}, {RM_LOGIT_CLIP_MAX}], no min–max)")
+    print(f"  rm_batch_size={rm_batch_size} max_text_len={rm_max_text_len}")
 
     if arch_type is not None:
         discrimination_loss_for_loading = 1.0 if arch_type == "non_residual" else 0.0
@@ -249,30 +308,35 @@ def process_run(
             rm_model,
             rm_tokenizer,
             rm_device,
-            criteria_mode=rm_criteria_mode,
             rm_batch_size=rm_batch_size,
             rm_max_text_len=rm_max_text_len,
-            debug=debug_rm,
         )
 
-        print(f"RM metric mean reward (pooled): {metrics['rm_metric_mean_reward']}")
-        for cname, row in metrics["per_concept"].items():
-            print(f"  {cname}: mean={row['mean']:.4f} std={row['std']:.4f} n={row['n']}")
+        print(
+            f"  rm_relevance_mean={metrics['rm_relevance_mean']:.4f} "
+            f"rm_grammar_mean={metrics['rm_grammar_mean']:.4f} "
+            f"rm_together_mean={metrics['rm_together_mean']:.4f} (n={metrics['rm_total_n']})"
+        )
 
         log_payload = {
-            "rm_metric_mean_reward": metrics["rm_metric_mean_reward"],
-            "rm_metric_std_reward": metrics["rm_metric_std_reward"],
-            "rm_metric_total_n": metrics["rm_metric_total_n"],
+            "rm_relevance_mean": metrics["rm_relevance_mean"],
+            "rm_relevance_std": metrics["rm_relevance_std"],
+            "rm_grammar_mean": metrics["rm_grammar_mean"],
+            "rm_grammar_std": metrics["rm_grammar_std"],
+            "rm_together_mean": metrics["rm_together_mean"],
+            "rm_together_std": metrics["rm_together_std"],
+            "rm_total_n": metrics["rm_total_n"],
             "rm_metric_epoch": best_epoch,
             "rm_metric_run_type": run_type,
             "rm_metric_low_score_checkpoint": is_low_score,
-            "rm_metric_criteria_mode": rm_criteria_mode,
             "rm_model_name": rm_model_name,
         }
         for cname, row in metrics["per_concept"].items():
             safe = cname.replace(" ", "_").replace("/", "_")[:80]
-            log_payload[f"rm_metric_per_concept_mean_{safe}"] = row["mean"]
-            log_payload[f"rm_metric_per_concept_std_{safe}"] = row["std"]
+            if row["n"] > 0:
+                log_payload[f"rm_relevance_mean_{safe}"] = row["rm_relevance_mean"]
+                log_payload[f"rm_grammar_mean_{safe}"] = row["rm_grammar_mean"]
+                log_payload[f"rm_together_mean_{safe}"] = row["rm_together_mean"]
 
         wandb.log(log_payload)
 
@@ -293,27 +357,34 @@ def process_run(
         traceback.print_exc()
 
     if results:
-        # Compact summary for tables (strip large nested lists)
         summary = {
-            "rm_metric_mean_reward": results.get("rm_metric_mean_reward"),
-            "rm_metric_std_reward": results.get("rm_metric_std_reward"),
-            "rm_metric_total_n": results.get("rm_metric_total_n"),
+            "rm_relevance_mean": results.get("rm_relevance_mean"),
+            "rm_grammar_mean": results.get("rm_grammar_mean"),
+            "rm_together_mean": results.get("rm_together_mean"),
+            "rm_total_n": results.get("rm_total_n"),
             "epoch": results.get("epoch"),
-            "per_concept_means": {k: v["mean"] for k, v in results.get("per_concept", {}).items()},
+            "per_concept": results.get("per_concept"),
         }
         wandb.log({"rm_metric_results_summary": summary})
 
     wandb.finish()
 
     print(f"\nCompleted processing run {run_id}")
-    print(f"Results summary: {results.get('rm_metric_mean_reward') if results else None}")
+    if results:
+        print(
+            f"  relevance={results.get('rm_relevance_mean')} "
+            f"grammar={results.get('rm_grammar_mean')} "
+            f"together={results.get('rm_together_mean')}"
+        )
 
     return results
 
 
 def main():
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
-    parser = argparse.ArgumentParser(description="Resume wandb runs and log Skywork RM metrics on steerability samples.")
+    parser = argparse.ArgumentParser(
+        description="Resume wandb runs; log RM logits clipped to [-100,100] (relevance / grammar / together) on steerability samples."
+    )
     parser.add_argument("--run_ids_pickle", type=str, required=True, help="Pickle file with list of wandb run IDs")
     parser.add_argument("--wandb_project", type=str, default="cbm-generation-new")
     parser.add_argument("--wandb_entity", type=str, default=None)
@@ -328,24 +399,16 @@ def main():
         "--rm_model_name",
         type=str,
         default="Skywork/Skywork-Reward-V2-Llama-3.1-8B",
-        help="HF id for sequence-classification reward model (same default as train_grpo_finegrained_llm).",
+        help="HF id for sequence-classification reward model.",
     )
-    parser.add_argument(
-        "--rm_criteria_mode",
-        type=str,
-        default="separate",
-        choices=["separate", "together", "separate_hybrid", "relevance_only"],
-        help="Same modes as --rm_criteria_mode in train_grpo_finegrained_llm.",
-    )
-    parser.add_argument("--rm_batch_size", type=int, default=0, help="0 = score all texts per concept in one batch.")
+    parser.add_argument("--rm_batch_size", type=int, default=0, help="0 = score all texts per chunk in one forward.")
     parser.add_argument("--rm_max_text_len", type=int, default=500)
     parser.add_argument(
         "--rm_device",
         type=str,
         default="cuda" if torch.cuda.is_available() else "cpu",
-        help="Device for the reward model (e.g. cuda:1 to free cuda:0 for LLaMA).",
+        help="Device for the reward model (e.g. cuda:1).",
     )
-    parser.add_argument("--debug_rm", action="store_true", help="Verbose RM debug on first concept only.")
     args = parser.parse_args()
 
     with open(args.run_ids_pickle, "rb") as f:
@@ -354,7 +417,10 @@ def main():
     print(f"Loaded {len(run_ids)} run IDs from {args.run_ids_pickle}")
     print(f"Run IDs: {run_ids}")
     print(f"Expected dataset: {args.dataset}")
-    print(f"RM: {args.rm_model_name} | criteria={args.rm_criteria_mode} | rm_device={args.rm_device}")
+    print(
+        f"RM: {args.rm_model_name} | logits clipped to [{RM_LOGIT_CLIP_MIN}, {RM_LOGIT_CLIP_MAX}] "
+        f"(relevance, grammar, together) | rm_device={args.rm_device}"
+    )
 
     all_results = {}
     total_runs = len(run_ids)
@@ -368,11 +434,9 @@ def main():
                 args.wandb_project,
                 args.wandb_entity,
                 args.rm_model_name,
-                args.rm_criteria_mode,
                 args.rm_batch_size,
                 args.rm_max_text_len,
                 args.rm_device,
-                args.debug_rm,
                 run_idx=idx,
                 total_runs=total_runs,
             )
@@ -384,11 +448,17 @@ def main():
             traceback.print_exc()
 
     print("\n" + "=" * 60)
-    print("All RM metric results (mean reward):")
+    print("All runs — rm_relevance_mean / rm_grammar_mean / rm_together_mean (clipped logits):")
     print("=" * 60)
     for rid, res in all_results.items():
-        m = res.get("rm_metric_mean_reward") if res else None
-        print(f"{rid}: {m}")
+        if not res:
+            print(f"{rid}: None")
+            continue
+        print(
+            f"{rid}: rel={res.get('rm_relevance_mean')} "
+            f"gram={res.get('rm_grammar_mean')} "
+            f"tog={res.get('rm_together_mean')}"
+        )
 
 
 if __name__ == "__main__":
