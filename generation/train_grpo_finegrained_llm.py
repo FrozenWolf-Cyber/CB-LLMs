@@ -1201,7 +1201,7 @@ if __name__ == "__main__":
 
                         # RM stays resident on rm_idle_device (args.rm_device)
 
-                        _rm_debug = (e == 0 and i < 2)
+                        _rm_debug = args.DEBUG and (e == 0) and (i < 2)  # only debug the first 2 batches of the first epoch
                         rm_rewards, rm_raw_scores = compute_reward_model_scores(
                             rm_model=rm_model,
                             rm_tokenizer=rm_tokenizer_rm,
