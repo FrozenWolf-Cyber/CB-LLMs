@@ -25,6 +25,22 @@ reference (pretrained) model:
 Usage:
     python train_grpo.py --dataset SetFit/sst2 --pretrained_run_id <wandb_run_id>
     python train_grpo.py --dataset SetFit/sst2 --pretrained_path <folder_path>
+
+Reward modes:
+    cosine        : cos_sim_cubed vs one-hot target (MPNet embeddings)
+    aggressive    : inverse-rank * similarity (MPNet embeddings)
+    llm           : base Llama-3-8B as judge (steerability + coherence + grammar)
+    reward_model  : Skywork-Reward-V2-Llama-3.1-8B as judge.
+                    Controlled by two extra flags:
+                      --rm_criteria_mode {separate, together, separate_hybrid}
+                        separate        : score relevance + grammar with two RM prompts;
+                                          sigmoid each → multiply.
+                        together        : single combined RM prompt; one sigmoid score.
+                        separate_hybrid : RM scores grammar only (sigmoid); steerability
+                                          is computed with MPNet cosine (same as cosine mode);
+                                          final reward = grammar_sigmoid × cosine_reward.
+                      --rm_batch_size N : number of trajectories per RM forward pass
+                                          (default 0 = all at once).
 """
 import argparse
 import os
@@ -74,7 +90,7 @@ def set_seed(seed):
 
 parser = argparse.ArgumentParser()
 
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
 parser.add_argument("--dataset", type=str, default="SetFit/sst2")
 parser.add_argument("--batch_size", type=int, default=4)
 
@@ -110,11 +126,48 @@ parser.add_argument("--grpo_steps_per_concept", type=int, default=-1,
                     help="If >0, override the effective number of epochs so that total GRPO steps scale as: original_epochs * num_concepts * grpo_steps_per_concept.")
 parser.add_argument("--concept_distill_weight", type=float, default=0.0, help="Weight for concept prediction distillation loss (CE between policy and reference model concepts on real data). 0 disables it.")
 parser.add_argument("--grpo_reward_mode", type=str, default="cosine",
-                    choices=["cosine", "aggressive", "llm"],
-                    help="Reward type for GRPO: 'cosine' uses cos_sim_cubed vs one-hot target; 'aggressive' uses inverse-rank * similarity; "
-                         "'llm' uses base Llama-3-8B as judge (steerability + coherence + grammar) and also replaces the KL reference with the plain base model.")
+                    choices=["cosine", "aggressive", "llm", "reward_model"],
+                    help=(
+                        "Reward type for GRPO:\n"
+                        "  cosine       : cos_sim_cubed vs one-hot target (MPNet).\n"
+                        "  aggressive   : inverse-rank * similarity (MPNet).\n"
+                        "  llm          : base Llama-3-8B as few-shot JSON judge.\n"
+                        "  reward_model : Skywork-Reward-V2-Llama-3.1-8B as judge.\n"
+                        "                 See --rm_criteria_mode and --rm_batch_mode."
+                    ))
 parser.add_argument("--grpo_llm_max_text_len", type=int, default=200,
                     help="Max chars of each generated trajectory passed to the LLM judge prompt (used when --grpo_reward_mode llm).")
+
+# ---- NEW: Reward-model reward mode flags ----
+parser.add_argument("--rm_model_name", type=str,
+                    default="Skywork/Skywork-Reward-V2-Llama-3.1-8B",
+                    help="HuggingFace model id for the reward model (used when --grpo_reward_mode reward_model).")
+parser.add_argument("--rm_criteria_mode", type=str, default="separate",
+                    choices=["separate", "together", "separate_hybrid"],
+                    help=(
+                        "How to construct RM prompts (reward_model mode only).\n"
+                        "  separate        : two RM prompts per trajectory — relevance + grammar.\n"
+                        "                    Sigmoid each and multiply.\n"
+                        "  together        : single combined RM prompt; one sigmoid score.\n"
+                        "  separate_hybrid : RM scores grammar only (sigmoid); MPNet cosine\n"
+                        "                    (same as cosine mode) scores steerability;\n"
+                        "                    final reward = grammar_sigmoid x cosine_reward."
+                    ))
+parser.add_argument("--rm_batch_size", type=int, default=0,
+                    help="Number of trajectories per RM forward pass. "
+                         "0 (default) = score all trajectories in a single batched call.")
+parser.add_argument("--rm_max_text_len", type=int, default=500,
+                    help="Max chars of each trajectory passed into the RM prompt (reward_model mode).")
+parser.add_argument("--rm_device", type=str, default=("cuda" if torch.cuda.is_available() else "cpu"),
+                help="Device to keep the reward/judge model on. "
+                    "Used for --grpo_reward_mode reward_model (Skywork RM) and llm (base Llama judge). "
+                    "Set to 'cuda:1', 'cuda:2', etc. to keep it resident on a specific GPU.")
+parser.add_argument("--ref_device", type=str, default=("cuda" if torch.cuda.is_available() else "cpu"),
+                help="Device to keep the KL reference model (pi_ref) on. "
+                    "Set to 'cuda:2', etc. to put the reference on a different GPU. "
+                    "In llm reward mode, this may load a separate base Llama copy for pi_ref.")
+parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu",
+                    help="Device to run the model on.")
 # ---- Dataset mixing ----
 parser.add_argument("--grpo_mix_dataset", action="store_true",
                     help="If set, replace grpo_mix_k of the G generated trajectories with real training texts from the current batch.")
@@ -127,6 +180,7 @@ parser.add_argument("--grpo_subset_renorm", action="store_true",
 parser.add_argument("--grpo_subset_topk", type=int, default=20,
                     help="Top-K cutoff used when --grpo_subset_renorm is enabled (default 20).")
 
+device = None  # set in main after parsing args
 
 class ClassificationDataset(torch.utils.data.Dataset):
     def __init__(self, encoded_text, s):
@@ -335,9 +389,172 @@ def compute_llm_rewards_batch(base_lm_model, base_lm_tokenizer, texts, concept_n
     return rewards, raw_scores
 
 
+# =============================================================================
+# NEW: Skywork reward model scoring
+# =============================================================================
+
+def compute_reward_model_scores(
+    rm_model,
+    rm_tokenizer,
+    texts,
+    concept_name,
+    device,
+    criteria_mode="separate",
+    rm_batch_size=0,
+    max_text_len=500,
+    debug=False,
+):
+    """Score trajectories with a Skywork-style sequence-classification reward model.
+
+    Raw RM logits span a wide numeric range (e.g. 3 → 23). A sigmoid maps them
+    to (0, 1), consistent with other reward modes and GRPO advantage normalization.
+
+    Args:
+        rm_model       : AutoModelForSequenceClassification, already on `device`.
+        rm_tokenizer   : matching tokenizer.
+        texts          : list[str] — decoded trajectories. Indices are preserved;
+                         no internal filtering so the caller's index alignment holds.
+        concept_name   : str — the concept the policy was steered toward.
+        device         : torch.device — the main training device (RM is already here).
+        criteria_mode  : "separate", "together", or "separate_hybrid".
+            separate        : two RM prompts per trajectory (relevance + grammar);
+                              sigmoid each and multiply.
+            together        : single combined RM prompt; sigmoid of one score.
+            separate_hybrid : RM scores grammar only (sigmoid). Steerability
+                              (cosine) is computed externally by the caller and
+                              multiplied in. This function returns grammar sigmoids
+                              in `rewards`; the caller is responsible for the cosine
+                              multiplication. raw_scores_list carries "grammar_score".
+        rm_batch_size  : int — trajectories per RM forward pass. 0 = all at once.
+        max_text_len   : int — max chars of each trajectory in the RM prompt.
+        debug          : bool — print prompts/scores for the first call.
+
+    Returns:
+        rewards          : list[float], same length as `texts`, values in (0, 1).
+                           For separate_hybrid, these are grammar-only sigmoids.
+        raw_scores_list  : list[dict|None] — per-trajectory raw RM scores.
+            Keys: "rm_score" (all), "relevance_score"/"grammar_score" (separate/hybrid).
+    """
+    n = len(texts)
+    rewards = [0.0] * n
+    raw_scores_list = [None] * n
+
+    if n == 0:
+        return rewards, raw_scores_list
+
+    # ------------------------------------------------------------------
+    # Prompt templates — assistant turn is always the trajectory text.
+    # ------------------------------------------------------------------
+    relevance_user = f"Write a text about the concept: {concept_name}"
+    grammar_user   = "Write a grammatically correct and fluent paragraph."
+    combined_user  = f"Write a grammatically correct and fluent text about the concept: {concept_name}"
+
+    def _make_formatted(user_turn, response_text):
+        conv = [
+            {"role": "user",      "content": user_turn},
+            {"role": "assistant", "content": response_text[:max_text_len]},
+        ]
+        formatted = rm_tokenizer.apply_chat_template(conv, tokenize=False)
+        if rm_tokenizer.bos_token and formatted.startswith(rm_tokenizer.bos_token):
+            formatted = formatted[len(rm_tokenizer.bos_token):]
+        return formatted
+
+    def _sigmoid(x: float) -> float:
+        return float(torch.sigmoid(torch.tensor(x)).item())
+
+    def _score_formatted(formatted_list):
+        """Batch-score pre-formatted strings; chunk size controlled by rm_batch_size."""
+        chunk = rm_batch_size if rm_batch_size > 0 else len(formatted_list)
+        all_scores = []
+        for start in range(0, len(formatted_list), chunk):
+            chunk_list = formatted_list[start: start + chunk]
+            tokenized = rm_tokenizer(
+                chunk_list,
+                return_tensors="pt",
+                padding=True,
+                truncation=True,
+                max_length=2048,
+            ).to(device)
+            with torch.no_grad():
+                logits = rm_model(**tokenized).logits  # (chunk, 1)
+            all_scores.extend(logits[:, 0].tolist())
+            del tokenized, logits
+        return all_scores
+
+    # ------------------------------------------------------------------
+    # Criteria mode dispatch
+    # ------------------------------------------------------------------
+    if criteria_mode == "separate":
+        rel_formatted  = [_make_formatted(relevance_user, t) for t in texts]
+        gram_formatted = [_make_formatted(grammar_user,   t) for t in texts]
+
+        if debug:
+            print(f"[RM reward DEBUG] criteria=separate, rm_batch_size={rm_batch_size}")
+            print(f"  relevance prompt[0]:\n{rel_formatted[0][:400]}")
+            print(f"  grammar prompt[0]:\n{gram_formatted[0][:400]}")
+
+        rel_scores  = _score_formatted(rel_formatted)
+        gram_scores = _score_formatted(gram_formatted)
+
+        for i in range(n):
+            r_rel  = _sigmoid(rel_scores[i])
+            r_gram = _sigmoid(gram_scores[i])
+            rewards[i] = r_rel * r_gram
+            raw_scores_list[i] = {
+                "relevance_score": rel_scores[i],
+                "grammar_score":   gram_scores[i],
+                "rm_score":        (rel_scores[i] + gram_scores[i]) / 2.0,
+            }
+            if debug:
+                print(f"  [{i}] rel={rel_scores[i]:.3f}→{r_rel:.3f}  "
+                      f"gram={gram_scores[i]:.3f}→{r_gram:.3f}  "
+                      f"reward={rewards[i]:.4f}")
+
+    elif criteria_mode == "together":
+        comb_formatted = [_make_formatted(combined_user, t) for t in texts]
+
+        if debug:
+            print(f"[RM reward DEBUG] criteria=together, rm_batch_size={rm_batch_size}")
+            print(f"  combined prompt[0]:\n{comb_formatted[0][:400]}")
+
+        comb_scores = _score_formatted(comb_formatted)
+
+        for i in range(n):
+            rewards[i] = _sigmoid(comb_scores[i])
+            raw_scores_list[i] = {"rm_score": comb_scores[i]}
+
+            if debug:
+                print(f"  [{i}] score={comb_scores[i]:.3f}→{rewards[i]:.4f}")
+
+    else:  # separate_hybrid — grammar RM only; caller multiplies cosine reward
+        gram_formatted = [_make_formatted(grammar_user, t) for t in texts]
+
+        if debug:
+            print(f"[RM reward DEBUG] criteria=separate_hybrid, rm_batch_size={rm_batch_size}")
+            print(f"  grammar prompt[0]:\n{gram_formatted[0][:400]}")
+
+        gram_scores = _score_formatted(gram_formatted)
+
+        for i in range(n):
+            r_gram = _sigmoid(gram_scores[i])
+            rewards[i] = r_gram  # cosine factor applied by caller
+            raw_scores_list[i] = {
+                "grammar_score": gram_scores[i],
+                "rm_score":      gram_scores[i],
+            }
+            if debug:
+                print(f"  [{i}] gram={gram_scores[i]:.3f}→{r_gram:.3f} (cosine TBD by caller)")
+
+    cuda_gc()
+    return rewards, raw_scores_list
+
+
 if __name__ == "__main__":
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
     args = parser.parse_args()
+    device = torch.device(args.device)
+    reward_device = torch.device(args.rm_device)
+    ref_device = torch.device(args.ref_device)
     set_seed(args.seed)
 
     # Validate: need either run_id or path
@@ -525,17 +742,17 @@ if __name__ == "__main__":
     ref_cbl = None
     if args.grpo_reward_mode != "llm":
         print("preparing reference model (frozen)...")
-        ref_preLM = LlamaModel.from_pretrained('meta-llama/Meta-Llama-3-8B', torch_dtype=torch.bfloat16).to(device)
+        ref_preLM = LlamaModel.from_pretrained('meta-llama/Meta-Llama-3-8B', torch_dtype=torch.bfloat16).to(ref_device)
         ref_preLM.load_adapter(peft_path)
         ref_preLM.eval()
         for p in ref_preLM.parameters():
             p.requires_grad = False
 
         if args.arch_type == "non_residual":
-            ref_cbl = CBL(config, len(concept_set), tokenizer).to(device)
+            ref_cbl = CBL(config, len(concept_set), tokenizer).to(ref_device)
         else:
-            ref_cbl = CBLResidual(config, len(concept_set), args.residual_dim, tokenizer).to(device)
-        ref_cbl.load_state_dict(torch.load(cbl_path, map_location=device), strict=False)
+            ref_cbl = CBLResidual(config, len(concept_set), args.residual_dim, tokenizer).to(ref_device)
+        ref_cbl.load_state_dict(torch.load(cbl_path, map_location=ref_device), strict=False)
         ref_cbl.eval()
         for p in ref_cbl.parameters():
             p.requires_grad = False
@@ -585,7 +802,8 @@ if __name__ == "__main__":
     else:
         intervention_value = 100
 
-    # Load MPNET for GRPO reward scoring
+    # Load MPNET for GRPO reward scoring (used by cosine/aggressive; also for
+    # steerability metrics in reward_model mode).
     from transformers import AutoTokenizer, AutoModel
     tokenizer_sim_grpo = AutoTokenizer.from_pretrained('sentence-transformers/all-mpnet-base-v2')
     sim_model_grpo = AutoModel.from_pretrained('sentence-transformers/all-mpnet-base-v2').to(device)
@@ -638,9 +856,10 @@ if __name__ == "__main__":
     # This single model serves TWO roles:
     #   (a) reward judge  — generates JSON scores for all trajectories in one pass
     #   (b) KL reference  — frozen π_ref for the KL divergence penalty
-    # NOTE: In `llm` reward mode we *offload the base LLM to CPU* when not in use.
-    # This reduces peak VRAM at the cost of PCIe transfer overhead.
+    # NOTE: In `llm` reward mode we keep the base LLM resident on `--rm_device`
+    # (and optionally a separate KL reference copy on `--ref_device`).
     base_lm_model = None
+    base_lm_ref_model = None
     base_lm_tokenizer = None
     if args.grpo_reward_mode == "llm":
         print("Loading base Llama-3-8B (AutoModelForCausalLM) for LLM reward + KL reference...")
@@ -653,14 +872,70 @@ if __name__ == "__main__":
         base_lm_model.eval()
         for p in base_lm_model.parameters():
             p.requires_grad = False
-        base_lm_model.to("cpu")
-        print("base_lm_model loaded on CPU (moved to GPU only when computing reward/KL, then offloaded back).")
+        base_lm_model.to(reward_device)
+        print(f"base_lm_model loaded on {reward_device} (kept resident; no CPU offload).")
+
+        # Optional separate copy for KL reference if ref_device differs.
+        # This is intentional: it lets you place reward judge and pi_ref on different GPUs.
+        if ref_device == reward_device:
+            base_lm_ref_model = base_lm_model
+        else:
+            base_lm_ref_model = AutoModelForCausalLM.from_pretrained(
+                'meta-llama/Meta-Llama-3-8B', torch_dtype=torch.bfloat16
+            )
+            base_lm_ref_model.eval()
+            for p in base_lm_ref_model.parameters():
+                p.requires_grad = False
+            base_lm_ref_model.to(ref_device)
+            print(f"base_lm_ref_model loaded on {ref_device} (separate copy for KL reference).")
 
         # When offloading between CPU/GPU, compiling the reference forward tends to recompile
         # or be device-sensitive. Keep it in eager mode for stability.
         base_lm_logits_model = None
     else:
         base_lm_logits_model = None
+
+    # =========================================================================
+    # NEW: Load Skywork reward model for 'reward_model' reward mode
+    # =========================================================================
+    rm_model = None
+    rm_tokenizer_rm = None
+    rm_idle_device = None  # set below when reward_model mode is active
+    if args.grpo_reward_mode == "reward_model":
+        print(f"Loading reward model: {args.rm_model_name} ...")
+        from transformers import AutoModelForSequenceClassification
+
+        rm_tokenizer_rm = AutoTokenizer.from_pretrained(args.rm_model_name)
+
+        # Try flash_attention_2 first (requires flash-attn package); fall back to eager.
+        _rm_load_kwargs = dict(
+            torch_dtype=torch.bfloat16,
+            num_labels=1,
+        )
+        try:
+            rm_model = AutoModelForSequenceClassification.from_pretrained(
+                args.rm_model_name,
+                attn_implementation="flash_attention_2",
+                **_rm_load_kwargs,
+            )
+            print("  Loaded RM with flash_attention_2.")
+        except Exception as fa2_err:
+            print(f"  flash_attention_2 unavailable ({fa2_err}), falling back to eager attention.")
+            rm_model = AutoModelForSequenceClassification.from_pretrained(
+                args.rm_model_name,
+                **_rm_load_kwargs,
+            )
+
+        rm_model.eval()
+        for p in rm_model.parameters():
+            p.requires_grad = False
+
+        # Keep the RM resident on its configured device.
+        rm_idle_device = torch.device(args.rm_device)
+        rm_model.to(rm_idle_device)
+        print(f"  RM device: {rm_idle_device} (kept resident)")
+        print(f"  rm_criteria_mode = {args.rm_criteria_mode}")
+        print(f"  rm_batch_size    = {args.rm_batch_size} (0 = all at once)")
 
     print("start GRPO training...")
     d_name = args.dataset.replace('/', '_')
@@ -871,21 +1146,18 @@ if __name__ == "__main__":
 
                     if args.grpo_reward_mode == "llm":
                         # ---- LLM-as-judge reward ----
-                        # Move base LLM to GPU for reward scoring, then offload back to CPU.
                         cuda_gc()
-                        base_lm_model.to(device)
                         # Print prompt + output for the first 3 steps to verify parsing
-                        _llm_debug = (e == 0 and i < 3)
+                        _llm_debug = args.DEBUG
                         llm_rewards, llm_raw_scores = compute_llm_rewards_batch(
                             base_lm_model, base_lm_tokenizer,
                             non_empty_texts,
                             concept_name=concept_set[grpo_concept_idx],
-                            device=device,
+                            device=reward_device,
                             max_text_len=args.grpo_llm_max_text_len,
                             max_new_tokens=512,
                             debug=_llm_debug,
                         )
-                        base_lm_model.to("cpu")
                         cuda_gc()
                         for rank, g in enumerate(non_empty_indices):
                             grpo_rewards[g] = llm_rewards[rank]
@@ -923,44 +1195,97 @@ if __name__ == "__main__":
                         training_losses["grpo_steer_top20"].append(0.0)
                         training_losses["grpo_steer_cos_sim"].append(float(np.mean([grpo_rewards[g] for g in non_empty_indices])))
 
-                    else:
+                    elif args.grpo_reward_mode == "reward_model":
                         # ---- MPNet + (optional RoBERTa) reward (cosine / aggressive) ----
                         cuda_gc()
-                        generated_c_grpo = tokenizer_sim_grpo(non_empty_texts, return_tensors='pt', truncation=True, max_length=args.max_length, padding=True).to(device)  # input_ids: (N_non_empty, L_mpnet)
-                        generated_features_grpo = sim_model_grpo(input_ids=generated_c_grpo["input_ids"], attention_mask=generated_c_grpo["attention_mask"])  # last_hidden_state: (N_non_empty, L_mpnet, D)
-                        generated_features_grpo = mean_pooling(generated_features_grpo.last_hidden_state, generated_c_grpo["attention_mask"])  # (N_non_empty, D)
-                        generated_features_grpo = F.normalize(generated_features_grpo, p=2, dim=1)  # (N_non_empty, D) L2-normalized
 
-                        sims_grpo = generated_features_grpo @ concept_features_grpo.T  # (N_non_empty, C)
+                        # RM stays resident on rm_idle_device (args.rm_device)
+
+                        _rm_debug = (e == 0 and i < 2)
+                        rm_rewards, rm_raw_scores = compute_reward_model_scores(
+                            rm_model=rm_model,
+                            rm_tokenizer=rm_tokenizer_rm,
+                            texts=non_empty_texts,
+                            concept_name=concept_set[grpo_concept_idx],
+                            device=rm_idle_device,
+                            criteria_mode=args.rm_criteria_mode,
+                            rm_batch_size=args.rm_batch_size,
+                            max_text_len=args.rm_max_text_len,
+                            debug=_rm_debug,
+                        )
+                        cuda_gc()
+
+                        # MPNet cosine — always computed for steerability metrics;
+                        # also used as the steerability factor in separate_hybrid.
+                        gen_c_rm = tokenizer_sim_grpo(
+                            non_empty_texts, return_tensors='pt',
+                            truncation=True, max_length=args.max_length, padding=True
+                        ).to(device)
+                        gen_feats_rm = sim_model_grpo(
+                            input_ids=gen_c_rm["input_ids"],
+                            attention_mask=gen_c_rm["attention_mask"]
+                        )
+                        gen_feats_rm = mean_pooling(gen_feats_rm.last_hidden_state, gen_c_rm["attention_mask"])
+                        gen_feats_rm = F.normalize(gen_feats_rm, p=2, dim=1)
+                        sims_rm = gen_feats_rm @ concept_features_grpo.T  # (N_non_empty, C)
+
+                        v_target_rm = torch.zeros(len(non_empty_texts), len(concept_set), device=device)
+                        v_target_rm[:, grpo_concept_idx] = 1.0
+                        cosine_rewards_rm = cos_sim_cubed(sims_rm, v_target_rm.float(), reduce=False)  # (N_non_empty,)
+
+                        # Steerability metrics from MPNet (shared across all sub-modes)
+                        sorted_indices_rm = torch.argsort(sims_rm, dim=1, descending=True)
+                        steer_top1  = (sorted_indices_rm[:, 0]   == grpo_concept_idx).float().mean().item()
+                        steer_top3  = (sorted_indices_rm[:, :3]  == grpo_concept_idx).any(dim=1).float().mean().item()
+                        steer_top5  = (sorted_indices_rm[:, :5]  == grpo_concept_idx).any(dim=1).float().mean().item()
+                        steer_top20 = (sorted_indices_rm[:, :20] == grpo_concept_idx).any(dim=1).float().mean().item()
+                        steer_cos_mean_rm = cosine_rewards_rm.mean().item()
+
+                        training_losses["grpo_steer_top1"].append(steer_top1)
+                        training_losses["grpo_steer_top3"].append(steer_top3)
+                        training_losses["grpo_steer_top5"].append(steer_top5)
+                        training_losses["grpo_steer_top20"].append(steer_top20)
+                        training_losses["grpo_steer_cos_sim"].append(steer_cos_mean_rm)
+
+                        # Assemble final per-trajectory rewards
+                        for rank, g in enumerate(non_empty_indices):
+                            if args.rm_criteria_mode == "separate_hybrid":
+                                # grammar sigmoid (from RM) × cosine steerability (from MPNet)
+                                grpo_rewards[g] = rm_rewards[rank] * cosine_rewards_rm[rank].item()
+                            else:
+                                # separate or together: RM score is already the full reward
+                                grpo_rewards[g] = rm_rewards[rank]
+
+                        # Log RM scores for the best trajectory
+                        best_rm_rank = int(np.argmax([grpo_rewards[g] for g in non_empty_indices]))
+                        best_rm_raw  = rm_raw_scores[best_rm_rank] or {}
+                        rm_log = {"rm_reward_best_score": best_rm_raw.get("rm_score", 0.0)}
+                        if args.rm_criteria_mode in ("separate", "separate_hybrid"):
+                            rm_log["rm_reward_best_grammar"]   = best_rm_raw.get("grammar_score", 0.0)
+                        if args.rm_criteria_mode == "separate":
+                            rm_log["rm_reward_best_relevance"] = best_rm_raw.get("relevance_score", 0.0)
+                        if args.rm_criteria_mode == "separate_hybrid":
+                            rm_log["rm_reward_best_cosine"] = cosine_rewards_rm[best_rm_rank].item()
+                        wandb.log(rm_log)
+
+                        del gen_c_rm, gen_feats_rm, sims_rm, v_target_rm, sorted_indices_rm
+                        del cosine_rewards_rm, rm_rewards, rm_raw_scores, best_rm_raw
+                        cuda_gc()
+                    # =================================================================
+
+                    else:
+                        # ---- MPNet cosine / aggressive reward ----
+                        cuda_gc()
+                        generated_c_grpo = tokenizer_sim_grpo(non_empty_texts, return_tensors='pt', truncation=True, max_length=args.max_length, padding=True).to(device)
+                        generated_features_grpo = sim_model_grpo(input_ids=generated_c_grpo["input_ids"], attention_mask=generated_c_grpo["attention_mask"])
+                        generated_features_grpo = mean_pooling(generated_features_grpo.last_hidden_state, generated_c_grpo["attention_mask"])
+                        generated_features_grpo = F.normalize(generated_features_grpo, p=2, dim=1)
+
+                        sims_grpo = generated_features_grpo @ concept_features_grpo.T
                         v_target_grpo = [0] * len(concept_set)
                         v_target_grpo[grpo_concept_idx] = 1.0
-                        v_tensor_grpo = torch.tensor(v_target_grpo).to(device).unsqueeze(0).expand(len(non_empty_texts), -1)  # (N_non_empty, C)
+                        v_tensor_grpo = torch.tensor(v_target_grpo).to(device).unsqueeze(0).expand(len(non_empty_texts), -1)
 
-                        # If available, use RoBERTa concept classifiers to filter/weight ACS similarities
-                        ## TODO : FIX DOWNSCALING SIMILARITY SCORES, FOR INCORRECT CONCEPT TO LABEL MAPPING
-                        # if grpo_classifiers:
-                        #     rob_enc = roberta_tokenizer_grpo(
-                        #         non_empty_texts,
-                        #         return_tensors='pt', truncation=True,
-                        #         max_length=512, padding=True
-                        #     ).to(device)
-                        #     rob_input = {"input_ids": rob_enc["input_ids"], "attention_mask": rob_enc["attention_mask"]}
-
-                        #     total_probs = torch.zeros(len(non_empty_texts), len(concept_set), device=device)
-                        #     for grpo_clf in grpo_classifiers:
-                        #         clf_logits = grpo_clf(rob_input)  # (N_non_empty, C)
-                        #         probs = F.softmax(clf_logits, dim=-1)
-                        #         total_probs += probs
-                        #     total_probs /= len(grpo_classifiers)
-
-                        #     # Element-wise filter: downweight concepts RoBERTa deems unlikely
-                        #     sims_grpo = sims_grpo * total_probs
-
-                        #     # Drop classifier intermediates
-                        #     del rob_enc, rob_input, total_probs, clf_logits, probs
-                        #     cuda_gc()
-
-                        # Optional subset renormalization: focus reward on top-K concepts (+ target)
                         if args.grpo_subset_renorm:
                             K = min(args.grpo_subset_topk, sims_grpo.size(1))
                             sims_mod = torch.zeros_like(sims_grpo)
@@ -1116,26 +1441,48 @@ if __name__ == "__main__":
                         # Use base Llama-3-8B (AutoModelForCausalLM) as KL reference.
                         # It produces vocab logits directly without any CBL intervention.
                         cuda_gc()
-                        base_lm_model.to(device)
-                        ref_vocab_logits_g = base_lm_model(
-                            input_ids=batch_input, attention_mask=batch_attn
+                        ref_llm = base_lm_ref_model if base_lm_ref_model is not None else base_lm_model
+                        if ref_device != device:
+                            ref_batch_input = batch_input.to(ref_device, non_blocking=True)
+                            ref_batch_attn = batch_attn.to(ref_device, non_blocking=True)
+                        else:
+                            ref_batch_input = batch_input
+                            ref_batch_attn = batch_attn
+                        ref_vocab_logits_g = ref_llm(
+                            input_ids=ref_batch_input, attention_mask=ref_batch_attn
                         ).logits  # (V, T, vocab_size)
                         ref_log_probs_g = F.log_softmax(ref_vocab_logits_g, dim=-1)
+                        if ref_log_probs_g.device != device:
+                            ref_log_probs_g = ref_log_probs_g.to(device, non_blocking=True)
                         del ref_vocab_logits_g
-                        base_lm_model.to("cpu")
+                        if ref_device != device:
+                            del ref_batch_input, ref_batch_attn
                         cuda_gc()
                     else:
-                        ref_feats_g = ref_preLM(input_ids=batch_input, attention_mask=batch_attn).last_hidden_state
+                        if ref_device != device:
+                            ref_batch_input = batch_input.to(ref_device, non_blocking=True)
+                            ref_batch_attn = batch_attn.to(ref_device, non_blocking=True)
+                        else:
+                            ref_batch_input = batch_input
+                            ref_batch_attn = batch_attn
+
+                        ref_feats_g = ref_preLM(input_ids=ref_batch_input, attention_mask=ref_batch_attn).last_hidden_state
                         ref_concepts_g, ref_unsup_g, _, _ = ref_cbl(ref_feats_g.float())
 
-                        ref_intervened_g = torch.zeros(len(valid_indices), batch_input.shape[1], len(concept_set), device=device)
+                        ref_intervened_g = torch.zeros(
+                            len(valid_indices), ref_batch_input.shape[1], len(concept_set), device=ref_device
+                        )
                         ref_intervened_g[:, :, grpo_concept_idx] = intervention_value
 
                         ref_vocab_logits_g = ref_cbl.intervene(ref_unsup_g, ref_intervened_g)
                         ref_log_probs_g = F.log_softmax(ref_vocab_logits_g, dim=-1)
+                        if ref_log_probs_g.device != device:
+                            ref_log_probs_g = ref_log_probs_g.to(device, non_blocking=True)
 
                         # Free reference intermediates (keep ref_concepts_g for optional distillation)
                         del ref_feats_g, ref_unsup_g, ref_intervened_g, ref_vocab_logits_g
+                        if ref_device != device:
+                            del ref_batch_input, ref_batch_attn
                         cuda_gc()
                     
                 # --- KL divergence: full-vocab KL(π_θ || π_ref) per token, always ≥ 0 ---
@@ -1158,7 +1505,10 @@ if __name__ == "__main__":
                     concept_mask_flat = batch_attn.reshape(-1).bool()  # (V * seq_len,)
                     policy_concept_flat = concepts_g.reshape(-1, len(concept_set))  # (V * seq_len, C)
                     with torch.no_grad():
-                        ref_concept_targets = F.softmax(ref_concepts_g.reshape(-1, len(concept_set)), dim=-1)
+                        _ref_concepts_for_distill = ref_concepts_g
+                        if _ref_concepts_for_distill.device != device:
+                            _ref_concepts_for_distill = _ref_concepts_for_distill.to(device, non_blocking=True)
+                        ref_concept_targets = F.softmax(_ref_concepts_for_distill.reshape(-1, len(concept_set)), dim=-1)
                     concept_distill_loss = F.cross_entropy(
                         policy_concept_flat[concept_mask_flat],
                         ref_concept_targets[concept_mask_flat]
@@ -1268,6 +1618,16 @@ if __name__ == "__main__":
         del ref_preLM, ref_cbl
     except:
         pass
+    # Free the reward model if loaded
+    if rm_model is not None:
+        del rm_model
+    try:
+        if base_lm_ref_model is not None and base_lm_ref_model is not base_lm_model:
+            del base_lm_ref_model
+    except Exception:
+        pass
+    if base_lm_model is not None:
+        del base_lm_model
 
     cuda_gc()
     
