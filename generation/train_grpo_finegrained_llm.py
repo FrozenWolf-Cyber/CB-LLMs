@@ -29,19 +29,23 @@ Usage:
 Reward modes:
     cosine        : cos_sim_cubed vs one-hot target (MPNet embeddings)
     aggressive    : inverse-rank * similarity (MPNet embeddings)
-    llm           : ContextualAI LMUnit (Qwen2.5-72B) as judge via Query/Response/Unit Test
+    llm           : ContextualAI LMUnit as judge (Query / Response / Unit Test per HF card).
+                    Uses the same --rm_criteria_mode as reward_model (separate / together / …).
     reward_model  : Skywork-Reward-V2-Llama-3.1-8B as judge.
                     Controlled by two extra flags:
                       --rm_criteria_mode {separate, together, separate_hybrid, relevance_only}
-                        separate         : relevance + grammar RM prompts; min–max each to [0,1] → multiply.
-                        together         : single combined RM prompt; min–max to [0,1] over the batch.
-                        separate_hybrid  : grammar RM only, min–max to [0,1]; × MPNet cosine (caller).
-                        relevance_only   : concept relevance RM only, min–max to [0,1]; no grammar.
+                        (Used for reward_model and for grpo_reward_mode=llm / LMUnit.)
+                        separate         : steer + grammar; min–max each to [0,1] → multiply.
+                        together         : single combined criterion; min–max to [0,1] over the batch.
+                        separate_hybrid  : grammar only, min–max to [0,1]; × MPNet cosine steer (caller).
+                        relevance_only   : steer / concept alignment only; min–max to [0,1]; no grammar pass.
                       --rm_batch_size N : number of trajectories per RM forward pass
                                           (default 0 = all at once).
 """
 import argparse
+import json
 import os
+import re
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -137,8 +141,9 @@ parser.add_argument("--grpo_llm_max_text_len", type=int, default=200,
                     help="Max chars of each generated trajectory (Response field) for LMUnit (used when --grpo_reward_mode llm).")
 parser.add_argument("--grpo_llm_judge_model", type=str, default="ContextualAI/LMUnit-qwen2.5-72b",
                     help="HuggingFace model id for LMUnit-style judging (--grpo_reward_mode llm).")
-parser.add_argument("--grpo_llm_max_new_tokens", type=int, default=40,
-                    help="Generation budget for LMUnit score decoding (--grpo_reward_mode llm).")
+parser.add_argument("--grpo_llm_max_new_tokens", type=int, default=64,
+                    help="Generation budget for LMUnit score decoding (--grpo_reward_mode llm). "
+                         "Official HF example uses 40; slightly higher helps if the model emits short rationales.")
 
 # ---- NEW: Reward-model reward mode flags ----
 parser.add_argument("--rm_model_name", type=str,
@@ -147,12 +152,12 @@ parser.add_argument("--rm_model_name", type=str,
 parser.add_argument("--rm_criteria_mode", type=str, default="separate",
                     choices=["separate", "together", "separate_hybrid", "relevance_only"],
                     help=(
-                        "How to construct RM prompts (reward_model mode only).\n"
-                        "  separate         : relevance + grammar RM; min–max each to [0,1] over the batch, multiply.\n"
-                        "  together         : single combined RM prompt; min–max logit to [0,1] over the batch.\n"
-                        "  separate_hybrid  : grammar RM only, min–max to [0,1]; MPNet cosine steerability;\n"
+                        "How to combine criteria (reward_model Skywork RM, or grpo_reward_mode=llm LMUnit).\n"
+                        "  separate         : steer + grammar; min–max each to [0,1] over the batch, multiply.\n"
+                        "  together         : single combined prompt / unit test; min–max to [0,1] over the batch.\n"
+                        "  separate_hybrid  : grammar only, min–max to [0,1]; MPNet cosine steerability;\n"
                         "                     final reward = grammar_minmax x cosine_reward.\n"
-                        "  relevance_only   : concept relevance RM only, min–max to [0,1]; grammar skipped."
+                        "  relevance_only   : steer / concept alignment only, min–max to [0,1]; grammar skipped."
                     ))
 parser.add_argument("--rm_batch_size", type=int, default=0,
                     help="Number of trajectories per RM forward pass. "
@@ -254,30 +259,145 @@ def find_pretrained_checkpoint(run_id, dataset):
     return peft_path, cbl_path
 
 
-# LMUnit judge: fixed Query / Unit Test wording ({concept_name} filled per step).
+# LMUnit judge: Query + Response + one Unit Test per forward (see ContextualAI LMUnit model card).
 _LMUNIT_QUERY_TEMPLATE = (
     'Generate open-ended text from an empty prompt while the model is steered toward the concept "{concept_name}".'
 )
-_LMUNIT_UNIT_TEST_TEMPLATE = (
-    'Does the generated text clearly reflect or align with the concept "{concept_name}"?'
+# Steerability / concept alignment (maps to RM "relevance" side).
+_LMUNIT_UNIT_TEST_STEER = (
+    'Does the response clearly reflect or align with the concept "{concept_name}"?'
+)
+# Grammar-only unit test (second pass in "separate", same spirit as Skywork grammar prompt).
+_LMUNIT_UNIT_TEST_GRAMMAR = (
+    "Is the response grammatically correct and fluent?"
+)
+# Single combined criterion ("together" mode).
+_LMUNIT_UNIT_TEST_COMBINED = (
+    'Does the response clearly reflect the concept "{concept_name}" while being grammatically '
+    "correct and fluent?"
 )
 
 
+def _batch_minmax_01(scores: list) -> list:
+    """Map scores to [0, 1] via (x - min) / (max - min) within this batch (same as RM path)."""
+    if not scores:
+        return []
+    lo = min(scores)
+    hi = max(scores)
+    if hi <= lo + 1e-12:
+        return [1.0] * len(scores)
+    span = hi - lo
+    return [(float(x) - lo) / span for x in scores]
+
+
 def _parse_lmunit_score_1_to_5(text):
-    """Parse LMUnit's scalar score in [1, 5] from generated text; return reward in [0, 1]."""
-    import re
+    """Parse LMUnit's scalar score in [1, 5] from generated text; return reward in [0, 1].
+
+    LMUnit is trained to emit a 1–5 judgment ([HF model card](https://huggingface.co/ContextualAI/LMUnit-qwen2.5-72b)).
+    Some checkpoints occasionally emit JSON-like fragments; we still try to recover a single rating in range.
+    """
     if not text:
         return 0.0, None
-    # Prefer an explicit x/5 style, then any decimal in [1, 5].
-    m = re.search(r"\b([1-5])\s*/\s*5\b", text, re.IGNORECASE)
+    s = text.strip()
+    if s.startswith("```"):
+        s = re.sub(r"^```[a-zA-Z]*\s*", "", s)
+        s = re.sub(r"\s*```\s*$", "", s).strip()
+
+    # Explicit x/5
+    m = re.search(r"\b([1-5])\s*/\s*5\b", s, re.IGNORECASE)
     if m:
         v = float(m.group(1))
         return (v - 1.0) / 4.0, v
-    for m in re.finditer(r"\b([1-5])(\.\d+)?\b", text):
+
+    # Small JSON objects often seen in the wild: {"score": 4} or {"rating": "4"}
+    for obj_match in re.finditer(r"\{[^{}]{0,200}\}", s):
+        blob = obj_match.group(0)
+        try:
+            d = json.loads(blob)
+            if isinstance(d, dict):
+                for key in ("score", "rating", "value", "overall"):
+                    if key not in d:
+                        continue
+                    val = d[key]
+                    if isinstance(val, str) and val.strip().isdigit():
+                        val = int(val.strip())
+                    if isinstance(val, (int, float)) and 1.0 <= float(val) <= 5.0:
+                        v = float(val)
+                        return (v - 1.0) / 4.0, v
+        except json.JSONDecodeError:
+            pass
+
+    # First standalone integer or float in [1, 5] (avoid greedy match on huge JSON arrays)
+    m = re.search(r"(?<![\d.])\b([1-5])(\.\d+)?\b", s)
+    if m:
         v = float(m.group(0))
         if 1.0 <= v <= 5.0:
             return (v - 1.0) / 4.0, v
+
     return 0.0, None
+
+
+def _lmunit_forward_scores(
+    lmunit_model,
+    lmunit_tokenizer,
+    texts,
+    query: str,
+    unit_test: str,
+    max_text_len: int,
+    max_new_tokens: int,
+    debug: bool,
+    debug_tag: str = "",
+):
+    """One LMUnit pass: same layout as official Transformers example on the model card."""
+    n = len(texts)
+    rewards_01 = [0.0] * n
+    scores_15 = [None] * n
+    decodes = [""] * n
+
+    model_device = next(lmunit_model.parameters()).device
+    pad_id = lmunit_tokenizer.pad_token_id
+    if pad_id is None:
+        pad_id = lmunit_tokenizer.eos_token_id
+
+    for idx, t in enumerate(texts):
+        response = t[:max_text_len]
+        content = f"Query: {query}\n\nResponse: {response}\n\nUnit Test: {unit_test}"
+        messages = [{"role": "user", "content": content}]
+        if debug and idx == 0:
+            print(f"\n[LLM reward DEBUG:{debug_tag}] ===== USER CONTENT [0] =====\n{content}\n{'='*60}")
+
+        inputs = lmunit_tokenizer.apply_chat_template(
+            messages,
+            add_generation_prompt=True,
+            tokenize=True,
+            return_dict=True,
+            return_tensors="pt",
+        )
+        inputs = {k: v.to(model_device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
+        in_len = inputs["input_ids"].shape[-1]
+
+        gen_kwargs = dict(
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+            pad_token_id=pad_id,
+        )
+        # Avoid passing deprecated/invalid kwargs (e.g. top_p) from model.generation_config.
+        with torch.inference_mode():
+            out_ids = lmunit_model.generate(**inputs, **gen_kwargs)
+
+        new_ids = out_ids[0][in_len:]
+        decoded = lmunit_tokenizer.decode(new_ids, skip_special_tokens=True)
+        r01, s15 = _parse_lmunit_score_1_to_5(decoded)
+        rewards_01[idx] = r01
+        scores_15[idx] = s15
+        decodes[idx] = decoded.strip()[:500]
+
+        if debug and idx == 0:
+            print(f"[LLM reward DEBUG:{debug_tag}] ===== RAW MODEL OUTPUT [0] =====\n{decoded}\n{'='*60}")
+
+        del inputs, out_ids, new_ids
+
+    return rewards_01, scores_15, decodes
 
 
 def compute_llm_rewards_batch(
@@ -285,28 +405,28 @@ def compute_llm_rewards_batch(
     lmunit_tokenizer,
     texts,
     concept_name,
+    criteria_mode="separate",
     max_text_len=200,
-    max_new_tokens=40,
+    max_new_tokens=64,
     debug=False,
 ):
-    """Score trajectories with ContextualAI LMUnit (HF causal LM + chat template).
+    """Score trajectories with LMUnit using the same *criteria modes* as ``compute_reward_model_scores``.
 
-    Prompt layout matches the official HF example: Query / Response / Unit Test in the
-    user message, ``apply_chat_template(..., add_generation_prompt=True)``, then
-    ``generate``. The model is trained to output a score in [1, 5]; we map linearly to
-    [0, 1] via (s - 1) / 4.
+    Per the official usage, each forward uses **one** natural-language unit test in the user message
+    (Query / Response / Unit Test), then ``generate``; the judge emits a score in [1, 5], mapped to [0, 1]
+    as (s - 1) / 4. Combinations mirror the Skywork RM path:
+
+    - ``separate``: steer unit test + grammar unit test; batch min–max each axis → product.
+    - ``together``: one combined unit test; batch min–max.
+    - ``separate_hybrid``: grammar unit test only, batch min–max; caller multiplies by MPNet cosine steer.
+    - ``relevance_only``: steer unit test only, batch min–max.
 
     Args:
-        lmunit_model, lmunit_tokenizer : frozen judge (inputs are placed on the model's device).
-        texts              : list[str] — responses to score (indices preserved).
-        concept_name       : substituted into hard-coded query and unit test strings.
-        max_text_len       : max chars of each response string.
-        max_new_tokens     : generation budget (HF example uses 40).
-        debug              : print first trajectory's user content and raw decode.
+        criteria_mode: same values as ``--rm_criteria_mode``.
 
     Returns:
-        rewards    : list[float] in [0, 1], same length as ``texts``.
-        raw_scores : list[dict|None] with keys ``lmunit_score_1_5``, ``lmunit_decode``.
+        rewards: list[float] in [0, 1] (hybrid: grammar_minmax only — multiply by cosine outside).
+        raw_scores: list[dict] with per-pass parses and decodes for logging.
     """
     cuda_gc()
 
@@ -319,51 +439,80 @@ def compute_llm_rewards_batch(
         return rewards, raw_scores
 
     query = _LMUNIT_QUERY_TEMPLATE.format(concept_name=concept_name)
-    unit_test = _LMUNIT_UNIT_TEST_TEMPLATE.format(concept_name=concept_name)
+    ut_steer = _LMUNIT_UNIT_TEST_STEER.format(concept_name=concept_name)
+    ut_gram = _LMUNIT_UNIT_TEST_GRAMMAR
+    ut_both = _LMUNIT_UNIT_TEST_COMBINED.format(concept_name=concept_name)
 
-    model_device = next(lmunit_model.parameters()).device
-    pad_id = lmunit_tokenizer.pad_token_id
-    if pad_id is None:
-        pad_id = lmunit_tokenizer.eos_token_id
-
-    for idx, t in enumerate(texts):
-        response = t[:max_text_len]
-        content = f"Query: {query}\n\nResponse: {response}\n\nUnit Test: {unit_test}"
-        messages = [{"role": "user", "content": content}]
-        if debug and idx == 0:
-            print(f"\n[LLM reward DEBUG] ===== USER CONTENT [0] =====\n{content}\n{'='*60}")
-
-        inputs = lmunit_tokenizer.apply_chat_template(
-            messages,
-            add_generation_prompt=True,
-            tokenize=True,
-            return_dict=True,
-            return_tensors="pt",
+    if criteria_mode == "separate":
+        s01_a, s15_a, dec_a = _lmunit_forward_scores(
+            lmunit_model, lmunit_tokenizer, texts, query, ut_steer,
+            max_text_len, max_new_tokens, debug, debug_tag="steer",
         )
-        inputs = {k: v.to(model_device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
-        in_len = inputs["input_ids"].shape[-1]
+        cuda_gc()
+        s01_b, s15_b, dec_b = _lmunit_forward_scores(
+            lmunit_model, lmunit_tokenizer, texts, query, ut_gram,
+            max_text_len, max_new_tokens, debug, debug_tag="grammar",
+        )
+        steer_norm = _batch_minmax_01(s01_a)
+        gram_norm = _batch_minmax_01(s01_b)
+        for i in range(n):
+            rewards[i] = steer_norm[i] * gram_norm[i]
+            raw_scores[i] = {
+                "lmunit_steer_1_5": s15_a[i],
+                "lmunit_grammar_1_5": s15_b[i],
+                "lmunit_decode_steer": dec_a[i],
+                "lmunit_decode_grammar": dec_b[i],
+                "rm_score": (s01_a[i] + s01_b[i]) / 2.0 if s15_a[i] is not None and s15_b[i] is not None else rewards[i],
+                "relevance_score": s01_a[i],
+                "grammar_score": s01_b[i],
+            }
 
-        with torch.inference_mode():
-            out_ids = lmunit_model.generate(
-                **inputs,
-                max_new_tokens=max_new_tokens,
-                do_sample=False,
-                pad_token_id=pad_id,
-            )
+    elif criteria_mode == "together":
+        s01, s15, dec = _lmunit_forward_scores(
+            lmunit_model, lmunit_tokenizer, texts, query, ut_both,
+            max_text_len, max_new_tokens, debug, debug_tag="combined",
+        )
+        comb_norm = _batch_minmax_01(s01)
+        for i in range(n):
+            rewards[i] = comb_norm[i]
+            raw_scores[i] = {
+                "lmunit_score_1_5": s15[i],
+                "lmunit_decode": dec[i],
+                "rm_score": s01[i],
+            }
 
-        new_ids = out_ids[0][in_len:]
-        decoded = lmunit_tokenizer.decode(new_ids, skip_special_tokens=True)
-        r01, s15 = _parse_lmunit_score_1_to_5(decoded)
-        rewards[idx] = r01
-        raw_scores[idx] = {
-            "lmunit_score_1_5": s15,
-            "lmunit_decode": decoded.strip()[:500],
-        }
+    elif criteria_mode == "relevance_only":
+        s01, s15, dec = _lmunit_forward_scores(
+            lmunit_model, lmunit_tokenizer, texts, query, ut_steer,
+            max_text_len, max_new_tokens, debug, debug_tag="steer_only",
+        )
+        rel_norm = _batch_minmax_01(s01)
+        for i in range(n):
+            rewards[i] = rel_norm[i]
+            raw_scores[i] = {
+                "lmunit_steer_1_5": s15[i],
+                "lmunit_decode_steer": dec[i],
+                "relevance_score": s01[i],
+                "rm_score": s01[i],
+            }
 
-        if debug and idx == 0:
-            print(f"[LLM reward DEBUG] ===== RAW MODEL OUTPUT [0] =====\n{decoded}\n{'='*60}")
+    elif criteria_mode == "separate_hybrid":
+        s01_b, s15_b, dec_b = _lmunit_forward_scores(
+            lmunit_model, lmunit_tokenizer, texts, query, ut_gram,
+            max_text_len, max_new_tokens, debug, debug_tag="grammar_hybrid",
+        )
+        gram_norm = _batch_minmax_01(s01_b)
+        for i in range(n):
+            rewards[i] = gram_norm[i]
+            raw_scores[i] = {
+                "lmunit_grammar_1_5": s15_b[i],
+                "lmunit_decode_grammar": dec_b[i],
+                "grammar_score": s01_b[i],
+                "rm_score": s01_b[i],
+            }
 
-        del inputs, out_ids, new_ids
+    else:
+        raise ValueError(f"Unknown criteria_mode={criteria_mode!r} for LMUnit rewards")
 
     cuda_gc()
     return rewards, raw_scores
@@ -439,17 +588,6 @@ def compute_reward_model_scores(
             formatted = formatted[len(rm_tokenizer.bos_token):]
         return formatted
 
-    def _minmax_01(scores: list) -> list:
-        """Map scores to [0, 1] via (x - min) / (max - min) within this batch."""
-        if not scores:
-            return []
-        lo = min(scores)
-        hi = max(scores)
-        if hi <= lo + 1e-12:
-            return [1.0] * len(scores)
-        span = hi - lo
-        return [(float(x) - lo) / span for x in scores]
-
     def _rm_debug_snippet(s: str, max_chars: int = 220) -> str:
         s = (s or "").replace("\n", " ").strip()
         if len(s) <= max_chars:
@@ -501,10 +639,10 @@ def compute_reward_model_scores(
         rel_scores  = _score_formatted(rel_formatted)
         gram_scores = _score_formatted(gram_formatted)
 
-        rel_norm = _minmax_01(rel_scores)
-        gram_norm = _minmax_01(gram_scores)
+        rel_norm = _batch_minmax_01(rel_scores)
+        gram_norm = _batch_minmax_01(gram_scores)
         together_logits = [(rel_scores[i] + gram_scores[i]) / 2.0 for i in range(n)]
-        together_norm = _minmax_01(together_logits)
+        together_norm = _batch_minmax_01(together_logits)
         hybrid_weights = [rel_norm[i] * gram_norm[i] for i in range(n)]
 
         if debug:
@@ -537,7 +675,7 @@ def compute_reward_model_scores(
             print(f"  combined prompt[0]:\n{comb_formatted[0][:400]}")
 
         comb_scores = _score_formatted(comb_formatted)
-        comb_norm = _minmax_01(comb_scores)
+        comb_norm = _batch_minmax_01(comb_scores)
 
         if debug:
             _rm_debug_best_worst("together / combined RM (min–max to [0,1] over batch)", comb_norm, texts)
@@ -560,7 +698,7 @@ def compute_reward_model_scores(
             print(f"  relevance prompt[0]:\n{rel_formatted[0][:400]}")
 
         rel_scores = _score_formatted(rel_formatted)
-        rel_norm = _minmax_01(rel_scores)
+        rel_norm = _batch_minmax_01(rel_scores)
 
         if debug:
             _rm_debug_best_worst("relevance only (min–max to [0,1] over batch)", rel_norm, texts)
@@ -584,7 +722,7 @@ def compute_reward_model_scores(
             print(f"  grammar prompt[0]:\n{gram_formatted[0][:400]}")
 
         gram_scores = _score_formatted(gram_formatted)
-        gram_norm = _minmax_01(gram_scores)
+        gram_norm = _batch_minmax_01(gram_scores)
 
         if debug:
             _rm_debug_best_worst("grammar / separate_hybrid (min–max to [0,1] over batch)", gram_norm, texts)
@@ -934,6 +1072,7 @@ if __name__ == "__main__":
             p.requires_grad = False
         lmunit_model.to(reward_device)
         print(f"LMUnit judge loaded on {reward_device}.")
+        print(f"  LMUnit criteria combination: rm_criteria_mode = {args.rm_criteria_mode} (same flag as Skywork RM).")
 
         print("Loading Meta-Llama-3-8B (AutoModelForCausalLM) for KL reference π_ref...")
         base_lm_tokenizer = AutoTokenizer.from_pretrained('meta-llama/Meta-Llama-3-8B')
@@ -1203,30 +1342,59 @@ if __name__ == "__main__":
                     non_empty_texts = [decoded_texts[g] for g in non_empty_indices]
 
                     if args.grpo_reward_mode == "llm":
-                        # ---- LLM-as-judge reward ----
+                        # ---- LMUnit judge + same criteria modes as Skywork RM ----
                         cuda_gc()
-                        # Print prompt + output for the first 3 steps to verify parsing
                         _llm_debug = args.DEBUG
                         llm_rewards, llm_raw_scores = compute_llm_rewards_batch(
                             lmunit_model,
                             lmunit_tokenizer,
                             non_empty_texts,
                             concept_name=concept_set[grpo_concept_idx],
+                            criteria_mode=args.rm_criteria_mode,
                             max_text_len=args.grpo_llm_max_text_len,
                             max_new_tokens=args.grpo_llm_max_new_tokens,
                             debug=_llm_debug,
                         )
                         cuda_gc()
-                        for rank, g in enumerate(non_empty_indices):
-                            grpo_rewards[g] = llm_rewards[rank]
 
-                        # Free reward intermediates ASAP
+                        # MPNet steerability (metrics for all llm steps; × reward when separate_hybrid)
+                        gen_c_llm = tokenizer_sim_grpo(
+                            non_empty_texts, return_tensors='pt',
+                            truncation=True, max_length=args.max_length, padding=True
+                        ).to(device)
+                        gen_feats_llm = sim_model_grpo(
+                            input_ids=gen_c_llm["input_ids"],
+                            attention_mask=gen_c_llm["attention_mask"]
+                        )
+                        gen_feats_llm = mean_pooling(gen_feats_llm.last_hidden_state, gen_c_llm["attention_mask"])
+                        gen_feats_llm = F.normalize(gen_feats_llm, p=2, dim=1)
+                        sims_llm = gen_feats_llm @ concept_features_grpo.T
+
+                        v_target_llm = torch.zeros(len(non_empty_texts), len(concept_set), device=device)
+                        v_target_llm[:, grpo_concept_idx] = 1.0
+                        cosine_rewards_llm = cos_sim_cubed(sims_llm, v_target_llm.float(), reduce=False)
+
+                        sorted_indices_llm = torch.argsort(sims_llm, dim=1, descending=True)
+                        steer_top1_llm = (sorted_indices_llm[:, 0] == grpo_concept_idx).float().mean().item()
+                        steer_top3_llm = (sorted_indices_llm[:, :3] == grpo_concept_idx).any(dim=1).float().mean().item()
+                        steer_top5_llm = (sorted_indices_llm[:, :5] == grpo_concept_idx).any(dim=1).float().mean().item()
+                        steer_top20_llm = (sorted_indices_llm[:, :20] == grpo_concept_idx).any(dim=1).float().mean().item()
+                        steer_cos_mean_llm = cosine_rewards_llm.mean().item()
+
+                        training_losses["grpo_steer_top1"].append(steer_top1_llm)
+                        training_losses["grpo_steer_top3"].append(steer_top3_llm)
+                        training_losses["grpo_steer_top5"].append(steer_top5_llm)
+                        training_losses["grpo_steer_top20"].append(steer_top20_llm)
+                        training_losses["grpo_steer_cos_sim"].append(steer_cos_mean_llm)
+
+                        for rank, g in enumerate(non_empty_indices):
+                            if args.rm_criteria_mode == "separate_hybrid":
+                                grpo_rewards[g] = llm_rewards[rank] * cosine_rewards_llm[rank].item()
+                            else:
+                                grpo_rewards[g] = llm_rewards[rank]
+
                         del llm_rewards
 
-                        # Log parsed criteria scores for the highest-reward trajectory.
-                        # Important: `llm_raw_scores` is aligned to `non_empty_texts` (ranked 0..N-1),
-                        # while `grpo_rewards` is indexed by the original trajectory id `g` (0..G-1).
-                        # Pick the best trajectory using a simple loop (clear + avoids rank/index confusion).
                         best_rank = 0
                         best_g = non_empty_indices[0]
                         best_reward = grpo_rewards[best_g]
@@ -1237,22 +1405,22 @@ if __name__ == "__main__":
                                 best_rank = rank
                                 best_g = g
                         best_raw = llm_raw_scores[best_rank] or {}
-                        _s15 = best_raw.get("lmunit_score_1_5")
-                        _s01 = (_s15 - 1.0) / 4.0 if _s15 is not None else best_reward
-                        wandb.log({
-                            "llm_reward_best_lmunit_1_5": float(_s15) if _s15 is not None else 0.0,
-                            "llm_reward_best_normalized": float(_s01),
-                        })
+                        _s15_combined = best_raw.get("lmunit_score_1_5")
+                        _s15_steer = best_raw.get("lmunit_steer_1_5")
+                        _s15_gram = best_raw.get("lmunit_grammar_1_5")
+                        llm_log = {
+                            "llm_reward_best_normalized": float(best_reward),
+                            "llm_reward_best_lmunit_combined_1_5": float(_s15_combined) if _s15_combined is not None else 0.0,
+                            "llm_reward_best_lmunit_steer_1_5": float(_s15_steer) if _s15_steer is not None else 0.0,
+                            "llm_reward_best_lmunit_grammar_1_5": float(_s15_gram) if _s15_gram is not None else 0.0,
+                        }
+                        if args.rm_criteria_mode == "separate_hybrid":
+                            llm_log["llm_reward_best_cosine"] = cosine_rewards_llm[best_rank].item()
+                        wandb.log(llm_log)
 
-                        del llm_raw_scores, best_raw
+                        del llm_raw_scores, best_raw, gen_c_llm, gen_feats_llm, sims_llm, v_target_llm
+                        del sorted_indices_llm, cosine_rewards_llm
                         cuda_gc()
-
-                        # Steerability metrics: not applicable without MPNet sims — append 0 placeholders
-                        training_losses["grpo_steer_top1"].append(0.0)
-                        training_losses["grpo_steer_top3"].append(0.0)
-                        training_losses["grpo_steer_top5"].append(0.0)
-                        training_losses["grpo_steer_top20"].append(0.0)
-                        training_losses["grpo_steer_cos_sim"].append(float(np.mean([grpo_rewards[g] for g in non_empty_indices])))
 
                     elif args.grpo_reward_mode == "reward_model":
                         # ---- MPNet + (optional RoBERTa) reward (cosine / aggressive) ----
