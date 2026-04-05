@@ -41,6 +41,7 @@ from modules import CBLResidual, CBL, Roberta_classifier
 import time
 from module_intervention import amplify_intervention
 from utils import elastic_net_penalty, mean_pooling, eos_pooling, get_labels, cos_sim_cubed
+from steerability_cache import load_concept_samples, sample_file_path, save_all_steerability_texts, steerability_output_root, write_sample
 import wandb
 import glob
 import copy
@@ -61,6 +62,12 @@ parser.add_argument("--epoch_multiplier", type=int, default=1, help="Epoch multi
 parser.add_argument("--max_length", type=int, default=350)
 parser.add_argument("--num_workers", type=int, default=0)
 parser.add_argument("--seed", type=int, default=42)
+parser.add_argument(
+    "--samples_per_concept",
+    type=int,
+    default=None,
+    help="Steerability evaluation: samples per concept. Default max(1, 100 // num_concepts), same as resume_steerability_test.",
+)
 parser.add_argument("--discrimination_loss", type=float, default=0.0)
 parser.add_argument("--arch_type", type=str, default="residual", choices=["residual", "non_residual"])
 parser.add_argument("--residual_dim", type=int, default=768)
@@ -976,11 +983,24 @@ if __name__ == "__main__":
     total_evals = 0
     
     # Use batched generation for steerability evaluation: for each concept
-    # generate 50 samples at once with `generate_batch`.
-    num_steerability_samples = 50  # scalar
+    # generate N samples with `generate_batch` (with on-disk cache under checkpoint dir).
+    num_steerability_samples = (
+        max(1, args.samples_per_concept)
+        if args.samples_per_concept is not None
+        else max(1, 100 // len(concept_set))
+    )
+    print(
+        f"Steerability samples per concept: {num_steerability_samples}"
+        + (" (from --samples_per_concept)" if args.samples_per_concept is not None else " (default: 100 // num_concepts)")
+    )
+    steer_root = steerability_output_root(os.path.normpath(prefix.rstrip("/")), best_epoch, False)
+    print(f"Steerability sample cache: {steer_root}")
+    steerability_texts_for_save = [[] for _ in range(len(concept_set))]
     gen_input = torch.tensor([tokenizer.encode("")]).to(device)  # (1, prompt_len)
     special_tokens_mask = torch.tensor([128000, 128001]).to(device)  # (2,)
     ce_loss_fn = torch.nn.CrossEntropyLoss(reduction="none")  # CE over classes
+    steer_chunk = 25
+    cseed = args.seed
 
     # Use either the full concept set or the capped active subset for steerability testing
     steer_concept_indices = active_concept_indices if args.grpo_active_concepts_k is not None and args.grpo_active_concepts_k > 0 else range(len(concept_set))
@@ -989,29 +1009,40 @@ if __name__ == "__main__":
         for j in tqdm(steer_concept_indices, desc="Steerability concepts"):
             v = [0] * len(concept_set)  # (C,)
             v[j] = intervention_value
+            cname = concept_set[j]
+            slots = load_concept_samples(steer_root, cseed, j, cname, num_steerability_samples)
+            pos = 0
+            while pos < num_steerability_samples:
+                if slots[pos] is not None:
+                    pos += 1
+                    continue
+                end = pos
+                while end < num_steerability_samples and slots[end] is None:
+                    end += 1
+                gen_pos = pos
+                while gen_pos < end:
+                    current_batch = min(steer_chunk, end - gen_pos)
+                    text_ids_batch, _ = cbl.generate_batch(
+                        gen_input,
+                        preLM,
+                        num_samples=current_batch,
+                        intervene=v,
+                        length=50,
+                    )
+                    for b in range(current_batch):
+                        sample_idx = gen_pos + b
+                        tokens = text_ids_batch[b][~torch.isin(text_ids_batch[b], special_tokens_mask)]
+                        decoded = tokenizer.decode(tokens)
+                        slots[sample_idx] = decoded
+                        write_sample(sample_file_path(steer_root, j, cname, cseed, sample_idx), decoded)
+                        text.append(decoded)
+                    gen_pos += current_batch
+                pos = end
 
-            # Batched generation: `num_steerability_samples` samples for this concept
-            text_ids_batch, _ = cbl.generate_batch(
-                gen_input,
-                preLM,
-                num_samples=num_steerability_samples,
-                intervene=v,
-                length=50,
-            )  # (num_steerability_samples, gen_len)
-
-            # Decode and collect texts for MPNet scoring
-            decoded_texts = []  # list of length B=num_steerability_samples
-            for g in range(num_steerability_samples):
-                tokens = text_ids_batch[g][~torch.isin(text_ids_batch[g], special_tokens_mask)]
-                decoded = tokenizer.decode(tokens)
-                decoded_texts.append(decoded)
-                text.append(decoded)
-            
-            ### print some decoded texts for debugging
-            # print(f"Steerability evaluation for concept '{concept_set[j]}':")
-            for idx in range(len(decoded_texts)):
-                # print(f"  Sample {idx+1}: {decoded_texts[idx]}")
-                wandb.log({f"steerability_sample_{concept_set[j]}_{idx+1}": decoded_texts[idx]})
+            decoded_texts = [slots[k] for k in range(num_steerability_samples)]
+            steerability_texts_for_save[j] = decoded_texts
+            for idx, dt in enumerate(decoded_texts):
+                wandb.log({f"steerability_sample_{cname}_{idx + 1}": dt})
             # Batched similarity scoring with MPNet
             generated_c = tokenizer_sim(
                 decoded_texts,
@@ -1229,5 +1260,7 @@ if __name__ == "__main__":
     perplexity = perplexity.compute(model_id='meta-llama/Meta-Llama-3-8B', max_length=100)['mean_perplexity']
     print(perplexity)
     wandb.log({"perplexity_all_tokens": perplexity})
-        
+
+    save_all_steerability_texts(steer_root, args.seed, concept_set, steerability_texts_for_save)
+
     

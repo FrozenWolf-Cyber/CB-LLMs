@@ -21,6 +21,7 @@ except ImportError:
     import config as CFG
 from transformers import AutoModelForSequenceClassification, AutoTokenizer, LlamaConfig
 
+from steerability_cache import save_all_steerability_texts, steerability_output_root
 from resume_steerability_test import (
     find_eval_checkpoint,
     generate_steerability_texts,
@@ -199,6 +200,7 @@ def process_run(
     rm_batch_size,
     rm_max_text_len,
     rm_device_str,
+    samples_per_concept=None,
     run_idx=None,
     total_runs=None,
 ):
@@ -258,6 +260,8 @@ def process_run(
 
     concept_set = CFG.concept_set.get(dataset, CFG.concepts_from_labels[dataset])
     print(f"Concept len: {len(concept_set)}")
+    n_samples = max(1, samples_per_concept) if samples_per_concept is not None else max(1, 100 // len(concept_set))
+    print(f"Samples per concept: {n_samples}" + (" (from --samples_per_concept)" if samples_per_concept is not None else " (default: 100 // num_concepts)"))
 
     rm_device = torch.device(rm_device_str)
     rm_model, rm_tokenizer = load_reward_model(rm_model_name, rm_device)
@@ -272,6 +276,9 @@ def process_run(
     results = {}
     print(f"\nRM steerability benchmark — epoch {best_epoch} (logits clipped to [{RM_LOGIT_CLIP_MIN}, {RM_LOGIT_CLIP_MAX}], no min–max)")
     print(f"  rm_batch_size={rm_batch_size} max_text_len={rm_max_text_len}")
+
+    steer_dir = steerability_output_root(ckpt_prefix, best_epoch, is_low_score)
+    print(f"Steerability sample cache: {steer_dir}")
 
     if arch_type is not None:
         discrimination_loss_for_loading = 1.0 if arch_type == "non_residual" else 0.0
@@ -289,7 +296,6 @@ def process_run(
             residual_dim,
         )
 
-        samples_per_concept = max(1, 100 // len(concept_set))
         llama_vocab_weight = get_llama_vocab_weight() if add_llama_logits else None
         decoded_texts_by_concept = generate_steerability_texts(
             preLM,
@@ -297,9 +303,11 @@ def process_run(
             tokenizer,
             concept_set,
             dataset,
-            samples_per_concept=samples_per_concept,
+            samples_per_concept=n_samples,
             print_k=3,
             llama_vocab_weight=llama_vocab_weight,
+            steerability_cache_dir=steer_dir,
+            steerability_cache_seed=seed,
         )
 
         metrics = run_rm_metrics_from_texts(
@@ -346,6 +354,8 @@ def process_run(
             "run_type": run_type,
             "low_score_checkpoint": is_low_score,
         }
+
+        save_all_steerability_texts(steer_dir, seed, concept_set, decoded_texts_by_concept)
 
         del preLM, cbl
         torch.cuda.empty_cache()
@@ -396,6 +406,12 @@ def main():
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
+        "--samples_per_concept",
+        type=int,
+        default=None,
+        help="Steerability samples per concept. If omitted, max(1, 100 // num_concepts).",
+    )
+    parser.add_argument(
         "--rm_model_name",
         type=str,
         default="Skywork/Skywork-Reward-V2-Llama-3.1-8B",
@@ -437,6 +453,7 @@ def main():
                 args.rm_batch_size,
                 args.rm_max_text_len,
                 args.rm_device,
+                samples_per_concept=args.samples_per_concept,
                 run_idx=idx,
                 total_runs=total_runs,
             )

@@ -14,6 +14,7 @@ import time
 import torch.nn.functional as F
 from datasets import load_dataset
 from utils import mean_pooling, get_labels, cos_sim_cubed
+from steerability_cache import load_concept_samples, sample_file_path, save_all_steerability_texts, steerability_output_root, write_sample
 
 
 def set_seed(seed):
@@ -33,6 +34,12 @@ parser.add_argument("--classifier_weight_suffixes", type=str, default="_seed42,_
 parser.add_argument("--dataset", type=str, required=True,
                     help="Dataset to test (must match the dataset used in the wandb run). e.g., 'SetFit/sst2', 'ag_news', 'yelp_polarity', 'dbpedia_14'")
 parser.add_argument("--seed", type=int, default=42, help="Random seed for steerability test generation")
+parser.add_argument(
+    "--samples_per_concept",
+    type=int,
+    default=None,
+    help="Steerability generations per concept in GRPO eval. If omitted, uses max(1, 100 // num_concepts) like resume_steerability_test.",
+)
 
 
 def find_eval_checkpoint(run_id, dataset):
@@ -63,59 +70,6 @@ def find_eval_checkpoint(run_id, dataset):
         return None, None, None
 
     return peft_path, cbl_path, epoch
-
-
-def generate_steerability_texts(preLM, cbl, tokenizer, concept_set, dataset, samples_per_concept, print_k=3):
-    """
-    Generate steerability texts with batched generation for each concept.
-    Returns: list of lists, shape (num_concepts, samples_per_concept)
-    """
-    if dataset == "dbpedia_14":
-        intervention_value = 150
-    else:
-        intervention_value = 100
-
-    input_ids = torch.tensor([tokenizer.encode("")]).to(device)
-    special_tokens_mask = torch.tensor([128000, 128001]).to(device)
-    all_texts = []
-
-    chunk_size = 25
-
-    with torch.no_grad():
-        for concept_idx in tqdm(range(len(concept_set)), desc="Steerability generation"):
-            v = [0] * len(concept_set)
-            v[concept_idx] = intervention_value
-            concept_texts = []
-            generated_so_far = 0
-
-            while generated_so_far < samples_per_concept:
-                current_batch = min(chunk_size, samples_per_concept - generated_so_far)
-                text_ids_batch, _ = cbl.generate_batch(
-                    input_ids,
-                    preLM,
-                    num_samples=current_batch,
-                    intervene=v,
-                    length=50,
-                )
-
-                for b in range(current_batch):
-                    decoded_text_ids = tokenizer.decode(
-                        text_ids_batch[b][~torch.isin(text_ids_batch[b], special_tokens_mask)]
-                    )
-                    concept_texts.append(decoded_text_ids)
-                    wandb.log({
-                        f"steerability_sample_{concept_set[concept_idx]}_{generated_so_far + b + 1}": decoded_text_ids
-                    })
-
-                generated_so_far += current_batch
-
-            print(f"Concept '{concept_set[concept_idx]}' sample preview:")
-            for k in range(min(print_k, len(concept_texts))):
-                print(f"  [{k+1}] {concept_texts[k]}")
-
-            all_texts.append(concept_texts)
-
-    return all_texts
 
 
 def run_steerability_test_from_texts(decoded_texts_by_concept, roberta_tokenizer, classifier, concept_set):
@@ -169,7 +123,20 @@ def load_model_and_cbl(peft_path, cbl_path, config, concept_set, tokenizer, arch
     return preLM, cbl
 
 
-def run_evaluation(preLM, cbl, tokenizer, concept_set, dataset, run_config, classifier_suffixes, run_name, seed):
+def run_evaluation(
+    preLM,
+    cbl,
+    tokenizer,
+    concept_set,
+    dataset,
+    run_config,
+    classifier_suffixes,
+    run_name,
+    seed,
+    num_steerability_samples=None,
+    steerability_cache_dir=None,
+    steerability_cache_seed=42,
+):
     """
     Run all evaluations from train_grpo_finegrained.py.
     """
@@ -202,36 +169,69 @@ def run_evaluation(preLM, cbl, tokenizer, concept_set, dataset, run_config, clas
     top10_correct = 0
     top20_correct = 0
     total_evals = 0
-    
-    num_steerability_samples = 50
+
+    n_steer = (
+        max(1, num_steerability_samples)
+        if num_steerability_samples is not None
+        else max(1, 100 // len(concept_set))
+    )
+    print(
+        f"Steerability samples per concept: {n_steer}"
+        + (" (from --samples_per_concept)" if num_steerability_samples is not None else " (default: 100 // num_concepts)")
+    )
+    if steerability_cache_dir:
+        print(f"Steerability sample cache: {steerability_cache_dir}")
     gen_input = torch.tensor([tokenizer.encode("")]).to(device)
     special_tokens_mask = torch.tensor([128000, 128001]).to(device)
     ce_loss_fn = torch.nn.CrossEntropyLoss(reduction="none")
 
     steer_concept_indices = range(len(concept_set))
+    chunk_size = 25
+    cseed = steerability_cache_seed
+    steer_texts_snapshot = [[] for _ in range(len(concept_set))]
 
     with torch.no_grad():
         for j in tqdm(steer_concept_indices, desc="Steerability concepts"):
             v = [0] * len(concept_set)
             v[j] = intervention_value
+            cname = concept_set[j]
+            slots = load_concept_samples(steerability_cache_dir, cseed, j, cname, n_steer)
+            pos = 0
+            while pos < n_steer:
+                if slots[pos] is not None:
+                    pos += 1
+                    continue
+                end = pos
+                while end < n_steer and slots[end] is None:
+                    end += 1
+                gen_pos = pos
+                while gen_pos < end:
+                    current_batch = min(chunk_size, end - gen_pos)
+                    text_ids_batch, _ = cbl.generate_batch(
+                        gen_input,
+                        preLM,
+                        num_samples=current_batch,
+                        intervene=v,
+                        length=50,
+                    )
+                    for b in range(current_batch):
+                        sample_idx = gen_pos + b
+                        tokens = text_ids_batch[b][~torch.isin(text_ids_batch[b], special_tokens_mask)]
+                        decoded = tokenizer.decode(tokens)
+                        slots[sample_idx] = decoded
+                        if steerability_cache_dir:
+                            write_sample(
+                                sample_file_path(steerability_cache_dir, j, cname, cseed, sample_idx),
+                                decoded,
+                            )
+                        text.append(decoded)
+                    gen_pos += current_batch
+                pos = end
 
-            text_ids_batch, _ = cbl.generate_batch(
-                gen_input,
-                preLM,
-                num_samples=num_steerability_samples,
-                intervene=v,
-                length=50,
-            )
-
-            decoded_texts = []
-            for g in range(num_steerability_samples):
-                tokens = text_ids_batch[g][~torch.isin(text_ids_batch[g], special_tokens_mask)]
-                decoded = tokenizer.decode(tokens)
-                decoded_texts.append(decoded)
-                text.append(decoded)
-            
-            for idx in range(len(decoded_texts)):
-                wandb.log({f"steerability_sample_{concept_set[j]}_{idx+1}": decoded_texts[idx]})
+            decoded_texts = [slots[k] for k in range(n_steer)]
+            steer_texts_snapshot[j] = decoded_texts
+            for idx, dt in enumerate(decoded_texts):
+                wandb.log({f"steerability_sample_{cname}_{idx + 1}": dt})
 
             generated_c = tokenizer_sim(
                 decoded_texts, padding=True, truncation=True, max_length=350, return_tensors="pt"
@@ -262,6 +262,9 @@ def run_evaluation(preLM, cbl, tokenizer, concept_set, dataset, run_config, clas
             top10_correct += (sorted_indices[:, :10] == j).any(dim=1).sum().item()
             top20_correct += (sorted_indices[:, :20] == j).any(dim=1).sum().item()
             total_evals += sims.size(0)
+
+    if steerability_cache_dir:
+        save_all_steerability_texts(steerability_cache_dir, cseed, concept_set, steer_texts_snapshot)
 
     steer_results = {
         "steerability_cos_sim_cubed": sum(cos_sim_cubed_values) / len(cos_sim_cubed_values),
@@ -450,7 +453,7 @@ def run_evaluation(preLM, cbl, tokenizer, concept_set, dataset, run_config, clas
 
 
 def process_run(run_id, classifier_suffixes, expected_dataset, seed, wandb_project, wandb_entity=None,
-                run_idx=None, total_runs=None):
+                samples_per_concept=None, run_idx=None, total_runs=None):
     """
     Process a single wandb run: load config, load models, run evaluations, and log results.
     """
@@ -492,6 +495,10 @@ def process_run(run_id, classifier_suffixes, expected_dataset, seed, wandb_proje
     if best_epoch is None:
         print(f"No model weights found for run {run_id}")
         return
+
+    d_name = dataset.replace("/", "_")
+    grpo_prefix = os.path.join(".", f"from_pretained_llama3_lora_grpo_{run_id}", d_name)
+    steer_dir = steerability_output_root(grpo_prefix, best_epoch, False)
     
     config = LlamaConfig.from_pretrained('meta-llama/Meta-Llama-3-8B')
     tokenizer = AutoTokenizer.from_pretrained('meta-llama/Meta-Llama-3-8B')
@@ -519,7 +526,18 @@ def process_run(run_id, classifier_suffixes, expected_dataset, seed, wandb_proje
         )
 
         eval_results = run_evaluation(
-            preLM, cbl, tokenizer, concept_set, dataset, run_config, classifier_suffixes, resumed_run.name, seed
+            preLM,
+            cbl,
+            tokenizer,
+            concept_set,
+            dataset,
+            run_config,
+            classifier_suffixes,
+            resumed_run.name,
+            seed,
+            num_steerability_samples=samples_per_concept,
+            steerability_cache_dir=steer_dir,
+            steerability_cache_seed=seed,
         )
         results.update(eval_results)
 
@@ -563,6 +581,7 @@ def main():
                 args.seed,
                 args.wandb_project, 
                 args.wandb_entity,
+                samples_per_concept=args.samples_per_concept,
                 run_idx=idx,
                 total_runs=total_runs,
             )
