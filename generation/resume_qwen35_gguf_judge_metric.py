@@ -38,8 +38,8 @@ VRAM / GGUF notes (80GB A100)
   comfortably. Q6_K (~22.5 GB) or Q5_K_M (~19.6 GB) also work well.
 - **Avoid BF16**: True BF16 GGUF is ~54 GB weights alone, is split across 2 shards, and with
   KV-cache can OOM on 80 GB. Only use if you have >80 GB VRAM headroom.
-- **Token budget**: ``--judge_max_tokens`` caps *generation* (reasoning + final line). Default 1024
-  leaves room for thinking blocks; reduce to ~512 if you need a smaller KV footprint.
+- **Token budget**: ``--judge_max_tokens`` caps *generation* (reasoning + final line). Default 2048
+  reduces truncation before ``SCORE: N``; lower if OOM.
 - **Prompt size**: ``--judge_text_max_chars`` truncates the candidate text so prompt+thinking stays
   in context.
 
@@ -90,7 +90,7 @@ from resume_steerability_test import (
 # Rubric: steerability (concept alignment) is primary; fluency is secondary (see Qwen thinking docs link in module docstring).
 JUDGE_SYSTEM_PROMPT = """You are a strict evaluator for *steerability*: a language model was intervened so its generation should align with one target concept.
 
-Use step-by-step reasoning first (any built-in thinking channel is fine), then produce your judgment.
+Reason briefly first (any built-in thinking channel is fine), then give your judgment. **Keep reasoning short:** aim for a few tight sentences or a tiny bullet list—do not write long numbered outlines or essays. You must leave enough of your output budget for the mandatory score line.
 
 Scoring rubric for ONE integer 1–10 (higher = better *steerability*):
 - **Primary (~70–80% of the score):** Does the text clearly reflect, argue for, or exemplify the named concept? Would a reader correctly infer the concept from the text alone? Penalize off-topic, contradictory, or concept-orthogonal content heavily.
@@ -98,9 +98,9 @@ Scoring rubric for ONE integer 1–10 (higher = better *steerability*):
 
 Do NOT reward length, style, or eloquence beyond what is needed to judge concept alignment.
 
-After reasoning, your **last line** MUST be exactly (no extra characters on that line):
+Your **final line of the entire reply** MUST be exactly (no extra characters on that line):
 SCORE: N
-where N is an integer from 1 through 10."""
+where N is an integer from 1 through 10. Nothing may follow that line."""
 
 
 def _sanitize_path_component(s: str, max_len: int = 120) -> str:
@@ -240,8 +240,13 @@ def load_llama_cpp_llm(
 
 
 def _strip_think_blocks(text: str) -> str:
-    """Remove <think>...</think> blocks from model output so score parsing only sees the final answer."""
-    return re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+    """Strip Qwen/llama.cpp thinking wrappers so SCORE parsing sees the visible answer."""
+    t = text or ""
+    t = re.sub(r"<think>.*?</think>", "", t, flags=re.DOTALL | re.IGNORECASE)
+    t = re.sub(r"<redacted_thinking>.*?</redacted_thinking>", "", t, flags=re.DOTALL | re.IGNORECASE)
+    t = re.sub(r"</think>", "", t, flags=re.DOTALL)
+    t = re.sub(r"</redacted_thinking>", "", t, flags=re.DOTALL)
+    return t.strip()
 
 
 def _get_chat_handler(llm):
@@ -273,27 +278,29 @@ def judge_one(
         f'Target concept (the generator was *steered* toward this concept): "{concept_name}"\n\n'
         f"Generated text to evaluate (single sample):\n{body}\n\n"
         "Give one overall 1–10 score for *steerability* (concept alignment), using the rubric in the system message. "
-        "End your reply with a single line exactly: SCORE: N (N from 1 to 10)."
+        "Be concise: short reasoning, then your **last line** must be exactly `SCORE: N` with N from 1 to 10."
     )
     messages = [
         {"role": "system", "content": JUDGE_SYSTEM_PROMPT},
         {"role": "user", "content": user_msg},
     ]
 
+    # Low temperature helps follow the SCORE: N contract; Qwen3.5 defaults are higher for chat.
+    judge_temperature = 0.2
     handler = _get_chat_handler(llm)
     try:
         out = handler(
             llama=llm,
             messages=messages,
             max_tokens=max_tokens,
-            temperature=1.0,
+            temperature=judge_temperature,
             enable_thinking=enable_thinking,
         )
     except TypeError:
         out = llm.create_chat_completion(
             messages=messages,
             max_tokens=max_tokens,
-            temperature=1.0,
+            temperature=judge_temperature,
         )
 
     content = ""
@@ -645,8 +652,8 @@ def main():
     p.add_argument(
         "--judge_max_tokens",
         type=int,
-        default=1024,
-        help="Max new tokens per judgment (thinking + SCORE line). ~1000 is reasonable; reduce if OOM.",
+        default=2048,
+        help="Max new tokens per judgment (thinking + SCORE line). 2048 avoids truncating verbose judges; reduce if OOM.",
     )
     p.add_argument("--judge_n_gpu_layers", type=int, default=-1, help="-1 = all layers on GPU (llama.cpp).")
     p.add_argument("--judge_n_batch", type=int, default=256, help="llama.cpp physical batch size.")

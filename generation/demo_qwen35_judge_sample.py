@@ -99,10 +99,20 @@ def main() -> int:
         required=True,
         help="Local .gguf path or HF spec repo_id::filename (see resume_qwen35_gguf_judge_metric).",
     )
-    p.add_argument("--n_ctx", type=int, default=4096)
+    p.add_argument(
+        "--n_ctx",
+        type=int,
+        default=8192,
+        help="Context for judge + long reasoning (default 8192).",
+    )
     p.add_argument("--n_gpu_layers", type=int, default=-1)
     p.add_argument("--n_batch", type=int, default=256)
-    p.add_argument("--max_tokens", type=int, default=768)
+    p.add_argument(
+        "--max_tokens",
+        type=int,
+        default=2048,
+        help="Must be large enough for thinking + final SCORE line (default 2048).",
+    )
     p.add_argument("--max_chars", type=int, default=1200)
     p.add_argument("--judge_disable_thinking", action="store_true", help="Pass enable_thinking=False to template.")
     p.add_argument("--verbose", action="store_true")
