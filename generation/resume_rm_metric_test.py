@@ -203,6 +203,7 @@ def process_run(
     samples_per_concept=None,
     run_idx=None,
     total_runs=None,
+    interventions_per_batch=1,
 ):
     set_seed(seed)
 
@@ -308,6 +309,7 @@ def process_run(
             llama_vocab_weight=llama_vocab_weight,
             steerability_cache_dir=steer_dir,
             steerability_cache_seed=seed,
+            interventions_per_batch=interventions_per_batch,
         )
 
         metrics = run_rm_metrics_from_texts(
@@ -420,6 +422,12 @@ def main():
     parser.add_argument("--rm_batch_size", type=int, default=0, help="0 = score all texts per chunk in one forward.")
     parser.add_argument("--rm_max_text_len", type=int, default=500)
     parser.add_argument(
+        "--interventions_per_batch",
+        type=int,
+        default=4,
+        help="Number of concept interventions to batch together during generation. (default: 4)",
+    )
+    parser.add_argument(
         "--rm_device",
         type=str,
         default="cuda" if torch.cuda.is_available() else "cpu",
@@ -456,6 +464,7 @@ def main():
                 samples_per_concept=args.samples_per_concept,
                 run_idx=idx,
                 total_runs=total_runs,
+                interventions_per_batch=args.interventions_per_batch,
             )
             all_results[run_id] = out
         except Exception as e:

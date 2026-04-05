@@ -417,6 +417,7 @@ def process_run(
     samples_per_concept: int | None = None,
     run_idx: int | None = None,
     total_runs: int | None = None,
+    interventions_per_batch: int = 1,
 ):
     set_seed(seed)
 
@@ -506,6 +507,7 @@ def process_run(
             llama_vocab_weight=llama_vocab_weight,
             steerability_cache_dir=steer_dir,
             steerability_cache_seed=seed,
+            interventions_per_batch=interventions_per_batch,
         )
         save_all_steerability_texts(steer_dir, seed, concept_set, decoded_texts_by_concept)
     except Exception as e:
@@ -693,6 +695,12 @@ def main():
             "Default: derived from --judge_gguf_path basename."
         ),
     )
+    p.add_argument(
+        "--interventions_per_batch",
+        type=int,
+        default=4,
+        help="Number of concept interventions to batch together during generation. (default: 4)",
+    )
     args = p.parse_args()
 
     with open(args.run_ids_pickle, "rb") as f:
@@ -723,6 +731,7 @@ def main():
             samples_per_concept=args.samples_per_concept,
             run_idx=idx,
             total_runs=len(run_ids),
+            interventions_per_batch=args.interventions_per_batch,
         )
 
     print("\n" + "=" * 60)

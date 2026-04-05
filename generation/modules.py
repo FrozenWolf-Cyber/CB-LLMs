@@ -198,6 +198,92 @@ class CBL(nn.Module):
                 break
         return ids, self.relu(concepts) if concepts is not None else None
 
+    def generate_multi_concept_batch(
+        self,
+        ids,
+        preLM,
+        interventions,
+        samples_per_intervention=1,
+        length=100,
+        temp=0.7,
+        topk=100,
+        topp=0.9,
+        repetition_penalty=1.5,
+        eos_token_id=128001,
+        keep_other_concepts: bool = False,
+        llama_vocab_weight=None,
+    ):
+        """
+        Generate samples for multiple concept interventions in a single batch.
+
+        Output rows are grouped by intervention:
+          [interv_0_sample_0, ..., interv_0_sample_{n-1},
+           interv_1_sample_0, ..., interv_{K-1}_sample_{n-1}]
+
+        Args:
+            ids: (1, prompt_len) input token ids (will be broadcast).
+            interventions: list of K intervention vectors, each of length concept_dim.
+            samples_per_intervention: how many samples to generate per intervention.
+
+        Returns:
+            ids: (K * samples_per_intervention, seq_len) generated token ids.
+            concepts: final activated concepts tensor, or None.
+        """
+        num_groups = len(interventions)
+        total_batch = num_groups * samples_per_intervention
+
+        ids = ids.expand(total_batch, -1).contiguous()
+        finished = torch.zeros(total_batch, dtype=torch.bool, device=ids.device)
+
+        intervention_tensor = torch.tensor(
+            interventions, dtype=torch.float32, device=ids.device
+        )  # (K, concept_dim)
+        intervention_expanded = intervention_tensor.repeat_interleave(
+            samples_per_intervention, dim=0
+        )  # (total_batch, concept_dim)
+
+        past_key_values = None
+        concepts = None
+
+        for i in range(length):
+            input_ids = ids[:, -1:] if past_key_values is not None else ids
+            outputs = preLM(input_ids, past_key_values=past_key_values, use_cache=True)
+            past_key_values = outputs.past_key_values
+            features = outputs.last_hidden_state.float()
+            concepts = self.cbl(features)
+            unsup_features = self.unsup(features)
+
+            iv = intervention_expanded.unsqueeze(1).expand_as(concepts)
+            if not keep_other_concepts:
+                concepts = iv.contiguous()
+            else:
+                mask = (intervention_expanded != 0).unsqueeze(1).expand_as(concepts)
+                concepts = torch.where(mask, iv, concepts)
+
+            logits = self.fc(torch.cat((self.relu(concepts), unsup_features), dim=-1))
+            if llama_vocab_weight is not None:
+                llama_logits = F.linear(
+                    outputs.last_hidden_state.to(llama_vocab_weight.dtype),
+                    llama_vocab_weight,
+                )
+                logits = logits + llama_logits.to(dtype=logits.dtype)
+            for b in range(total_batch):
+                if not finished[b]:
+                    score = logits[b, -1, ids[b]].clone()
+                    score = torch.where(score < 0, score * repetition_penalty, score / repetition_penalty)
+                    logits[b, -1, ids[b]] = score
+            next_token_logits = logits[:, -1, :] / temp
+            filtered_logits = top_k_top_p_filtering_batched(next_token_logits.clone(), top_k=topk, top_p=topp)
+            next_token = torch.multinomial(F.softmax(filtered_logits, dim=-1), num_samples=1)
+            next_token[finished] = eos_token_id
+            ids = torch.cat((ids, next_token), dim=-1)
+            if eos_token_id is not None:
+                finished = finished | (next_token.squeeze(-1) == eos_token_id)
+            if finished.all():
+                break
+
+        return ids, self.relu(concepts) if concepts is not None else None
+
 
 class CBLResidual(nn.Module):
     def __init__(self, config, concept_dim, residual_dim, tokenizer):
@@ -320,6 +406,92 @@ class CBLResidual(nn.Module):
                 finished = finished | (next_token.squeeze(-1) == eos_token_id)
             if finished.all():
                 break
+        return ids, self.relu(concepts) if concepts is not None else None
+
+    def generate_multi_concept_batch(
+        self,
+        ids,
+        preLM,
+        interventions,
+        samples_per_intervention=1,
+        length=100,
+        temp=0.7,
+        topk=100,
+        topp=0.9,
+        repetition_penalty=1.5,
+        eos_token_id=128001,
+        keep_other_concepts: bool = False,
+        llama_vocab_weight=None,
+    ):
+        """
+        Generate samples for multiple concept interventions in a single batch.
+
+        Output rows are grouped by intervention:
+          [interv_0_sample_0, ..., interv_0_sample_{n-1},
+           interv_1_sample_0, ..., interv_{K-1}_sample_{n-1}]
+
+        Args:
+            ids: (1, prompt_len) input token ids (will be broadcast).
+            interventions: list of K intervention vectors, each of length concept_dim.
+            samples_per_intervention: how many samples to generate per intervention.
+
+        Returns:
+            ids: (K * samples_per_intervention, seq_len) generated token ids.
+            concepts: final activated concepts tensor, or None.
+        """
+        num_groups = len(interventions)
+        total_batch = num_groups * samples_per_intervention
+
+        ids = ids.expand(total_batch, -1).contiguous()
+        finished = torch.zeros(total_batch, dtype=torch.bool, device=ids.device)
+
+        intervention_tensor = torch.tensor(
+            interventions, dtype=torch.float32, device=ids.device
+        )  # (K, concept_dim)
+        intervention_expanded = intervention_tensor.repeat_interleave(
+            samples_per_intervention, dim=0
+        )  # (total_batch, concept_dim)
+
+        past_key_values = None
+        concepts = None
+
+        for i in range(length):
+            input_ids = ids[:, -1:] if past_key_values is not None else ids
+            outputs = preLM(input_ids, past_key_values=past_key_values, use_cache=True)
+            past_key_values = outputs.past_key_values
+            features = outputs.last_hidden_state.float()
+            concepts = self.cbl(features)
+            unsup_features = self.cbl_residual(features)
+
+            iv = intervention_expanded.unsqueeze(1).expand_as(concepts)
+            if not keep_other_concepts:
+                concepts = iv.contiguous()
+            else:
+                mask = (intervention_expanded != 0).unsqueeze(1).expand_as(concepts)
+                concepts = torch.where(mask, iv, concepts)
+
+            logits = self.fc(torch.cat((self.relu(concepts), unsup_features), dim=-1))
+            if llama_vocab_weight is not None:
+                llama_logits = F.linear(
+                    outputs.last_hidden_state.to(llama_vocab_weight.dtype),
+                    llama_vocab_weight,
+                )
+                logits = logits + llama_logits.to(dtype=logits.dtype)
+            for b in range(total_batch):
+                if not finished[b]:
+                    score = logits[b, -1, ids[b]].clone()
+                    score = torch.where(score < 0, score * repetition_penalty, score / repetition_penalty)
+                    logits[b, -1, ids[b]] = score
+            next_token_logits = logits[:, -1, :] / temp
+            filtered_logits = top_k_top_p_filtering_batched(next_token_logits.clone(), top_k=topk, top_p=topp)
+            next_token = torch.multinomial(F.softmax(filtered_logits, dim=-1), num_samples=1)
+            next_token[finished] = eos_token_id
+            ids = torch.cat((ids, next_token), dim=-1)
+            if eos_token_id is not None:
+                finished = finished | (next_token.squeeze(-1) == eos_token_id)
+            if finished.all():
+                break
+
         return ids, self.relu(concepts) if concepts is not None else None
 
     def compute_residual_contrib(self, unsup_features):

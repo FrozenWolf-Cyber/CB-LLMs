@@ -60,6 +60,13 @@ parser.add_argument(
     default=None,
     help="Steerability samples per concept. If omitted, uses max(1, 100 // num_concepts) like training scripts.",
 )
+parser.add_argument(
+    "--interventions_per_batch",
+    type=int,
+    default=4,
+    help="Number of concept interventions to batch together during generation. "
+         "Higher values reduce sequential autoregressive loops but increase VRAM usage. (default: 4)",
+)
 
 
 def infer_run_layout(run_id, dataset, run_config):
@@ -166,6 +173,7 @@ def generate_steerability_texts(
     keep_other_concepts=False,
     steerability_cache_dir=None,
     steerability_cache_seed=42,
+    interventions_per_batch=1,
 ):
     """
     Generate steerability texts with batched generation for each concept.
@@ -173,6 +181,10 @@ def generate_steerability_texts(
 
     If steerability_cache_dir is set, loads existing ``seed_{seed}_sample_{k}.txt`` files
     and only generates missing slots, then writes each new sample to disk.
+
+    When ``interventions_per_batch > 1``, multiple concept interventions are generated
+    in a single forward-pass batch via ``generate_multi_concept_batch``, reducing the
+    number of sequential autoregressive loops.
     """
     if dataset == "dbpedia_14":
         intervention_value = 150
@@ -185,63 +197,136 @@ def generate_steerability_texts(
 
     chunk_size = 25
     cseed = steerability_cache_seed
+    num_concepts = len(concept_set)
+
+    all_slots = []
+    for concept_idx in range(num_concepts):
+        cname = concept_set[concept_idx]
+        slots = load_concept_samples(
+            steerability_cache_dir, cseed, concept_idx, cname, samples_per_concept
+        )
+        all_slots.append(slots)
 
     with torch.no_grad():
-        for concept_idx in tqdm(range(len(concept_set)), desc="Steerability generation"):
-            v = [0] * len(concept_set)
-            v[concept_idx] = intervention_value
-            cname = concept_set[concept_idx]
-            slots = load_concept_samples(
-                steerability_cache_dir, cseed, concept_idx, cname, samples_per_concept
-            )
-            pos = 0
-            while pos < samples_per_concept:
-                if slots[pos] is not None:
-                    pos += 1
+        if interventions_per_batch <= 1:
+            for concept_idx in tqdm(range(num_concepts), desc="Steerability generation"):
+                v = [0] * num_concepts
+                v[concept_idx] = intervention_value
+                slots = all_slots[concept_idx]
+                pos = 0
+                while pos < samples_per_concept:
+                    if slots[pos] is not None:
+                        pos += 1
+                        continue
+                    end = pos
+                    while end < samples_per_concept and slots[end] is None:
+                        end += 1
+                    gen_pos = pos
+                    while gen_pos < end:
+                        current_batch = min(chunk_size, end - gen_pos)
+                        text_ids_batch, _ = cbl.generate_batch(
+                            input_ids,
+                            preLM,
+                            num_samples=current_batch,
+                            intervene=v,
+                            length=50,
+                            keep_other_concepts=keep_other_concepts,
+                            llama_vocab_weight=llama_vocab_weight,
+                        )
+
+                        for b in range(current_batch):
+                            sample_idx = gen_pos + b
+                            decoded_text_ids = tokenizer.decode(
+                                text_ids_batch[b][~torch.isin(text_ids_batch[b], special_tokens_mask)]
+                            )
+                            slots[sample_idx] = decoded_text_ids
+                            if steerability_cache_dir:
+                                cname = concept_set[concept_idx]
+                                write_sample(
+                                    sample_file_path(
+                                        steerability_cache_dir, concept_idx, cname, cseed, sample_idx
+                                    ),
+                                    decoded_text_ids,
+                                )
+
+                        gen_pos += current_batch
+                    pos = end
+        else:
+            for group_start in tqdm(
+                range(0, num_concepts, interventions_per_batch),
+                desc=f"Steerability generation (x{interventions_per_batch} concepts/batch)",
+            ):
+                group_end = min(group_start + interventions_per_batch, num_concepts)
+                group_indices = list(range(group_start, group_end))
+
+                needs_gen = []
+                missing_indices = {}
+                for ci in group_indices:
+                    missing = [i for i in range(samples_per_concept) if all_slots[ci][i] is None]
+                    if missing:
+                        needs_gen.append(ci)
+                        missing_indices[ci] = missing
+
+                if not needs_gen:
                     continue
-                end = pos
-                while end < samples_per_concept and slots[end] is None:
-                    end += 1
-                need = end - pos
-                gen_pos = pos
-                while gen_pos < end:
-                    current_batch = min(chunk_size, end - gen_pos)
-                    text_ids_batch, _ = cbl.generate_batch(
+
+                interventions = []
+                for ci in needs_gen:
+                    v = [0] * num_concepts
+                    v[ci] = intervention_value
+                    interventions.append(v)
+
+                max_missing = max(len(missing_indices[ci]) for ci in needs_gen)
+
+                gen_offset = 0
+                while gen_offset < max_missing:
+                    current_chunk = min(chunk_size, max_missing - gen_offset)
+                    text_ids_batch, _ = cbl.generate_multi_concept_batch(
                         input_ids,
                         preLM,
-                        num_samples=current_batch,
-                        intervene=v,
+                        interventions=interventions,
+                        samples_per_intervention=current_chunk,
                         length=50,
                         keep_other_concepts=keep_other_concepts,
                         llama_vocab_weight=llama_vocab_weight,
                     )
 
-                    for b in range(current_batch):
-                        sample_idx = gen_pos + b
-                        decoded_text_ids = tokenizer.decode(
-                            text_ids_batch[b][~torch.isin(text_ids_batch[b], special_tokens_mask)]
-                        )
-                        slots[sample_idx] = decoded_text_ids
-                        if steerability_cache_dir:
-                            write_sample(
-                                sample_file_path(
-                                    steerability_cache_dir, concept_idx, cname, cseed, sample_idx
-                                ),
-                                decoded_text_ids,
+                    for g, ci in enumerate(needs_gen):
+                        row_start = g * current_chunk
+                        mi = missing_indices[ci]
+                        for b in range(current_chunk):
+                            abs_idx = gen_offset + b
+                            if abs_idx >= len(mi):
+                                continue
+                            sample_idx = mi[abs_idx]
+                            decoded = tokenizer.decode(
+                                text_ids_batch[row_start + b][
+                                    ~torch.isin(text_ids_batch[row_start + b], special_tokens_mask)
+                                ]
                             )
+                            all_slots[ci][sample_idx] = decoded
+                            if steerability_cache_dir:
+                                cname = concept_set[ci]
+                                write_sample(
+                                    sample_file_path(
+                                        steerability_cache_dir, ci, cname, cseed, sample_idx
+                                    ),
+                                    decoded,
+                                )
 
-                    gen_pos += current_batch
-                pos = end
+                    gen_offset += current_chunk
 
-            concept_texts = [slots[k] for k in range(samples_per_concept)]
-            for idx, t in enumerate(concept_texts):
-                wandb.log({f"steerability_sample_{cname}_{idx + 1}": t})
+    for concept_idx in range(num_concepts):
+        cname = concept_set[concept_idx]
+        concept_texts = [all_slots[concept_idx][k] for k in range(samples_per_concept)]
+        for idx, t in enumerate(concept_texts):
+            wandb.log({f"steerability_sample_{cname}_{idx + 1}": t})
 
-            print(f"Concept '{cname}' sample preview:")
-            for k in range(min(print_k, len(concept_texts))):
-                print(f"  [{k+1}] {concept_texts[k]}")
+        print(f"Concept '{cname}' sample preview:")
+        for k in range(min(print_k, len(concept_texts))):
+            print(f"  [{k+1}] {concept_texts[k]}")
 
-            all_texts.append(concept_texts)
+        all_texts.append(concept_texts)
 
     return all_texts
 
@@ -307,7 +392,7 @@ def load_model_and_cbl(peft_path, cbl_path, config, concept_set, tokenizer, disc
 
 
 def process_run(run_id, classifier_suffixes, expected_dataset, seed, wandb_project, wandb_entity=None,
-                samples_per_concept=None, run_idx=None, total_runs=None):
+                samples_per_concept=None, run_idx=None, total_runs=None, interventions_per_batch=1):
     """
     Process a single wandb run: load config, load models, run steerability tests, and log results.
     """
@@ -452,6 +537,7 @@ def process_run(run_id, classifier_suffixes, expected_dataset, seed, wandb_proje
             llama_vocab_weight=llama_vocab_weight,
             steerability_cache_dir=steer_dir,
             steerability_cache_seed=seed,
+            interventions_per_batch=interventions_per_batch,
         )
 
         for clf_idx, classifier in classifiers.items():
@@ -521,6 +607,7 @@ def main():
     print(f"Expected dataset: {args.dataset}")
     print(f"Steerability seed: {args.seed}")
     print(f"samples_per_concept arg: {args.samples_per_concept}")
+    print(f"interventions_per_batch: {args.interventions_per_batch}")
     
     # Process each run
     all_results = {}
@@ -539,6 +626,7 @@ def main():
                 samples_per_concept=args.samples_per_concept,
                 run_idx=idx,
                 total_runs=total_runs,
+                interventions_per_batch=args.interventions_per_batch,
             )
             all_results[run_id] = results
         except Exception as e:
