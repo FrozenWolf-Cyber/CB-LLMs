@@ -24,6 +24,13 @@ Example (HuggingFace from_pretrained — auto-downloads)::
       --judge_gguf_path "unsloth/Qwen3.5-27B-GGUF::Qwen3.5-27B-Q8_0.gguf" \\
       --gen_device cuda:0
 
+Optional: persist full judge outputs (reasoning + answer) per W&B run::
+
+    --judge_log_dir ./judge_logs \\
+    --judge_log_name qwen35_27b_q8
+
+``--judge_log_name`` defaults to a slug of the GGUF filename; use a distinct name when comparing judges.
+
 VRAM / GGUF notes (80GB A100)
 -----------------------------
 - Llama-3-8B bf16 + LoRA + CBL is released before loading the judge; peak judge VRAM is from GGUF.
@@ -65,7 +72,11 @@ except ImportError:
     import config as CFG
 from transformers import AutoTokenizer, LlamaConfig
 
-from steerability_cache import save_all_steerability_texts, steerability_output_root
+from steerability_cache import (
+    save_all_steerability_texts,
+    sanitize_concept_slug,
+    steerability_output_root,
+)
 from resume_steerability_test import (
     find_eval_checkpoint,
     generate_steerability_texts,
@@ -90,6 +101,60 @@ Do NOT reward length, style, or eloquence beyond what is needed to judge concept
 After reasoning, your **last line** MUST be exactly (no extra characters on that line):
 SCORE: N
 where N is an integer from 1 through 10."""
+
+
+def _sanitize_path_component(s: str, max_len: int = 120) -> str:
+    t = re.sub(r"[^a-zA-Z0-9._-]+", "_", str(s).strip())
+    t = t.strip("_") or "unnamed"
+    return t[:max_len]
+
+
+def default_judge_log_name_from_gguf(judge_gguf_path: str) -> str:
+    """Filesystem-safe label derived from GGUF path or ``repo::file.gguf`` spec."""
+    _, _, fn = judge_gguf_path.partition("::")
+    base = fn.strip() if fn else judge_gguf_path
+    base = os.path.basename(base.rstrip("/"))
+    if base.lower().endswith(".gguf"):
+        base = base[: -5]
+    return _sanitize_path_component(base, max_len=80)
+
+
+def write_judge_reasoning_log(
+    *,
+    judge_log_run_dir: str,
+    concept_idx: int,
+    concept_name: str,
+    sample_idx: int,
+    run_id: str,
+    enable_thinking: bool,
+    parsed_score: int | None,
+    raw_assistant_output: str,
+) -> None:
+    """
+    Append-free log: one UTF-8 file per sample. Overwrites on re-run (not a cache).
+    Body is the full model output (thinking tags + visible answer).
+    """
+    sub = os.path.join(
+        judge_log_run_dir,
+        f"c{concept_idx:03d}_{sanitize_concept_slug(concept_name)}",
+    )
+    os.makedirs(sub, exist_ok=True)
+    path = os.path.join(sub, f"sample_{sample_idx:04d}.txt")
+    score_line = "null" if parsed_score is None else str(parsed_score)
+    header = (
+        "# judge_reasoning_log v1\n"
+        f"run_id: {run_id}\n"
+        f"concept_idx: {concept_idx}\n"
+        f"concept_name: {json.dumps(concept_name, ensure_ascii=False)}\n"
+        f"sample_idx: {sample_idx}\n"
+        f"parsed_score: {score_line}\n"
+        f"enable_thinking: {str(enable_thinking).lower()}\n"
+        "---\n"
+    )
+    body = raw_assistant_output if raw_assistant_output is not None else ""
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(header)
+        f.write(body)
 
 
 def _release_generation_vram():
@@ -249,6 +314,8 @@ def run_judge_on_texts(
     max_chars: int,
     max_tokens: int,
     enable_thinking: bool = True,
+    judge_log_run_dir: str | None = None,
+    wandb_run_id: str = "",
 ):
     all_scores: list[float] = []
     per_concept: dict = {}
@@ -264,6 +331,17 @@ def run_judge_on_texts(
         scores_this: list[float] = []
         for b, t in enumerate(texts):
             s, raw = judge_one(llm, concept_name, t, max_chars, max_tokens, enable_thinking=enable_thinking)
+            if judge_log_run_dir:
+                write_judge_reasoning_log(
+                    judge_log_run_dir=judge_log_run_dir,
+                    concept_idx=concept_idx,
+                    concept_name=concept_name,
+                    sample_idx=b,
+                    run_id=wandb_run_id,
+                    enable_thinking=enable_thinking,
+                    parsed_score=s,
+                    raw_assistant_output=raw or "",
+                )
             if s is None:
                 parse_fail += 1
                 wandb.log(
@@ -327,6 +405,8 @@ def process_run(
     judge_disable_thinking: bool,
     judge_llama_verbose: bool,
     gen_device_str: str,
+    judge_log_dir: str | None = None,
+    judge_log_name: str | None = None,
     samples_per_concept: int | None = None,
     run_idx: int | None = None,
     total_runs: int | None = None,
@@ -447,6 +527,17 @@ def process_run(
             n_batch=judge_n_batch,
             verbose=judge_llama_verbose,
         )
+        judge_log_run_dir = None
+        if judge_log_dir:
+            jname = judge_log_name or default_judge_log_name_from_gguf(judge_gguf_path)
+            judge_log_run_dir = os.path.join(
+                os.path.abspath(judge_log_dir),
+                jname,
+                _sanitize_path_component(run_id),
+            )
+            os.makedirs(judge_log_run_dir, exist_ok=True)
+            print(f"Judge reasoning logs (overwrite each run): {judge_log_run_dir}")
+
         metrics = run_judge_on_texts(
             llm,
             decoded_texts_by_concept,
@@ -454,6 +545,8 @@ def process_run(
             max_chars=judge_text_max_chars,
             max_tokens=judge_max_tokens,
             enable_thinking=enable_thinking,
+            judge_log_run_dir=judge_log_run_dir,
+            wandb_run_id=run_id,
         )
 
         def _fmt(x):
@@ -575,6 +668,24 @@ def main():
         help="Set enable_thinking false (ignored if --judge_chat_template_kwargs_json is set).",
     )
     p.add_argument("--judge_llama_verbose", action="store_true", help="Verbose llama.cpp loader.")
+    p.add_argument(
+        "--judge_log_dir",
+        type=str,
+        default=None,
+        help=(
+            "If set, write full judge outputs (reasoning + answer) to disk under "
+            "``{dir}/{judge_name}/{wandb_run_id}/cXXX_slug/sample_YYYY.txt`` (overwrites on re-run; not a cache)."
+        ),
+    )
+    p.add_argument(
+        "--judge_log_name",
+        type=str,
+        default=None,
+        help=(
+            "Subfolder name for this judge (e.g. qwen35_27b_q8 vs another GGUF). "
+            "Default: derived from --judge_gguf_path basename."
+        ),
+    )
     args = p.parse_args()
 
     with open(args.run_ids_pickle, "rb") as f:
@@ -600,6 +711,8 @@ def main():
             args.judge_disable_thinking,
             args.judge_llama_verbose,
             args.gen_device,
+            judge_log_dir=args.judge_log_dir,
+            judge_log_name=args.judge_log_name,
             samples_per_concept=args.samples_per_concept,
             run_idx=idx,
             total_runs=len(run_ids),
