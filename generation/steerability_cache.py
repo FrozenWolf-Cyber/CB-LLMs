@@ -48,8 +48,12 @@ def _load_json(root: str) -> Dict:
     p = _json_path(root)
     if not os.path.isfile(p):
         return {}
-    with open(p, "r", encoding="utf-8") as f:
-        return json.load(f)
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (json.JSONDecodeError, ValueError):
+        return {}
 
 
 def _save_json(root: str, data: Dict) -> None:
