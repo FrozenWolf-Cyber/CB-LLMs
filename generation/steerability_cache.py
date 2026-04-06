@@ -1,20 +1,30 @@
 """
-Disk cache for steerability generations: one UTF-8 text file per (seed, concept, sample index).
+Disk cache for steerability generations: single JSON file per run.
 
 Layout under the checkpoint folder (same directory as epoch weights):
 
     steerability_outputs/epoch_{E}[_lowscore]/
-        c{idx:03d}_{sanitized_concept_name}/
-            seed_{seed}_sample_{k}.txt
+        samples.json
+
+JSON structure (all keys are strings):
+
+    {
+        "<concept_idx>": {
+            "<seed>": {
+                "<sample_idx>": "<generated_text>"
+            }
+        }
+    }
 
 Used by resume steerability scripts and training eval so partial runs can resume.
 """
 
 from __future__ import annotations
 
+import json
 import os
 import re
-from typing import List, Optional, Sequence
+from typing import Dict, List, Optional, Sequence
 
 
 def sanitize_concept_slug(name: str, max_len: int = 80) -> str:
@@ -30,27 +40,40 @@ def steerability_output_root(ckpt_prefix: str, epoch: int, is_low_score: bool) -
     return os.path.join(ckpt_prefix, "steerability_outputs", f"epoch_{epoch}{sfx}")
 
 
-def concept_subdir(root: str, concept_idx: int, concept_name: str) -> str:
-    slug = sanitize_concept_slug(concept_name)
-    return os.path.join(root, f"c{concept_idx:03d}_{slug}")
+def _json_path(root: str) -> str:
+    return os.path.join(root, "samples.json")
 
 
-def sample_file_path(root: str, concept_idx: int, concept_name: str, seed: int, sample_idx: int) -> str:
-    sub = concept_subdir(root, concept_idx, concept_name)
-    return os.path.join(sub, f"seed_{seed}_sample_{sample_idx}.txt")
+def _load_json(root: str) -> Dict:
+    p = _json_path(root)
+    if not os.path.isfile(p):
+        return {}
+    with open(p, "r", encoding="utf-8") as f:
+        return json.load(f)
 
 
-def read_sample(path: str) -> Optional[str]:
-    if not os.path.isfile(path):
-        return None
-    with open(path, "r", encoding="utf-8") as f:
-        return f.read()
+def _save_json(root: str, data: Dict) -> None:
+    os.makedirs(root, exist_ok=True)
+    p = _json_path(root)
+    with open(p, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
 
 
-def write_sample(path: str, text: str) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        f.write(text)
+def write_sample(
+    root: str,
+    concept_idx: int,
+    concept_name: str,
+    seed: int,
+    sample_idx: int,
+    text: str,
+) -> None:
+    """Write a single sample into the run's JSON cache (read-modify-write)."""
+    data = _load_json(root)
+    ci_key = str(concept_idx)
+    s_key = str(seed)
+    si_key = str(sample_idx)
+    data.setdefault(ci_key, {}).setdefault(s_key, {})[si_key] = text
+    _save_json(root, data)
 
 
 def load_concept_samples(
@@ -60,14 +83,12 @@ def load_concept_samples(
     concept_name: str,
     n_samples: int,
 ) -> List[Optional[str]]:
-    """Return length-n list; entry k is file text or None if missing."""
+    """Return length-n list; entry k is cached text or None if missing."""
     if not cache_root or n_samples <= 0:
         return [None] * max(0, n_samples)
-    out: List[Optional[str]] = []
-    for k in range(n_samples):
-        p = sample_file_path(cache_root, concept_idx, concept_name, seed, k)
-        out.append(read_sample(p))
-    return out
+    data = _load_json(cache_root)
+    concept_data = data.get(str(concept_idx), {}).get(str(seed), {})
+    return [concept_data.get(str(k)) for k in range(n_samples)]
 
 
 def save_all_steerability_texts(
@@ -77,15 +98,18 @@ def save_all_steerability_texts(
     texts_by_concept: Sequence[Sequence[str]],
 ) -> None:
     """
-    Write every sample to disk (idempotent). Skips concepts with empty lists.
-    Call at end of training / eval to guarantee on-disk snapshot.
+    Write every sample to the JSON cache (idempotent).
+    Skips concepts with empty lists.
     """
     if not cache_root:
         return
+    data = _load_json(cache_root)
+    s_key = str(seed)
     for ci, texts in enumerate(texts_by_concept):
         if not texts or ci >= len(concept_set):
             continue
-        cname = concept_set[ci]
+        ci_key = str(ci)
+        seed_dict = data.setdefault(ci_key, {}).setdefault(s_key, {})
         for si, t in enumerate(texts):
-            p = sample_file_path(cache_root, ci, cname, seed, si)
-            write_sample(p, t)
+            seed_dict[str(si)] = t
+    _save_json(cache_root, data)

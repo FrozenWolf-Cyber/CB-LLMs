@@ -12,7 +12,6 @@ from modules import CBLResidual, CBL, Roberta_classifier
 import wandb
 from steerability_cache import (
     load_concept_samples,
-    sample_file_path,
     save_all_steerability_texts,
     steerability_output_root,
     write_sample,
@@ -243,9 +242,7 @@ def generate_steerability_texts(
                             if steerability_cache_dir:
                                 cname = concept_set[concept_idx]
                                 write_sample(
-                                    sample_file_path(
-                                        steerability_cache_dir, concept_idx, cname, cseed, sample_idx
-                                    ),
+                                    steerability_cache_dir, concept_idx, cname, cseed, sample_idx,
                                     decoded_text_ids,
                                 )
 
@@ -308,9 +305,7 @@ def generate_steerability_texts(
                             if steerability_cache_dir:
                                 cname = concept_set[ci]
                                 write_sample(
-                                    sample_file_path(
-                                        steerability_cache_dir, ci, cname, cseed, sample_idx
-                                    ),
+                                    steerability_cache_dir, ci, cname, cseed, sample_idx,
                                     decoded,
                                 )
 

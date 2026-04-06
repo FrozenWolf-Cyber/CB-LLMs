@@ -14,7 +14,7 @@ import time
 import torch.nn.functional as F
 from datasets import load_dataset
 from utils import mean_pooling, get_labels, cos_sim_cubed
-from steerability_cache import load_concept_samples, sample_file_path, save_all_steerability_texts, steerability_output_root, write_sample
+from steerability_cache import load_concept_samples, save_all_steerability_texts, steerability_output_root, write_sample
 
 
 def set_seed(seed):
@@ -221,7 +221,7 @@ def run_evaluation(
                         slots[sample_idx] = decoded
                         if steerability_cache_dir:
                             write_sample(
-                                sample_file_path(steerability_cache_dir, j, cname, cseed, sample_idx),
+                                steerability_cache_dir, j, cname, cseed, sample_idx,
                                 decoded,
                             )
                         text.append(decoded)

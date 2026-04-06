@@ -41,7 +41,7 @@ from modules import CBLResidual, CBL, Roberta_classifier
 import time
 from module_intervention import amplify_intervention
 from utils import elastic_net_penalty, mean_pooling, eos_pooling, get_labels, cos_sim_cubed
-from steerability_cache import load_concept_samples, sample_file_path, save_all_steerability_texts, steerability_output_root, write_sample
+from steerability_cache import load_concept_samples, save_all_steerability_texts, steerability_output_root, write_sample
 import wandb
 import glob
 import copy
@@ -1034,7 +1034,7 @@ if __name__ == "__main__":
                         tokens = text_ids_batch[b][~torch.isin(text_ids_batch[b], special_tokens_mask)]
                         decoded = tokenizer.decode(tokens)
                         slots[sample_idx] = decoded
-                        write_sample(sample_file_path(steer_root, j, cname, cseed, sample_idx), decoded)
+                        write_sample(steer_root, j, cname, cseed, sample_idx, decoded)
                         text.append(decoded)
                     gen_pos += current_batch
                 pos = end
