@@ -70,7 +70,7 @@ import json
 import os
 import pickle
 import re
-import tqdm
+from tqdm.auto import tqdm
 import numpy as np
 import torch
 import wandb
