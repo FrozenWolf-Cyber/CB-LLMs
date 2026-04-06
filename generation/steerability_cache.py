@@ -80,6 +80,26 @@ def write_sample(
     _save_json(root, data)
 
 
+def write_samples_batch(
+    root: str,
+    samples: List[tuple],
+) -> None:
+    """
+    Write multiple samples in one JSON read-modify-write cycle.
+
+    Each element of *samples* is ``(concept_idx, concept_name, seed, sample_idx, text)``.
+    """
+    if not samples:
+        return
+    data = _load_json(root)
+    for concept_idx, _concept_name, seed, sample_idx, text in samples:
+        ci_key = str(concept_idx)
+        s_key = str(seed)
+        si_key = str(sample_idx)
+        data.setdefault(ci_key, {}).setdefault(s_key, {})[si_key] = text
+    _save_json(root, data)
+
+
 def load_concept_samples(
     cache_root: Optional[str],
     seed: int,

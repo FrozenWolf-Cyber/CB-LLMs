@@ -15,6 +15,7 @@ from steerability_cache import (
     save_all_steerability_texts,
     steerability_output_root,
     write_sample,
+    write_samples_batch,
 )
 
 
@@ -211,6 +212,7 @@ def generate_steerability_texts(
             for concept_idx in tqdm(range(num_concepts), desc="Steerability generation"):
                 v = [0] * num_concepts
                 v[concept_idx] = intervention_value
+                cname = concept_set[concept_idx]
                 slots = all_slots[concept_idx]
                 pos = 0
                 while pos < samples_per_concept:
@@ -233,6 +235,7 @@ def generate_steerability_texts(
                             llama_vocab_weight=llama_vocab_weight,
                         )
 
+                        pending_writes = []
                         for b in range(current_batch):
                             sample_idx = gen_pos + b
                             decoded_text_ids = tokenizer.decode(
@@ -240,11 +243,11 @@ def generate_steerability_texts(
                             )
                             slots[sample_idx] = decoded_text_ids
                             if steerability_cache_dir:
-                                cname = concept_set[concept_idx]
-                                write_sample(
-                                    steerability_cache_dir, concept_idx, cname, cseed, sample_idx,
-                                    decoded_text_ids,
+                                pending_writes.append(
+                                    (concept_idx, cname, cseed, sample_idx, decoded_text_ids)
                                 )
+                        if pending_writes:
+                            write_samples_batch(steerability_cache_dir, pending_writes)
 
                         gen_pos += current_batch
                     pos = end
@@ -288,9 +291,11 @@ def generate_steerability_texts(
                         llama_vocab_weight=llama_vocab_weight,
                     )
 
+                    pending_writes = []
                     for g, ci in enumerate(needs_gen):
                         row_start = g * current_chunk
                         mi = missing_indices[ci]
+                        cname = concept_set[ci]
                         for b in range(current_chunk):
                             abs_idx = gen_offset + b
                             if abs_idx >= len(mi):
@@ -303,11 +308,11 @@ def generate_steerability_texts(
                             )
                             all_slots[ci][sample_idx] = decoded
                             if steerability_cache_dir:
-                                cname = concept_set[ci]
-                                write_sample(
-                                    steerability_cache_dir, ci, cname, cseed, sample_idx,
-                                    decoded,
+                                pending_writes.append(
+                                    (ci, cname, cseed, sample_idx, decoded)
                                 )
+                    if pending_writes:
+                        write_samples_batch(steerability_cache_dir, pending_writes)
 
                     gen_offset += current_chunk
 
