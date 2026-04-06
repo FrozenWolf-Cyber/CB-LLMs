@@ -1,26 +1,29 @@
 import argparse
 import os
 import pickle
-import glob
 import torch
 import numpy as np
 import evaluate
 from tqdm.auto import tqdm
-import config as CFG
+try:
+    import config_finegrained as CFG
+except ImportError:
+    import config as CFG
 from transformers import LlamaConfig, LlamaModel, AutoTokenizer, RobertaTokenizerFast
-from modules import CBLResidual, CBL, Roberta_classifier
+from modules import Roberta_classifier
 import wandb
-import time
 import torch.nn.functional as F
 from datasets import load_dataset
-from utils import mean_pooling, get_labels, cos_sim_cubed
-from steerability_cache import load_concept_samples, save_all_steerability_texts, steerability_output_root, write_sample
-
-
-def set_seed(seed):
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    np.random.seed(seed)
+from utils import mean_pooling, cos_sim_cubed
+from steerability_cache import save_all_steerability_texts, steerability_output_root
+from resume_steerability_test import (
+    find_eval_checkpoint,
+    generate_steerability_texts,
+    get_llama_vocab_weight,
+    infer_run_layout,
+    load_model_and_cbl,
+    set_seed,
+)
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -40,36 +43,12 @@ parser.add_argument(
     default=None,
     help="Steerability generations per concept in GRPO eval. If omitted, uses max(1, 100 // num_concepts) like resume_steerability_test.",
 )
-
-
-def find_eval_checkpoint(run_id, dataset):
-    """
-    Return checkpoint paths (peft_path, cbl_path, epoch) for evaluation for a GRPO run.
-    """
-    d_name = dataset.replace('/', '_')
-    prefix = f"./from_pretained_llama3_lora_grpo_{run_id}/{d_name}/"
-    
-    if not os.path.isdir(prefix):
-        return None, None, None
-
-    cbl_files = sorted(glob.glob(os.path.join(prefix, "cbl_epoch_*.pt")))
-    
-    if not cbl_files:
-        return None, None, None
-
-    latest_cbl_path = cbl_files[-1]
-    try:
-        epoch = int(os.path.basename(latest_cbl_path).replace("cbl_epoch_", "").replace(".pt", ""))
-    except ValueError:
-        return None, None, None
-
-    peft_path = os.path.join(prefix, f"llama3_epoch_{epoch}")
-    cbl_path = os.path.join(prefix, f"cbl_epoch_{epoch}.pt")
-
-    if not os.path.isdir(peft_path) or not os.path.isfile(cbl_path):
-        return None, None, None
-
-    return peft_path, cbl_path, epoch
+parser.add_argument(
+    "--interventions_per_batch",
+    type=int,
+    default=4,
+    help="Number of concept interventions to batch together during generation. (default: 4)",
+)
 
 
 def run_steerability_test_from_texts(decoded_texts_by_concept, roberta_tokenizer, classifier, concept_set):
@@ -104,25 +83,6 @@ def run_steerability_test_from_texts(decoded_texts_by_concept, roberta_tokenizer
     return acc.compute()
 
 
-def load_model_and_cbl(peft_path, cbl_path, config, concept_set, tokenizer, arch_type, residual_dim=768):
-    """
-    Load the LLaMA model with LoRA adapter and CBL module.
-    """
-    preLM = LlamaModel.from_pretrained('meta-llama/Meta-Llama-3-8B', torch_dtype=torch.bfloat16).to(device)
-    preLM.load_adapter(peft_path)
-    preLM.eval()
-    
-    if arch_type == "non_residual":
-        cbl = CBL(config, len(concept_set), tokenizer).to(device)
-    else:
-        cbl = CBLResidual(config, len(concept_set), residual_dim, tokenizer).to(device)
-    
-    cbl.load_state_dict(torch.load(cbl_path, map_location=device), strict=False)
-    cbl.eval()
-    
-    return preLM, cbl
-
-
 def run_evaluation(
     preLM,
     cbl,
@@ -133,7 +93,7 @@ def run_evaluation(
     classifier_suffixes,
     run_name,
     seed,
-    num_steerability_samples=None,
+    decoded_texts_by_concept,
     steerability_cache_dir=None,
     steerability_cache_seed=42,
 ):
@@ -159,8 +119,7 @@ def run_evaluation(
         intervention_value = 150
     else:
         intervention_value = 100
-        
-    text = []
+
     cos_sim_cubed_values = []
     softmax_values = []
     top1_correct = 0
@@ -170,68 +129,22 @@ def run_evaluation(
     top20_correct = 0
     total_evals = 0
 
-    n_steer = (
-        max(1, num_steerability_samples)
-        if num_steerability_samples is not None
-        else max(1, 100 // len(concept_set))
-    )
-    print(
-        f"Steerability samples per concept: {n_steer}"
-        + (" (from --samples_per_concept)" if num_steerability_samples is not None else " (default: 100 // num_concepts)")
-    )
     if steerability_cache_dir:
         print(f"Steerability sample cache: {steerability_cache_dir}")
-    gen_input = torch.tensor([tokenizer.encode("")]).to(device)
-    special_tokens_mask = torch.tensor([128000, 128001]).to(device)
     ce_loss_fn = torch.nn.CrossEntropyLoss(reduction="none")
 
-    steer_concept_indices = range(len(concept_set))
-    chunk_size = 25
-    cseed = steerability_cache_seed
-    steer_texts_snapshot = [[] for _ in range(len(concept_set))]
-
     with torch.no_grad():
-        for j in tqdm(steer_concept_indices, desc="Steerability concepts"):
+        for j in tqdm(range(len(concept_set)), desc="Steerability concepts"):
             v = [0] * len(concept_set)
             v[j] = intervention_value
             cname = concept_set[j]
-            slots = load_concept_samples(steerability_cache_dir, cseed, j, cname, n_steer)
-            pos = 0
-            while pos < n_steer:
-                if slots[pos] is not None:
-                    pos += 1
-                    continue
-                end = pos
-                while end < n_steer and slots[end] is None:
-                    end += 1
-                gen_pos = pos
-                while gen_pos < end:
-                    current_batch = min(chunk_size, end - gen_pos)
-                    text_ids_batch, _ = cbl.generate_batch(
-                        gen_input,
-                        preLM,
-                        num_samples=current_batch,
-                        intervene=v,
-                        length=50,
-                    )
-                    for b in range(current_batch):
-                        sample_idx = gen_pos + b
-                        tokens = text_ids_batch[b][~torch.isin(text_ids_batch[b], special_tokens_mask)]
-                        decoded = tokenizer.decode(tokens)
-                        slots[sample_idx] = decoded
-                        if steerability_cache_dir:
-                            write_sample(
-                                steerability_cache_dir, j, cname, cseed, sample_idx,
-                                decoded,
-                            )
-                        text.append(decoded)
-                    gen_pos += current_batch
-                pos = end
-
-            decoded_texts = [slots[k] for k in range(n_steer)]
-            steer_texts_snapshot[j] = decoded_texts
-            for idx, dt in enumerate(decoded_texts):
-                wandb.log({f"steerability_sample_{cname}_{idx + 1}": dt})
+            decoded_texts = (
+                decoded_texts_by_concept[j]
+                if j < len(decoded_texts_by_concept)
+                else []
+            )
+            if len(decoded_texts) == 0:
+                continue
 
             generated_c = tokenizer_sim(
                 decoded_texts, padding=True, truncation=True, max_length=350, return_tensors="pt"
@@ -264,7 +177,9 @@ def run_evaluation(
             total_evals += sims.size(0)
 
     if steerability_cache_dir:
-        save_all_steerability_texts(steerability_cache_dir, cseed, concept_set, steer_texts_snapshot)
+        save_all_steerability_texts(
+            steerability_cache_dir, steerability_cache_seed, concept_set, decoded_texts_by_concept
+        )
 
     steer_results = {
         "steerability_cos_sim_cubed": sum(cos_sim_cubed_values) / len(cos_sim_cubed_values),
@@ -453,7 +368,7 @@ def run_evaluation(
 
 
 def process_run(run_id, classifier_suffixes, expected_dataset, seed, wandb_project, wandb_entity=None,
-                samples_per_concept=None, run_idx=None, total_runs=None):
+                samples_per_concept=None, run_idx=None, total_runs=None, interventions_per_batch=4):
     """
     Process a single wandb run: load config, load models, run evaluations, and log results.
     """
@@ -482,30 +397,41 @@ def process_run(run_id, classifier_suffixes, expected_dataset, seed, wandb_proje
     print(f"Run config: {run_config}")
     
     dataset = run_config.get('dataset', 'SetFit/sst2')
-    arch_type = run_config.get('arch_type', 'residual')
+    discrimination_loss = run_config.get('discrimination_loss', 1.0)
+    arch_type = run_config.get('arch_type', None)
     residual_dim = run_config.get('residual_dim', 768)
+    add_llama_logits = bool(run_config.get('add_llama_logits', False))
+    print(f"Add llama logits: {add_llama_logits}")
     
     if dataset != expected_dataset:
         print(f"SKIPPING run {run_id}: dataset mismatch. Run used '{dataset}' but expected '{expected_dataset}'.")
         return
     
-    peft_path, cbl_path, best_epoch = find_eval_checkpoint(run_id, dataset)
-    print(f"Evaluation epoch: {best_epoch}")
+    run_type, ckpt_prefix = infer_run_layout(run_id, dataset, run_config)
+    if run_type is None or ckpt_prefix is None:
+        print(f"Could not infer checkpoint layout for run {run_id}")
+        return
+
+    print(f"Detected run type: {run_type}")
+    print(f"Checkpoint prefix: {ckpt_prefix}")
+
+    peft_path, cbl_path, best_epoch, is_low_score = find_eval_checkpoint(ckpt_prefix, run_type, dataset)
+    print(f"Evaluation epoch: {best_epoch} (low_score={is_low_score})")
 
     if best_epoch is None:
         print(f"No model weights found for run {run_id}")
         return
 
-    d_name = dataset.replace("/", "_")
-    grpo_prefix = os.path.join(".", f"from_pretained_llama3_lora_grpo_{run_id}", d_name)
-    steer_dir = steerability_output_root(grpo_prefix, best_epoch, False)
+    steer_dir = steerability_output_root(ckpt_prefix, best_epoch, is_low_score)
     
     config = LlamaConfig.from_pretrained('meta-llama/Meta-Llama-3-8B')
     tokenizer = AutoTokenizer.from_pretrained('meta-llama/Meta-Llama-3-8B')
     tokenizer.pad_token = tokenizer.eos_token
     
-    concept_set = CFG.concept_set[dataset]
+    concept_set = CFG.concept_set.get(dataset, CFG.concepts_from_labels[dataset])
     print(f"Concept set length: {len(concept_set)}")
+    n_samples = max(1, samples_per_concept) if samples_per_concept is not None else max(1, 100 // len(concept_set))
+    print(f"Samples per concept: {n_samples}" + (" (from --samples_per_concept)" if samples_per_concept is not None else " (default: 100 // num_concepts)"))
     
     resumed_run = wandb.init(
         project=wandb_project,
@@ -519,10 +445,30 @@ def process_run(run_id, classifier_suffixes, expected_dataset, seed, wandb_proje
     print(f"Loading model from: {peft_path}")
     print(f"Loading CBL from: {cbl_path}")
 
+    if arch_type is not None:
+        discrimination_loss_for_loading = 1.0 if arch_type == "non_residual" else 0.0
+    else:
+        discrimination_loss_for_loading = discrimination_loss
+
     try:
         preLM, cbl = load_model_and_cbl(
             peft_path, cbl_path, config, concept_set, tokenizer,
-            arch_type, residual_dim
+            discrimination_loss_for_loading, residual_dim
+        )
+
+        llama_vocab_weight = get_llama_vocab_weight() if add_llama_logits else None
+        decoded_texts_by_concept = generate_steerability_texts(
+            preLM,
+            cbl,
+            tokenizer,
+            concept_set,
+            dataset,
+            samples_per_concept=n_samples,
+            print_k=3,
+            llama_vocab_weight=llama_vocab_weight,
+            steerability_cache_dir=steer_dir,
+            steerability_cache_seed=seed,
+            interventions_per_batch=interventions_per_batch,
         )
 
         eval_results = run_evaluation(
@@ -535,7 +481,7 @@ def process_run(run_id, classifier_suffixes, expected_dataset, seed, wandb_proje
             classifier_suffixes,
             resumed_run.name,
             seed,
-            num_steerability_samples=samples_per_concept,
+            decoded_texts_by_concept,
             steerability_cache_dir=steer_dir,
             steerability_cache_seed=seed,
         )
@@ -561,6 +507,7 @@ def process_run(run_id, classifier_suffixes, expected_dataset, seed, wandb_proje
 
 
 def main():
+    os.environ["TOKENIZERS_PARALLELISM"] = "false"
     args = parser.parse_args()
     
     with open(args.run_ids_pickle, 'rb') as f:
@@ -584,6 +531,7 @@ def main():
                 samples_per_concept=args.samples_per_concept,
                 run_idx=idx,
                 total_runs=total_runs,
+                interventions_per_batch=args.interventions_per_batch,
             )
             all_results[run_id] = results
         except Exception as e:
