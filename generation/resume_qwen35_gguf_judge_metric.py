@@ -10,7 +10,6 @@ Example (local GGUF)::
 
     python resume_qwen35_gguf_judge_metric.py \\
       --run_ids_pickle all_wandb_runs.pkl \\
-      --dataset SetFit/sst2 \\
       --wandb_entity YOUR_ENTITY \\
       --judge_gguf_path /path/to/Qwen3.5-27B-Q8_0.gguf \\
       --gen_device cuda:0
@@ -19,7 +18,6 @@ Single run (no pickle; pass W&B run id as a string)::
 
     python resume_qwen35_gguf_judge_metric.py \\
       --run_id abc123xyz \\
-      --dataset SetFit/sst2 \\
       --wandb_entity YOUR_ENTITY \\
       --judge_gguf_path /path/to/Qwen3.5-27B-Q8_0.gguf \\
       --gen_device cuda:0
@@ -28,7 +26,6 @@ Example (HuggingFace from_pretrained — auto-downloads)::
 
     python resume_qwen35_gguf_judge_metric.py \\
       --run_ids_pickle all_wandb_runs.pkl \\
-      --dataset SetFit/sst2 \\
       --wandb_entity YOUR_ENTITY \\
       --judge_gguf_path "unsloth/Qwen3.5-27B-GGUF::Qwen3.5-27B-Q8_0.gguf" \\
       --gen_device cuda:0
@@ -407,7 +404,6 @@ def run_judge_on_texts(
 
 def process_run(
     run_id: str,
-    expected_dataset: str,
     seed: int,
     wandb_project: str,
     wandb_entity: str | None,
@@ -447,14 +443,11 @@ def process_run(
 
     run_config = original_run.config
     dataset = run_config.get("dataset", "SetFit/sst2")
+    print(f"Dataset (from W&B run config): {dataset}")
     discrimination_loss = run_config.get("discrimination_loss", 1.0)
     arch_type = run_config.get("arch_type", None)
     residual_dim = run_config.get("residual_dim", 768)
     add_llama_logits = bool(run_config.get("add_llama_logits", False))
-
-    if dataset != expected_dataset:
-        print(f"SKIPPING run {run_id}: dataset mismatch ('{dataset}' vs expected '{expected_dataset}').")
-        return None
 
     run_type, ckpt_prefix = infer_run_layout(run_id, dataset, run_config)
     if run_type is None or ckpt_prefix is None:
@@ -647,7 +640,12 @@ def main():
     )
     p.add_argument("--wandb_project", type=str, default="cbm-generation-new")
     p.add_argument("--wandb_entity", type=str, default=None)
-    p.add_argument("--dataset", type=str, required=True)
+    p.add_argument(
+        "--dataset",
+        type=str,
+        default=None,
+        help="Deprecated: ignored. Dataset is read from each run's W&B config['dataset']. Kept for backward-compatible CLIs.",
+    )
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--gen_device", type=str, default="cuda:0", help="CUDA device for Llama-3-8B + CBL generation.")
     p.add_argument(
@@ -733,12 +731,13 @@ def main():
             run_ids = pickle.load(f)
 
     print(f"Runs: {len(run_ids)} | gen_device={args.gen_device} | GGUF={args.judge_gguf_path}")
+    if args.dataset is not None:
+        print("Note: --dataset is ignored; using each run's W&B config['dataset'].")
 
     all_out = {}
     for idx, rid in enumerate(run_ids, start=1):
         all_out[rid] = process_run(
             rid,
-            args.dataset,
             args.seed,
             args.wandb_project,
             args.wandb_entity,

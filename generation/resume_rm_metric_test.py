@@ -192,7 +192,6 @@ def run_rm_metrics_from_texts(
 
 def process_run(
     run_id,
-    expected_dataset,
     seed,
     wandb_project,
     wandb_entity,
@@ -231,15 +230,12 @@ def process_run(
     print(f"Run config: {run_config}")
 
     dataset = run_config.get("dataset", "SetFit/sst2")
+    print(f"Dataset (from W&B run config): {dataset}")
     discrimination_loss = run_config.get("discrimination_loss", 1.0)
     arch_type = run_config.get("arch_type", None)
     residual_dim = run_config.get("residual_dim", 768)
     add_llama_logits = bool(run_config.get("add_llama_logits", False))
     print(f"Add llama logits: {add_llama_logits}")
-
-    if dataset != expected_dataset:
-        print(f"SKIPPING run {run_id}: dataset mismatch. Run used '{dataset}' but expected '{expected_dataset}'.")
-        return None
 
     run_type, ckpt_prefix = infer_run_layout(run_id, dataset, run_config)
     if run_type is None or ckpt_prefix is None:
@@ -409,8 +405,8 @@ def main():
     parser.add_argument(
         "--dataset",
         type=str,
-        required=True,
-        help="Expected dataset tag (must match the run). e.g. SetFit/sst2, ag_news",
+        default=None,
+        help="Deprecated: ignored. Dataset is read from each run's W&B config['dataset']. Kept for backward-compatible CLIs.",
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
@@ -454,7 +450,8 @@ def main():
 
     print(f"Loaded {len(run_ids)} run IDs from {args.run_ids_pickle}")
     print(f"Run IDs: {run_ids}")
-    print(f"Expected dataset: {args.dataset}")
+    if args.dataset is not None:
+        print("Note: --dataset is ignored; using each run's W&B config['dataset'].")
     print(
         f"RM: {args.rm_model_name} | logits clipped to [{RM_LOGIT_CLIP_MIN}, {RM_LOGIT_CLIP_MAX}] "
         f"(relevance, grammar, together) | rm_device={args.rm_device}"
@@ -471,7 +468,6 @@ def main():
         try:
             out = process_run(
                 run_id,
-                args.dataset,
                 args.seed,
                 args.wandb_project,
                 args.wandb_entity,

@@ -34,8 +34,12 @@ parser.add_argument("--wandb_project", type=str, default="cbm-generation-new", h
 parser.add_argument("--wandb_entity", type=str, default=None, help="Wandb entity (username or team)")
 parser.add_argument("--classifier_weight_suffixes", type=str, default="_seed42,_seed123,_seed456", 
                     help="Comma-separated list of classifier weight suffixes to test (e.g., '_seed42,_seed123,_seed456')")
-parser.add_argument("--dataset", type=str, required=True,
-                    help="Dataset to test (must match the dataset used in the wandb run). e.g., 'SetFit/sst2', 'ag_news', 'yelp_polarity', 'dbpedia_14'")
+parser.add_argument(
+    "--dataset",
+    type=str,
+    default=None,
+    help="Deprecated: ignored. Dataset is read from each run's W&B config['dataset']. Kept for backward-compatible CLIs.",
+)
 parser.add_argument("--seed", type=int, default=42, help="Random seed for steerability test generation")
 parser.add_argument(
     "--samples_per_concept",
@@ -383,7 +387,7 @@ def run_evaluation(
     return results
 
 
-def process_run(run_id, classifier_suffixes, expected_dataset, seed, wandb_project, wandb_entity=None,
+def process_run(run_id, classifier_suffixes, seed, wandb_project, wandb_entity=None,
                 samples_per_concept=None, run_idx=None, total_runs=None, interventions_per_batch=4,
                 use_label_concepts=False, perplexity_only=False):
     """
@@ -414,15 +418,12 @@ def process_run(run_id, classifier_suffixes, expected_dataset, seed, wandb_proje
     print(f"Run config: {run_config}")
     
     dataset = run_config.get('dataset', 'SetFit/sst2')
+    print(f"Dataset (from W&B run config): {dataset}")
     discrimination_loss = run_config.get('discrimination_loss', 1.0)
     arch_type = run_config.get('arch_type', None)
     residual_dim = run_config.get('residual_dim', 768)
     add_llama_logits = bool(run_config.get('add_llama_logits', False))
     print(f"Add llama logits: {add_llama_logits}")
-    
-    if dataset != expected_dataset:
-        print(f"SKIPPING run {run_id}: dataset mismatch. Run used '{dataset}' but expected '{expected_dataset}'.")
-        return
     
     run_type, ckpt_prefix = infer_run_layout(run_id, dataset, run_config)
     if run_type is None or ckpt_prefix is None:
@@ -555,6 +556,8 @@ def main():
         run_ids = pickle.load(f)
     
     print(f"Loaded {len(run_ids)} run IDs from {args.run_ids_pickle}")
+    if args.dataset is not None:
+        print("Note: --dataset is ignored; using each run's W&B config['dataset'].")
     print(
         "Concept mode: "
         + ("class labels (train_combined.py)" if args.use_label_concepts else "fine-grained")
@@ -571,7 +574,6 @@ def main():
             results = process_run(
                 run_id, 
                 classifier_suffixes,
-                args.dataset,
                 args.seed,
                 args.wandb_project, 
                 args.wandb_entity,
