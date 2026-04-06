@@ -15,6 +15,15 @@ Example (local GGUF)::
       --judge_gguf_path /path/to/Qwen3.5-27B-Q8_0.gguf \\
       --gen_device cuda:0
 
+Single run (no pickle; pass W&B run id as a string)::
+
+    python resume_qwen35_gguf_judge_metric.py \\
+      --run_id abc123xyz \\
+      --dataset SetFit/sst2 \\
+      --wandb_entity YOUR_ENTITY \\
+      --judge_gguf_path /path/to/Qwen3.5-27B-Q8_0.gguf \\
+      --gen_device cuda:0
+
 Example (HuggingFace from_pretrained — auto-downloads)::
 
     python resume_qwen35_gguf_judge_metric.py \\
@@ -623,7 +632,19 @@ def process_run(
 def main():
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
     p = argparse.ArgumentParser(description="Steerability gen (Llama 8B) then Qwen GGUF 1–10 judge.")
-    p.add_argument("--run_ids_pickle", type=str, required=True)
+    run_src = p.add_mutually_exclusive_group(required=True)
+    run_src.add_argument(
+        "--run_ids_pickle",
+        type=str,
+        default=None,
+        help="Pickle file containing a list of W&B run ids (same as batch workflows).",
+    )
+    run_src.add_argument(
+        "--run_id",
+        type=str,
+        default=None,
+        help="Single W&B run id as a string (alternative to --run_ids_pickle).",
+    )
     p.add_argument("--wandb_project", type=str, default="cbm-generation-new")
     p.add_argument("--wandb_entity", type=str, default=None)
     p.add_argument("--dataset", type=str, required=True)
@@ -703,8 +724,13 @@ def main():
     )
     args = p.parse_args()
 
-    with open(args.run_ids_pickle, "rb") as f:
-        run_ids = pickle.load(f)
+    if args.run_id is not None:
+        run_ids = [args.run_id.strip()]
+        if not run_ids[0]:
+            p.error("--run_id must be a non-empty string")
+    else:
+        with open(args.run_ids_pickle, "rb") as f:
+            run_ids = pickle.load(f)
 
     print(f"Runs: {len(run_ids)} | gen_device={args.gen_device} | GGUF={args.judge_gguf_path}")
 
