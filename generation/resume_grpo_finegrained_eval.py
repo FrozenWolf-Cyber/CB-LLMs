@@ -49,6 +49,19 @@ parser.add_argument(
     default=4,
     help="Number of concept interventions to batch together during generation. (default: 4)",
 )
+parser.add_argument(
+    "--use_label_concepts",
+    action="store_true",
+    help=(
+        "Use CFG.concepts_from_labels[dataset] for CBL width and interventions (train_combined.py). "
+        "Default: fine-grained CFG.concept_set[dataset] when present."
+    ),
+)
+parser.add_argument(
+    "--perplexity_only",
+    action="store_true",
+    help="If set, skip steerability / concept-pred / weight analysis; only run perplexity (default: run full eval).",
+)
 
 
 def run_steerability_test_from_texts(decoded_texts_by_concept, roberta_tokenizer, classifier, concept_set):
@@ -96,229 +109,232 @@ def run_evaluation(
     decoded_texts_by_concept,
     steerability_cache_dir=None,
     steerability_cache_seed=42,
+    perplexity_only=False,
 ):
     """
     Run all evaluations from train_grpo_finegrained.py.
     """
     results = {}
     
-    # 1. Steerability Test (from train_grpo_finegrained.py)
-    print("\nRunning Steerability Test...")
-    from transformers import AutoTokenizer, AutoModel
-    tokenizer_sim = AutoTokenizer.from_pretrained('sentence-transformers/all-mpnet-base-v2')
-    sim_model = AutoModel.from_pretrained('sentence-transformers/all-mpnet-base-v2').to(device)
-    sim_model.eval()
-
-    encoded_c = tokenizer_sim(concept_set, padding=True, truncation=True, max_length=350)
-    encoded_c = {k: torch.tensor(v).to(device) for k, v in encoded_c.items()}
-    concept_features = sim_model(input_ids=encoded_c["input_ids"], attention_mask=encoded_c["attention_mask"])
-    concept_features = mean_pooling(concept_features.last_hidden_state, encoded_c["attention_mask"])
-    concept_features = F.normalize(concept_features, p=2, dim=1)
-
-    if dataset == "dbpedia_14":
-        intervention_value = 150
+    if perplexity_only:
+        print("\nSkipping steerability, concept prediction, and weight analysis (--perplexity_only).")
     else:
-        intervention_value = 100
+        # 1. Steerability Test (from train_grpo_finegrained.py)
+        print("\nRunning Steerability Test...")
+        from transformers import AutoTokenizer, AutoModel
+        tokenizer_sim = AutoTokenizer.from_pretrained('sentence-transformers/all-mpnet-base-v2')
+        sim_model = AutoModel.from_pretrained('sentence-transformers/all-mpnet-base-v2').to(device)
+        sim_model.eval()
 
-    cos_sim_cubed_values = []
-    softmax_values = []
-    top1_correct = 0
-    top3_correct = 0
-    top5_correct = 0
-    top10_correct = 0
-    top20_correct = 0
-    total_evals = 0
+        encoded_c = tokenizer_sim(concept_set, padding=True, truncation=True, max_length=350)
+        encoded_c = {k: torch.tensor(v).to(device) for k, v in encoded_c.items()}
+        concept_features = sim_model(input_ids=encoded_c["input_ids"], attention_mask=encoded_c["attention_mask"])
+        concept_features = mean_pooling(concept_features.last_hidden_state, encoded_c["attention_mask"])
+        concept_features = F.normalize(concept_features, p=2, dim=1)
 
-    if steerability_cache_dir:
-        print(f"Steerability sample cache: {steerability_cache_dir}")
-    ce_loss_fn = torch.nn.CrossEntropyLoss(reduction="none")
-
-    with torch.no_grad():
-        for j in tqdm(range(len(concept_set)), desc="Steerability concepts"):
-            v = [0] * len(concept_set)
-            v[j] = intervention_value
-            cname = concept_set[j]
-            decoded_texts = (
-                decoded_texts_by_concept[j]
-                if j < len(decoded_texts_by_concept)
-                else []
-            )
-            if len(decoded_texts) == 0:
-                continue
-
-            generated_c = tokenizer_sim(
-                decoded_texts, padding=True, truncation=True, max_length=350, return_tensors="pt"
-            )
-            generated_c = {k: v.to(device) for k, v in generated_c.items()}
-            generated_features = sim_model(
-                input_ids=generated_c["input_ids"], attention_mask=generated_c["attention_mask"]
-            )
-            generated_features = mean_pooling(
-                generated_features.last_hidden_state, generated_c["attention_mask"]
-            )
-            generated_features = F.normalize(generated_features, p=2, dim=1)
-
-            sims = generated_features @ concept_features.T
-            v_tensor = torch.tensor(v).to(device).unsqueeze(0).expand(sims.size(0), -1)
-
-            cos_vals = cos_sim_cubed(sims, v_tensor.float(), reduce=False)
-            cos_sim_cubed_values.extend(cos_vals.detach().cpu().tolist())
-
-            targets = torch.full((sims.size(0),), j, dtype=torch.long, device=device)
-            ce_vals = ce_loss_fn(sims, targets)
-            softmax_values.extend(ce_vals.detach().cpu().tolist())
-
-            sorted_indices = torch.argsort(sims, dim=1, descending=True)
-            top1_correct += (sorted_indices[:, 0] == j).sum().item()
-            top3_correct += (sorted_indices[:, :3] == j).any(dim=1).sum().item()
-            top5_correct += (sorted_indices[:, :5] == j).any(dim=1).sum().item()
-            top10_correct += (sorted_indices[:, :10] == j).any(dim=1).sum().item()
-            top20_correct += (sorted_indices[:, :20] == j).any(dim=1).sum().item()
-            total_evals += sims.size(0)
-
-    if steerability_cache_dir:
-        save_all_steerability_texts(
-            steerability_cache_dir, steerability_cache_seed, concept_set, decoded_texts_by_concept
-        )
-
-    steer_results = {
-        "steerability_cos_sim_cubed": sum(cos_sim_cubed_values) / len(cos_sim_cubed_values),
-        "steerability_softmax": sum(softmax_values) / len(softmax_values),
-        "steerability_top1_acc": top1_correct / total_evals,
-        "steerability_top3_acc": top3_correct / total_evals,
-        "steerability_top5_acc": top5_correct / total_evals,
-        "steerability_top10_acc": top10_correct / total_evals,
-        "steerability_top20_acc": top20_correct / total_evals,
-    }
-    wandb.log(steer_results)
-    results.update(steer_results)
-    print(f"Steerability Top-1 Acc: {steer_results['steerability_top1_acc']}")
-
-    # 2. Concept Prediction Evaluation (from train_grpo_finegrained.py)
-    print("\nRunning Concept Prediction Evaluation...")
-    labeling = run_config.get('labeling', 'mpnet')
-    d_name = dataset.replace('/', '_')
-    
-    if not os.path.exists(f"./{labeling}/{d_name}") and os.path.exists(f"./{labeling}_acs/{d_name}"):
-        labeling = f"{labeling}_acs"
-        
-    label_prefix = f"./" # Assuming labels are in the root, adjust if needed
-    if labeling in ['mpnet', 'simcse', 'angle', 'llm', 'mpnet_acs', 'simcse_acs', 'angle_acs', 'llm_acs']:
-        label_prefix = os.path.join(label_prefix, labeling)
-    label_prefix = os.path.join(label_prefix, d_name)
-
-    test_sim_path = os.path.join(label_prefix, "concept_labels_test.npy")
-    
-    if os.path.exists(test_sim_path):
-        test_dataset = load_dataset(dataset, split='test')
-        if dataset != 'SetFit/sst2':
-            test_dataset = test_dataset.rename_column(CFG.label_name[dataset], 'label')
-        if dataset == 'ag_news':
-            test_dataset = test_dataset.select(range(1000))
-
-        encoded_test_dataset = test_dataset.map(
-            lambda e: tokenizer(e[CFG.example_name[dataset]], padding='max_length', truncation=True, max_length=350),
-            batched=True, batch_size=len(test_dataset)
-        )
-        
-        from utils import eos_pooling
-        class EvalDataset(torch.utils.data.Dataset):
-            def __init__(self, encodings):
-                self.encodings = encodings
-            def __getitem__(self, idx):
-                row = self.encodings[idx]
-                item = {key: torch.tensor(row[key]) for key in ['input_ids', 'attention_mask']}
-                return item, 0 # dummy label
-            def __len__(self):
-                return len(self.encodings)
-
-        test_loader = torch.utils.data.DataLoader(
-            EvalDataset(encoded_test_dataset), batch_size=4, shuffle=False
-        )
-
-        concept_predictions = []
-        for batch, _ in tqdm(test_loader, total=len(test_loader)):
-            batch = {k: v.to(device) for k, v in batch.items()}
-            with torch.no_grad():
-                features = preLM(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"]).last_hidden_state
-                concepts, _, _, _ = cbl(features.float())
-            pooled_concepts = eos_pooling(concepts, batch["attention_mask"])
-            concept_predictions.append(pooled_concepts.detach().cpu())
-        
-        concept_predictions = torch.cat(concept_predictions, dim=0)
-        
-        test_similarity_np = np.load(test_sim_path)
-        test_similarity = torch.tensor(test_similarity_np, dtype=torch.float32)
-
-        if test_similarity.shape == concept_predictions.shape:
-            test_cos_sim = cos_sim_cubed(concept_predictions, test_similarity)
-            test_cos_loss = -test_cos_sim.item()
-
-            pred_norm = F.normalize(concept_predictions, p=2, dim=-1)
-            label_norm = F.normalize(test_similarity, p=2, dim=-1)
-            test_cos_raw = (pred_norm * label_norm).sum(dim=-1).mean().item()
-
-            true_concepts = torch.argmax(test_similarity, dim=-1)
-            pred_sorted = torch.argsort(concept_predictions, dim=-1, descending=True)
-
-            topk_list = [1, 3, 5, 10, 20]
-            topk_hits = {k: 0 for k in topk_list}
-            topk_iou_sums = {k: 0.0 for k in topk_list}
-            total = concept_predictions.size(0)
-
-            for i in range(total):
-                gt_idx = true_concepts[i].item()
-                row = pred_sorted[i]
-                for k in topk_list:
-                    k_clipped = min(k, row.size(0))
-                    gt_topk = torch.topk(test_similarity[i], k=k_clipped, dim=-1).indices.tolist()
-                    pred_topk = row[:k_clipped].tolist()
-                    gt_set = set(gt_topk)
-                    pred_set = set(pred_topk)
-                    inter = len(gt_set & pred_set)
-                    union = len(gt_set | pred_set)
-                    if union > 0:
-                        topk_iou_sums[k] += inter / union
-                for k in topk_list:
-                    if k <= row.size(0) and gt_idx in row[:k].tolist():
-                        topk_hits[k] += 1
-            
-            topk_acc = {f"test_concept_top{k}_acc": topk_hits[k] / total for k in topk_list}
-            topk_iou = {f"test_concept_top{k}_iou": topk_iou_sums[k] / total for k in topk_list}
-
-            concept_pred_results = {
-                "test_concept_cosine_similarity": float(test_cos_sim.item()),
-                "test_concept_cosine_loss": float(test_cos_loss),
-                "test_concept_cosine_raw": float(test_cos_raw),
-                **topk_acc,
-                **topk_iou,
-            }
-            wandb.log(concept_pred_results)
-            results.update(concept_pred_results)
-            print(f"Test concept cosine similarity (raw): {test_cos_raw:.4f}")
+        if dataset == "dbpedia_14":
+            intervention_value = 150
         else:
-            print(f"[WARN] Shape mismatch for concept prediction. Skipping.")
-    else:
-        print(f"[WARN] {test_sim_path} not found. Skipping cosine-similarity-based concept evaluation.")
+            intervention_value = 100
 
+        cos_sim_cubed_values = []
+        softmax_values = []
+        top1_correct = 0
+        top3_correct = 0
+        top5_correct = 0
+        top10_correct = 0
+        top20_correct = 0
+        total_evals = 0
 
-    # 3. Weight Analysis (from train_grpo_finegrained.py)
-    print("\nRunning Weight Analysis...")
-    # This part is tricky because cbl.fc doesn't exist in CBLResidual.
-    # We will try to access it, and if it fails, we assume it's a residual model.
-    try:
-        w = cbl.fc.weight.data[:, :len(concept_set)].T
-        for i in tqdm(range(len(concept_set)), desc="Weight Analysis"):
-            top_values, top_ids = torch.topk(w[i], k=10)
-            # Log or print, but avoid excessive printing in a loop
+        if steerability_cache_dir:
+            print(f"Steerability sample cache: {steerability_cache_dir}")
+        ce_loss_fn = torch.nn.CrossEntropyLoss(reduction="none")
+
+        with torch.no_grad():
+            for j in tqdm(range(len(concept_set)), desc="Steerability concepts"):
+                v = [0] * len(concept_set)
+                v[j] = intervention_value
+                cname = concept_set[j]
+                decoded_texts = (
+                    decoded_texts_by_concept[j]
+                    if j < len(decoded_texts_by_concept)
+                    else []
+                )
+                if len(decoded_texts) == 0:
+                    continue
+
+                generated_c = tokenizer_sim(
+                    decoded_texts, padding=True, truncation=True, max_length=350, return_tensors="pt"
+                )
+                generated_c = {k: v.to(device) for k, v in generated_c.items()}
+                generated_features = sim_model(
+                    input_ids=generated_c["input_ids"], attention_mask=generated_c["attention_mask"]
+                )
+                generated_features = mean_pooling(
+                    generated_features.last_hidden_state, generated_c["attention_mask"]
+                )
+                generated_features = F.normalize(generated_features, p=2, dim=1)
+
+                sims = generated_features @ concept_features.T
+                v_tensor = torch.tensor(v).to(device).unsqueeze(0).expand(sims.size(0), -1)
+
+                cos_vals = cos_sim_cubed(sims, v_tensor.float(), reduce=False)
+                cos_sim_cubed_values.extend(cos_vals.detach().cpu().tolist())
+
+                targets = torch.full((sims.size(0),), j, dtype=torch.long, device=device)
+                ce_vals = ce_loss_fn(sims, targets)
+                softmax_values.extend(ce_vals.detach().cpu().tolist())
+
+                sorted_indices = torch.argsort(sims, dim=1, descending=True)
+                top1_correct += (sorted_indices[:, 0] == j).sum().item()
+                top3_correct += (sorted_indices[:, :3] == j).any(dim=1).sum().item()
+                top5_correct += (sorted_indices[:, :5] == j).any(dim=1).sum().item()
+                top10_correct += (sorted_indices[:, :10] == j).any(dim=1).sum().item()
+                top20_correct += (sorted_indices[:, :20] == j).any(dim=1).sum().item()
+                total_evals += sims.size(0)
+
+        if steerability_cache_dir:
+            save_all_steerability_texts(
+                steerability_cache_dir, steerability_cache_seed, concept_set, decoded_texts_by_concept
+            )
+
+        steer_results = {
+            "steerability_cos_sim_cubed": sum(cos_sim_cubed_values) / len(cos_sim_cubed_values),
+            "steerability_softmax": sum(softmax_values) / len(softmax_values),
+            "steerability_top1_acc": top1_correct / total_evals,
+            "steerability_top3_acc": top3_correct / total_evals,
+            "steerability_top5_acc": top5_correct / total_evals,
+            "steerability_top10_acc": top10_correct / total_evals,
+            "steerability_top20_acc": top20_correct / total_evals,
+        }
+        wandb.log(steer_results)
+        results.update(steer_results)
+        print(f"Steerability Top-1 Acc: {steer_results['steerability_top1_acc']}")
+
+        # 2. Concept Prediction Evaluation (from train_grpo_finegrained.py)
+        print("\nRunning Concept Prediction Evaluation...")
+        labeling = run_config.get('labeling', 'mpnet')
+        d_name = dataset.replace('/', '_')
         
-        sparsity = (w > 1e-6).count_nonzero() / w.numel()
-        wandb.log({"concept_weight_sparsity": sparsity})
-        results["concept_weight_sparsity"] = sparsity.item()
-        print(f"  Concept weight sparsity: {sparsity.item()}")
-    except AttributeError:
-        print("  Skipping weight analysis for this model architecture (likely residual).")
+        if not os.path.exists(f"./{labeling}/{d_name}") and os.path.exists(f"./{labeling}_acs/{d_name}"):
+            labeling = f"{labeling}_acs"
+            
+        label_prefix = f"./" # Assuming labels are in the root, adjust if needed
+        if labeling in ['mpnet', 'simcse', 'angle', 'llm', 'mpnet_acs', 'simcse_acs', 'angle_acs', 'llm_acs']:
+            label_prefix = os.path.join(label_prefix, labeling)
+        label_prefix = os.path.join(label_prefix, d_name)
 
+        test_sim_path = os.path.join(label_prefix, "concept_labels_test.npy")
+        
+        if os.path.exists(test_sim_path):
+            test_dataset = load_dataset(dataset, split='test')
+            if dataset != 'SetFit/sst2':
+                test_dataset = test_dataset.rename_column(CFG.label_name[dataset], 'label')
+            if dataset == 'ag_news':
+                test_dataset = test_dataset.select(range(1000))
+
+            encoded_test_dataset = test_dataset.map(
+                lambda e: tokenizer(e[CFG.example_name[dataset]], padding='max_length', truncation=True, max_length=350),
+                batched=True, batch_size=len(test_dataset)
+            )
+            
+            from utils import eos_pooling
+            class EvalDataset(torch.utils.data.Dataset):
+                def __init__(self, encodings):
+                    self.encodings = encodings
+                def __getitem__(self, idx):
+                    row = self.encodings[idx]
+                    item = {key: torch.tensor(row[key]) for key in ['input_ids', 'attention_mask']}
+                    return item, 0 # dummy label
+                def __len__(self):
+                    return len(self.encodings)
+
+            test_loader = torch.utils.data.DataLoader(
+                EvalDataset(encoded_test_dataset), batch_size=4, shuffle=False
+            )
+
+            concept_predictions = []
+            for batch, _ in tqdm(test_loader, total=len(test_loader)):
+                batch = {k: v.to(device) for k, v in batch.items()}
+                with torch.no_grad():
+                    features = preLM(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"]).last_hidden_state
+                    concepts, _, _, _ = cbl(features.float())
+                pooled_concepts = eos_pooling(concepts, batch["attention_mask"])
+                concept_predictions.append(pooled_concepts.detach().cpu())
+            
+            concept_predictions = torch.cat(concept_predictions, dim=0)
+            
+            test_similarity_np = np.load(test_sim_path)
+            test_similarity = torch.tensor(test_similarity_np, dtype=torch.float32)
+
+            if test_similarity.shape == concept_predictions.shape:
+                test_cos_sim = cos_sim_cubed(concept_predictions, test_similarity)
+                test_cos_loss = -test_cos_sim.item()
+
+                pred_norm = F.normalize(concept_predictions, p=2, dim=-1)
+                label_norm = F.normalize(test_similarity, p=2, dim=-1)
+                test_cos_raw = (pred_norm * label_norm).sum(dim=-1).mean().item()
+
+                true_concepts = torch.argmax(test_similarity, dim=-1)
+                pred_sorted = torch.argsort(concept_predictions, dim=-1, descending=True)
+
+                topk_list = [1, 3, 5, 10, 20]
+                topk_hits = {k: 0 for k in topk_list}
+                topk_iou_sums = {k: 0.0 for k in topk_list}
+                total = concept_predictions.size(0)
+
+                for i in range(total):
+                    gt_idx = true_concepts[i].item()
+                    row = pred_sorted[i]
+                    for k in topk_list:
+                        k_clipped = min(k, row.size(0))
+                        gt_topk = torch.topk(test_similarity[i], k=k_clipped, dim=-1).indices.tolist()
+                        pred_topk = row[:k_clipped].tolist()
+                        gt_set = set(gt_topk)
+                        pred_set = set(pred_topk)
+                        inter = len(gt_set & pred_set)
+                        union = len(gt_set | pred_set)
+                        if union > 0:
+                            topk_iou_sums[k] += inter / union
+                    for k in topk_list:
+                        if k <= row.size(0) and gt_idx in row[:k].tolist():
+                            topk_hits[k] += 1
+                
+                topk_acc = {f"test_concept_top{k}_acc": topk_hits[k] / total for k in topk_list}
+                topk_iou = {f"test_concept_top{k}_iou": topk_iou_sums[k] / total for k in topk_list}
+
+                concept_pred_results = {
+                    "test_concept_cosine_similarity": float(test_cos_sim.item()),
+                    "test_concept_cosine_loss": float(test_cos_loss),
+                    "test_concept_cosine_raw": float(test_cos_raw),
+                    **topk_acc,
+                    **topk_iou,
+                }
+                wandb.log(concept_pred_results)
+                results.update(concept_pred_results)
+                print(f"Test concept cosine similarity (raw): {test_cos_raw:.4f}")
+            else:
+                print(f"[WARN] Shape mismatch for concept prediction. Skipping.")
+        else:
+            print(f"[WARN] {test_sim_path} not found. Skipping cosine-similarity-based concept evaluation.")
+
+
+        # 3. Weight Analysis (from train_grpo_finegrained.py)
+        print("\nRunning Weight Analysis...")
+        # This part is tricky because cbl.fc doesn't exist in CBLResidual.
+        # We will try to access it, and if it fails, we assume it's a residual model.
+        try:
+            w = cbl.fc.weight.data[:, :len(concept_set)].T
+            for i in tqdm(range(len(concept_set)), desc="Weight Analysis"):
+                top_values, top_ids = torch.topk(w[i], k=10)
+                # Log or print, but avoid excessive printing in a loop
+            
+            sparsity = (w > 1e-6).count_nonzero() / w.numel()
+            wandb.log({"concept_weight_sparsity": sparsity})
+            results["concept_weight_sparsity"] = sparsity.item()
+            print(f"  Concept weight sparsity: {sparsity.item()}")
+        except AttributeError:
+            print("  Skipping weight analysis for this model architecture (likely residual).")
 
     # 4. Perplexity (from train_grpo_finegrained.py)
     print("\nRunning Perplexity Calculation...")
@@ -368,7 +384,8 @@ def run_evaluation(
 
 
 def process_run(run_id, classifier_suffixes, expected_dataset, seed, wandb_project, wandb_entity=None,
-                samples_per_concept=None, run_idx=None, total_runs=None, interventions_per_batch=4):
+                samples_per_concept=None, run_idx=None, total_runs=None, interventions_per_batch=4,
+                use_label_concepts=False, perplexity_only=False):
     """
     Process a single wandb run: load config, load models, run evaluations, and log results.
     """
@@ -422,16 +439,22 @@ def process_run(run_id, classifier_suffixes, expected_dataset, seed, wandb_proje
         print(f"No model weights found for run {run_id}")
         return
 
-    steer_dir = steerability_output_root(ckpt_prefix, best_epoch, is_low_score)
+    steer_dir = None if perplexity_only else steerability_output_root(ckpt_prefix, best_epoch, is_low_score)
     
     config = LlamaConfig.from_pretrained('meta-llama/Meta-Llama-3-8B')
     tokenizer = AutoTokenizer.from_pretrained('meta-llama/Meta-Llama-3-8B')
     tokenizer.pad_token = tokenizer.eos_token
     
-    concept_set = CFG.concept_set.get(dataset, CFG.concepts_from_labels[dataset])
+    if use_label_concepts:
+        concept_set = CFG.concepts_from_labels[dataset]
+        print("Concept source: class labels (CFG.concepts_from_labels), train_combined.py compatible")
+    else:
+        concept_set = CFG.concept_set.get(dataset, CFG.concepts_from_labels[dataset])
+        print("Concept source: fine-grained (CFG.concept_set when available)")
     print(f"Concept set length: {len(concept_set)}")
     n_samples = max(1, samples_per_concept) if samples_per_concept is not None else max(1, 100 // len(concept_set))
-    print(f"Samples per concept: {n_samples}" + (" (from --samples_per_concept)" if samples_per_concept is not None else " (default: 100 // num_concepts)"))
+    if not perplexity_only:
+        print(f"Samples per concept: {n_samples}" + (" (from --samples_per_concept)" if samples_per_concept is not None else " (default: 100 // num_concepts)"))
     
     resumed_run = wandb.init(
         project=wandb_project,
@@ -456,35 +479,53 @@ def process_run(run_id, classifier_suffixes, expected_dataset, seed, wandb_proje
             discrimination_loss_for_loading, residual_dim
         )
 
-        llama_vocab_weight = get_llama_vocab_weight() if add_llama_logits else None
-        decoded_texts_by_concept = generate_steerability_texts(
-            preLM,
-            cbl,
-            tokenizer,
-            concept_set,
-            dataset,
-            samples_per_concept=n_samples,
-            print_k=3,
-            llama_vocab_weight=llama_vocab_weight,
-            steerability_cache_dir=steer_dir,
-            steerability_cache_seed=seed,
-            interventions_per_batch=interventions_per_batch,
-        )
+        if perplexity_only:
+            eval_results = run_evaluation(
+                preLM,
+                cbl,
+                tokenizer,
+                concept_set,
+                dataset,
+                run_config,
+                classifier_suffixes,
+                resumed_run.name,
+                seed,
+                None,
+                steerability_cache_dir=None,
+                steerability_cache_seed=seed,
+                perplexity_only=True,
+            )
+        else:
+            llama_vocab_weight = get_llama_vocab_weight() if add_llama_logits else None
+            decoded_texts_by_concept = generate_steerability_texts(
+                preLM,
+                cbl,
+                tokenizer,
+                concept_set,
+                dataset,
+                samples_per_concept=n_samples,
+                print_k=3,
+                llama_vocab_weight=llama_vocab_weight,
+                steerability_cache_dir=steer_dir,
+                steerability_cache_seed=seed,
+                interventions_per_batch=interventions_per_batch,
+            )
 
-        eval_results = run_evaluation(
-            preLM,
-            cbl,
-            tokenizer,
-            concept_set,
-            dataset,
-            run_config,
-            classifier_suffixes,
-            resumed_run.name,
-            seed,
-            decoded_texts_by_concept,
-            steerability_cache_dir=steer_dir,
-            steerability_cache_seed=seed,
-        )
+            eval_results = run_evaluation(
+                preLM,
+                cbl,
+                tokenizer,
+                concept_set,
+                dataset,
+                run_config,
+                classifier_suffixes,
+                resumed_run.name,
+                seed,
+                decoded_texts_by_concept,
+                steerability_cache_dir=steer_dir,
+                steerability_cache_seed=seed,
+                perplexity_only=False,
+            )
         results.update(eval_results)
 
         del preLM, cbl
@@ -514,6 +555,12 @@ def main():
         run_ids = pickle.load(f)
     
     print(f"Loaded {len(run_ids)} run IDs from {args.run_ids_pickle}")
+    print(
+        "Concept mode: "
+        + ("class labels (train_combined.py)" if args.use_label_concepts else "fine-grained")
+    )
+    if args.perplexity_only:
+        print("Eval mode: perplexity only (--perplexity_only)")
     
     classifier_suffixes = [s.strip() for s in args.classifier_weight_suffixes.split(',')]
     
@@ -532,6 +579,8 @@ def main():
                 run_idx=idx,
                 total_runs=total_runs,
                 interventions_per_batch=args.interventions_per_batch,
+                use_label_concepts=args.use_label_concepts,
+                perplexity_only=args.perplexity_only,
             )
             all_results[run_id] = results
         except Exception as e:

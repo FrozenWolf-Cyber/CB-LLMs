@@ -204,6 +204,7 @@ def process_run(
     run_idx=None,
     total_runs=None,
     interventions_per_batch=1,
+    use_label_concepts=False,
 ):
     set_seed(seed)
 
@@ -259,7 +260,12 @@ def process_run(
     tokenizer = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3-8B")
     tokenizer.pad_token = tokenizer.eos_token
 
-    concept_set = CFG.concept_set.get(dataset, CFG.concepts_from_labels[dataset])
+    if use_label_concepts:
+        concept_set = CFG.concepts_from_labels[dataset]
+        print("Concept source: class labels (CFG.concepts_from_labels)")
+    else:
+        concept_set = CFG.concept_set[dataset]
+        print("Concept source: fine-grained concepts (CFG.concept_set)")
     print(f"Concept len: {len(concept_set)}")
     n_samples = max(1, samples_per_concept) if samples_per_concept is not None else max(1, 100 // len(concept_set))
     print(f"Samples per concept: {n_samples}" + (" (from --samples_per_concept)" if samples_per_concept is not None else " (default: 100 // num_concepts)"))
@@ -428,6 +434,14 @@ def main():
         help="Number of concept interventions to batch together during generation. (default: 4)",
     )
     parser.add_argument(
+        "--use_label_concepts",
+        action="store_true",
+        help=(
+            "Use class-label concepts from CFG.concepts_from_labels (for train_combined.py-style runs). "
+            "If not set, uses fine-grained concepts from CFG.concept_set."
+        ),
+    )
+    parser.add_argument(
         "--rm_device",
         type=str,
         default="cuda" if torch.cuda.is_available() else "cpu",
@@ -444,6 +458,10 @@ def main():
     print(
         f"RM: {args.rm_model_name} | logits clipped to [{RM_LOGIT_CLIP_MIN}, {RM_LOGIT_CLIP_MAX}] "
         f"(relevance, grammar, together) | rm_device={args.rm_device}"
+    )
+    print(
+        "Concept mode: "
+        + ("class labels (train_combined.py compatible)" if args.use_label_concepts else "fine-grained concepts")
     )
 
     all_results = {}
@@ -465,6 +483,7 @@ def main():
                 run_idx=idx,
                 total_runs=total_runs,
                 interventions_per_batch=args.interventions_per_batch,
+                use_label_concepts=args.use_label_concepts,
             )
             all_results[run_id] = out
         except Exception as e:
