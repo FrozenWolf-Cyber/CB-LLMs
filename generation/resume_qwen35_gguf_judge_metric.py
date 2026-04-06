@@ -70,7 +70,7 @@ import json
 import os
 import pickle
 import re
-
+import tqdm
 import numpy as np
 import torch
 import wandb
@@ -338,14 +338,14 @@ def run_judge_on_texts(
     parse_ok = 0
     parse_fail = 0
 
-    for concept_idx, concept_name in enumerate(concept_set):
+    for concept_idx, concept_name in tqdm(enumerate(concept_set), desc="Judging concepts"):
         texts = decoded_texts_by_concept[concept_idx] if concept_idx < len(decoded_texts_by_concept) else []
         if not texts:
             per_concept[concept_name] = {"n": 0, "judge_mean_1_10": float("nan"), "judge_std_1_10": 0.0}
             continue
 
         scores_this: list[float] = []
-        for b, t in enumerate(texts):
+        for b, t in tqdm(enumerate(texts), desc="Judging samples"):
             s, raw = judge_one(llm, concept_name, t, max_chars, max_tokens, enable_thinking=enable_thinking)
             if judge_log_run_dir:
                 write_judge_reasoning_log(
