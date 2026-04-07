@@ -62,9 +62,30 @@ parser.add_argument(
     ),
 )
 parser.add_argument(
+    "--perplexity",
+    action="store_true",
+    help=(
+        "If set, run perplexity evaluation in addition to other metrics. "
+        "By default, perplexity is skipped unless --perplexity or --perplexity_only is set."
+    ),
+)
+parser.add_argument(
     "--perplexity_only",
     action="store_true",
-    help="If set, skip steerability / concept-pred / weight analysis; only run perplexity (default: run full eval).",
+    help=(
+        "If set, skip steerability / concept-pred / weight analysis; only run perplexity. "
+        "Deprecated in favor of --perplexity, but kept for backward compatibility."
+    ),
+)
+parser.add_argument(
+    "--concept_prediction",
+    action="store_true",
+    help="If set, run Concept Prediction Evaluation. Default: skip.",
+)
+parser.add_argument(
+    "--weight_analysis",
+    action="store_true",
+    help="If set, run Weight Analysis. Default: skip.",
 )
 
 
@@ -114,6 +135,9 @@ def run_evaluation(
     steerability_cache_dir=None,
     steerability_cache_seed=42,
     perplexity_only=False,
+    run_perplexity=False,
+    run_concept_prediction=False,
+    run_weight_analysis=False,
 ):
     """
     Run all evaluations from train_grpo_finegrained.py.
@@ -215,132 +239,136 @@ def run_evaluation(
         results.update(steer_results)
         print(f"Steerability Top-1 Acc: {steer_results['steerability_top1_acc']}")
 
-        # 2. Concept Prediction Evaluation (from train_grpo_finegrained.py)
-        print("\nRunning Concept Prediction Evaluation...")
-        labeling = run_config.get('labeling', 'mpnet')
-        d_name = dataset.replace('/', '_')
-        
-        if not os.path.exists(f"./{labeling}/{d_name}") and os.path.exists(f"./{labeling}_acs/{d_name}"):
-            labeling = f"{labeling}_acs"
+        if run_concept_prediction:
+            # 2. Concept Prediction Evaluation (from train_grpo_finegrained.py)
+            print("\nRunning Concept Prediction Evaluation...")
+            labeling = run_config.get('labeling', 'mpnet')
+            d_name = dataset.replace('/', '_')
             
-        label_prefix = f"./" # Assuming labels are in the root, adjust if needed
-        if labeling in ['mpnet', 'simcse', 'angle', 'llm', 'mpnet_acs', 'simcse_acs', 'angle_acs', 'llm_acs']:
-            label_prefix = os.path.join(label_prefix, labeling)
-        label_prefix = os.path.join(label_prefix, d_name)
-
-        test_sim_path = os.path.join(label_prefix, "concept_labels_test.npy")
-        
-        if os.path.exists(test_sim_path):
-            test_dataset = load_dataset(dataset, split='test')
-            if dataset != 'SetFit/sst2':
-                test_dataset = test_dataset.rename_column(CFG.label_name[dataset], 'label')
-            if dataset == 'ag_news':
-                test_dataset = test_dataset.select(range(1000))
-
-            encoded_test_dataset = test_dataset.map(
-                lambda e: tokenizer(e[CFG.example_name[dataset]], padding='max_length', truncation=True, max_length=350),
-                batched=True, batch_size=len(test_dataset)
-            )
-            
-            from utils import eos_pooling
-            class EvalDataset(torch.utils.data.Dataset):
-                def __init__(self, encodings):
-                    self.encodings = encodings
-                def __getitem__(self, idx):
-                    row = self.encodings[idx]
-                    item = {key: torch.tensor(row[key]) for key in ['input_ids', 'attention_mask']}
-                    return item, 0 # dummy label
-                def __len__(self):
-                    return len(self.encodings)
-
-            test_loader = torch.utils.data.DataLoader(
-                EvalDataset(encoded_test_dataset), batch_size=4, shuffle=False
-            )
-
-            concept_predictions = []
-            for batch, _ in tqdm(test_loader, total=len(test_loader)):
-                batch = {k: v.to(device) for k, v in batch.items()}
-                with torch.no_grad():
-                    features = preLM(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"]).last_hidden_state
-                    concepts, _, _, _ = cbl(features.float())
-                pooled_concepts = eos_pooling(concepts, batch["attention_mask"])
-                concept_predictions.append(pooled_concepts.detach().cpu())
-            
-            concept_predictions = torch.cat(concept_predictions, dim=0)
-            
-            test_similarity_np = np.load(test_sim_path)
-            test_similarity = torch.tensor(test_similarity_np, dtype=torch.float32)
-
-            if test_similarity.shape == concept_predictions.shape:
-                test_cos_sim = cos_sim_cubed(concept_predictions, test_similarity)
-                test_cos_loss = -test_cos_sim.item()
-
-                pred_norm = F.normalize(concept_predictions, p=2, dim=-1)
-                label_norm = F.normalize(test_similarity, p=2, dim=-1)
-                test_cos_raw = (pred_norm * label_norm).sum(dim=-1).mean().item()
-
-                true_concepts = torch.argmax(test_similarity, dim=-1)
-                pred_sorted = torch.argsort(concept_predictions, dim=-1, descending=True)
-
-                topk_list = [1, 3, 5, 10, 20]
-                topk_hits = {k: 0 for k in topk_list}
-                topk_iou_sums = {k: 0.0 for k in topk_list}
-                total = concept_predictions.size(0)
-
-                for i in range(total):
-                    gt_idx = true_concepts[i].item()
-                    row = pred_sorted[i]
-                    for k in topk_list:
-                        k_clipped = min(k, row.size(0))
-                        gt_topk = torch.topk(test_similarity[i], k=k_clipped, dim=-1).indices.tolist()
-                        pred_topk = row[:k_clipped].tolist()
-                        gt_set = set(gt_topk)
-                        pred_set = set(pred_topk)
-                        inter = len(gt_set & pred_set)
-                        union = len(gt_set | pred_set)
-                        if union > 0:
-                            topk_iou_sums[k] += inter / union
-                    for k in topk_list:
-                        if k <= row.size(0) and gt_idx in row[:k].tolist():
-                            topk_hits[k] += 1
+            if not os.path.exists(f"./{labeling}/{d_name}") and os.path.exists(f"./{labeling}_acs/{d_name}"):
+                labeling = f"{labeling}_acs"
                 
-                topk_acc = {f"test_concept_top{k}_acc": topk_hits[k] / total for k in topk_list}
-                topk_iou = {f"test_concept_top{k}_iou": topk_iou_sums[k] / total for k in topk_list}
+            label_prefix = f"./" # Assuming labels are in the root, adjust if needed
+            if labeling in ['mpnet', 'simcse', 'angle', 'llm', 'mpnet_acs', 'simcse_acs', 'angle_acs', 'llm_acs']:
+                label_prefix = os.path.join(label_prefix, labeling)
+            label_prefix = os.path.join(label_prefix, d_name)
 
-                concept_pred_results = {
-                    "test_concept_cosine_similarity": float(test_cos_sim.item()),
-                    "test_concept_cosine_loss": float(test_cos_loss),
-                    "test_concept_cosine_raw": float(test_cos_raw),
-                    **topk_acc,
-                    **topk_iou,
-                }
-                wandb.log(concept_pred_results)
-                results.update(concept_pred_results)
-                print(f"Test concept cosine similarity (raw): {test_cos_raw:.4f}")
-            else:
-                print(f"[WARN] Shape mismatch for concept prediction. Skipping.")
-        else:
-            print(f"[WARN] {test_sim_path} not found. Skipping cosine-similarity-based concept evaluation.")
-
-
-        # 3. Weight Analysis (from train_grpo_finegrained.py)
-        print("\nRunning Weight Analysis...")
-        # This part is tricky because cbl.fc doesn't exist in CBLResidual.
-        # We will try to access it, and if it fails, we assume it's a residual model.
-        try:
-            w = cbl.fc.weight.data[:, :len(concept_set)].T
-            for i in tqdm(range(len(concept_set)), desc="Weight Analysis"):
-                top_values, top_ids = torch.topk(w[i], k=10)
-                # Log or print, but avoid excessive printing in a loop
+            test_sim_path = os.path.join(label_prefix, "concept_labels_test.npy")
             
-            sparsity = (w > 1e-6).count_nonzero() / w.numel()
-            wandb.log({"concept_weight_sparsity": sparsity})
-            results["concept_weight_sparsity"] = sparsity.item()
-            print(f"  Concept weight sparsity: {sparsity.item()}")
-        except AttributeError:
-            print("  Skipping weight analysis for this model architecture (likely residual).")
+            if os.path.exists(test_sim_path):
+                test_dataset = load_dataset(dataset, split='test')
+                if dataset != 'SetFit/sst2':
+                    test_dataset = test_dataset.rename_column(CFG.label_name[dataset], 'label')
+                if dataset == 'ag_news':
+                    test_dataset = test_dataset.select(range(1000))
+
+                encoded_test_dataset = test_dataset.map(
+                    lambda e: tokenizer(e[CFG.example_name[dataset]], padding='max_length', truncation=True, max_length=350),
+                    batched=True, batch_size=len(test_dataset)
+                )
+                
+                from utils import eos_pooling
+                class EvalDataset(torch.utils.data.Dataset):
+                    def __init__(self, encodings):
+                        self.encodings = encodings
+                    def __getitem__(self, idx):
+                        row = self.encodings[idx]
+                        item = {key: torch.tensor(row[key]) for key in ['input_ids', 'attention_mask']}
+                        return item, 0 # dummy label
+                    def __len__(self):
+                        return len(self.encodings)
+
+                test_loader = torch.utils.data.DataLoader(
+                    EvalDataset(encoded_test_dataset), batch_size=4, shuffle=False
+                )
+
+                concept_predictions = []
+                for batch, _ in tqdm(test_loader, total=len(test_loader)):
+                    batch = {k: v.to(device) for k, v in batch.items()}
+                    with torch.no_grad():
+                        features = preLM(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"]).last_hidden_state
+                        concepts, _, _, _ = cbl(features.float())
+                    pooled_concepts = eos_pooling(concepts, batch["attention_mask"])
+                    concept_predictions.append(pooled_concepts.detach().cpu())
+                
+                concept_predictions = torch.cat(concept_predictions, dim=0)
+                
+                test_similarity_np = np.load(test_sim_path)
+                test_similarity = torch.tensor(test_similarity_np, dtype=torch.float32)
+
+                if test_similarity.shape == concept_predictions.shape:
+                    test_cos_sim = cos_sim_cubed(concept_predictions, test_similarity)
+                    test_cos_loss = -test_cos_sim.item()
+
+                    pred_norm = F.normalize(concept_predictions, p=2, dim=-1)
+                    label_norm = F.normalize(test_similarity, p=2, dim=-1)
+                    test_cos_raw = (pred_norm * label_norm).sum(dim=-1).mean().item()
+
+                    true_concepts = torch.argmax(test_similarity, dim=-1)
+                    pred_sorted = torch.argsort(concept_predictions, dim=-1, descending=True)
+
+                    topk_list = [1, 3, 5, 10, 20]
+                    topk_hits = {k: 0 for k in topk_list}
+                    topk_iou_sums = {k: 0.0 for k in topk_list}
+                    total = concept_predictions.size(0)
+
+                    for i in range(total):
+                        gt_idx = true_concepts[i].item()
+                        row = pred_sorted[i]
+                        for k in topk_list:
+                            k_clipped = min(k, row.size(0))
+                            gt_topk = torch.topk(test_similarity[i], k=k_clipped, dim=-1).indices.tolist()
+                            pred_topk = row[:k_clipped].tolist()
+                            gt_set = set(gt_topk)
+                            pred_set = set(pred_topk)
+                            inter = len(gt_set & pred_set)
+                            union = len(gt_set | pred_set)
+                            if union > 0:
+                                topk_iou_sums[k] += inter / union
+                        for k in topk_list:
+                            if k <= row.size(0) and gt_idx in row[:k].tolist():
+                                topk_hits[k] += 1
+                    
+                    topk_acc = {f"test_concept_top{k}_acc": topk_hits[k] / total for k in topk_list}
+                    topk_iou = {f"test_concept_top{k}_iou": topk_iou_sums[k] / total for k in topk_list}
+
+                    concept_pred_results = {
+                        "test_concept_cosine_similarity": float(test_cos_sim.item()),
+                        "test_concept_cosine_loss": float(test_cos_loss),
+                        "test_concept_cosine_raw": float(test_cos_raw),
+                        **topk_acc,
+                        **topk_iou,
+                    }
+                    wandb.log(concept_pred_results)
+                    results.update(concept_pred_results)
+                    print(f"Test concept cosine similarity (raw): {test_cos_raw:.4f}")
+                else:
+                    print(f"[WARN] Shape mismatch for concept prediction. Skipping.")
+            else:
+                print(f"[WARN] {test_sim_path} not found. Skipping cosine-similarity-based concept evaluation.")
+
+        if run_weight_analysis:
+            # 3. Weight Analysis (from train_grpo_finegrained.py)
+            print("\nRunning Weight Analysis...")
+            # This part is tricky because cbl.fc doesn't exist in CBLResidual.
+            # We will try to access it, and if it fails, we assume it's a residual model.
+            try:
+                w = cbl.fc.weight.data[:, :len(concept_set)].T
+                for i in tqdm(range(len(concept_set)), desc="Weight Analysis"):
+                    top_values, top_ids = torch.topk(w[i], k=10)
+                    # Log or print, but avoid excessive printing in a loop
+                
+                sparsity = (w > 1e-6).count_nonzero() / w.numel()
+                wandb.log({"concept_weight_sparsity": sparsity})
+                results["concept_weight_sparsity"] = sparsity.item()
+                print(f"  Concept weight sparsity: {sparsity.item()}")
+            except AttributeError:
+                print("  Skipping weight analysis for this model architecture (likely residual).")
 
     # 4. Perplexity (from train_grpo_finegrained.py)
+    if not (perplexity_only or run_perplexity):
+        # Perplexity disabled unless explicitly requested.
+        return results
     print("\nRunning Perplexity Calculation...")
     set_seed(seed)
     
@@ -389,7 +417,8 @@ def run_evaluation(
 
 def process_run(run_id, classifier_suffixes, seed, wandb_project, wandb_entity=None,
                 samples_per_concept=None, run_idx=None, total_runs=None, interventions_per_batch=4,
-                use_label_concepts=False, perplexity_only=False):
+                use_label_concepts=False, perplexity_only=False, run_perplexity=False,
+                run_concept_prediction=False, run_weight_analysis=False):
     """
     Process a single wandb run: load config, load models, run evaluations, and log results.
     """
@@ -495,6 +524,9 @@ def process_run(run_id, classifier_suffixes, seed, wandb_project, wandb_entity=N
                 steerability_cache_dir=None,
                 steerability_cache_seed=seed,
                 perplexity_only=True,
+                run_perplexity=True,
+                run_concept_prediction=False,
+                run_weight_analysis=False,
             )
         else:
             llama_vocab_weight = get_llama_vocab_weight() if add_llama_logits else None
@@ -526,6 +558,9 @@ def process_run(run_id, classifier_suffixes, seed, wandb_project, wandb_entity=N
                 steerability_cache_dir=steer_dir,
                 steerability_cache_seed=seed,
                 perplexity_only=False,
+                run_perplexity=run_perplexity,
+                run_concept_prediction=run_concept_prediction,
+                run_weight_analysis=run_weight_analysis,
             )
         results.update(eval_results)
 
@@ -564,6 +599,12 @@ def main():
     )
     if args.perplexity_only:
         print("Eval mode: perplexity only (--perplexity_only)")
+    elif args.perplexity:
+        print("Eval mode: full eval + perplexity (--perplexity)")
+    if args.concept_prediction:
+        print("Concept Prediction: enabled (--concept_prediction)")
+    if args.weight_analysis:
+        print("Weight Analysis: enabled (--weight_analysis)")
     
     classifier_suffixes = [s.strip() for s in args.classifier_weight_suffixes.split(',')]
     
@@ -583,6 +624,9 @@ def main():
                 interventions_per_batch=args.interventions_per_batch,
                 use_label_concepts=args.use_label_concepts,
                 perplexity_only=args.perplexity_only,
+                run_perplexity=(args.perplexity or args.perplexity_only),
+                run_concept_prediction=args.concept_prediction,
+                run_weight_analysis=args.weight_analysis,
             )
             all_results[run_id] = results
         except Exception as e:
