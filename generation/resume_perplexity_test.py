@@ -22,6 +22,7 @@ except ImportError:
 from transformers import LlamaConfig, AutoTokenizer
 
 from eval_metrics import (
+    _perplexity_cache_path,
     find_eval_checkpoint,
     generate_perplexity_texts,
     compute_perplexity,
@@ -34,7 +35,8 @@ from eval_metrics import (
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--run_ids_pickle", type=str, required=True, help="Path to pickle file containing list of wandb run IDs")
+parser.add_argument("--run_ids_pickle", type=str, default=None, help="Path to pickle file containing list of wandb run IDs")
+parser.add_argument("--run_id", type=str, default=None, help="Single wandb run ID (alternative to --run_ids_pickle)")
 parser.add_argument("--wandb_project", type=str, default="cbm-generation-new", help="Wandb project name")
 parser.add_argument("--wandb_entity", type=str, default=None, help="Wandb entity (username or team)")
 parser.add_argument("--dataset", type=str, required=True,
@@ -45,6 +47,11 @@ parser.add_argument(
     type=int,
     default=100,
     help="Number of generated texts to use for perplexity. Default 100.",
+)
+parser.add_argument(
+    "--clear_cache",
+    action="store_true",
+    help="Delete cached perplexity texts and regenerate from scratch.",
 )
 
 
@@ -57,6 +64,7 @@ def process_run(
     perplexity_n_samples=100,
     run_idx=None,
     total_runs=None,
+    clear_cache=False,
 ):
     """
     Process a single wandb run: load config, load best checkpoint, generate cached texts,
@@ -155,6 +163,15 @@ def process_run(
     cache_dir = os.path.normpath(str(ckpt_prefix).rstrip("/"))
     print(f"Perplexity text cache dir: {cache_dir}")
 
+    if clear_cache:
+        cache_file = _perplexity_cache_path(cache_dir, seed)
+        if os.path.isfile(cache_file):
+            print(f"--clear_cache: removing perplexity cache at {cache_file}")
+            os.remove(cache_file)
+            print("  Cache cleared. Texts will be regenerated.")
+        else:
+            print(f"--clear_cache: no existing cache file at {cache_file}")
+
     try:
         preLM, cbl = load_model_and_cbl(
             peft_path, cbl_path, config, concept_set, tokenizer,
@@ -212,11 +229,16 @@ def process_run(
 def main():
     args = parser.parse_args()
     
-    # Load run IDs from pickle file
-    with open(args.run_ids_pickle, 'rb') as f:
-        run_ids = pickle.load(f)
-    
-    print(f"Loaded {len(run_ids)} run IDs from {args.run_ids_pickle}")
+    if args.run_id is not None:
+        run_ids = [args.run_id]
+        print(f"Using single run ID: {args.run_id}")
+    elif args.run_ids_pickle is not None:
+        with open(args.run_ids_pickle, 'rb') as f:
+            run_ids = pickle.load(f)
+        print(f"Loaded {len(run_ids)} run IDs from {args.run_ids_pickle}")
+    else:
+        parser.error("Must provide either --run_id or --run_ids_pickle")
+
     print(f"Run IDs: {run_ids}")
     
     print(f"Expected dataset: {args.dataset}")
@@ -239,6 +261,7 @@ def main():
                 perplexity_n_samples=args.perplexity_n_samples,
                 run_idx=idx,
                 total_runs=total_runs,
+                clear_cache=args.clear_cache,
             )
             all_results[run_id] = results
         except Exception as e:

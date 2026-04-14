@@ -20,6 +20,8 @@ except ImportError:
     import config as CFG
 from transformers import LlamaConfig, AutoTokenizer
 
+import shutil
+
 from steerability_cache import save_all_steerability_texts, steerability_output_root
 from eval_metrics import (
     RM_LOGIT_CLIP_MIN,
@@ -49,6 +51,7 @@ def process_run(
     total_runs=None,
     interventions_per_batch=1,
     use_label_concepts=False,
+    clear_cache=False,
 ):
     set_seed(seed)
 
@@ -129,6 +132,11 @@ def process_run(
 
     steer_dir = steerability_output_root(ckpt_prefix, best_epoch, is_low_score)
     print(f"Steerability sample cache: {steer_dir}")
+
+    if clear_cache and os.path.isdir(steer_dir):
+        print(f"--clear_cache: removing steerability cache at {steer_dir}")
+        shutil.rmtree(steer_dir)
+        print("  Cache cleared. Texts will be regenerated.")
 
     if arch_type is not None:
         discrimination_loss_for_loading = 1.0 if arch_type == "non_residual" else 0.0
@@ -235,7 +243,8 @@ def main():
     parser = argparse.ArgumentParser(
         description="Resume wandb runs; log RM logits clipped to [-100,100] (relevance / grammar / together) on steerability samples."
     )
-    parser.add_argument("--run_ids_pickle", type=str, required=True, help="Pickle file with list of wandb run IDs")
+    parser.add_argument("--run_ids_pickle", type=str, default=None, help="Pickle file with list of wandb run IDs")
+    parser.add_argument("--run_id", type=str, default=None, help="Single wandb run ID (alternative to --run_ids_pickle)")
     parser.add_argument("--wandb_project", type=str, default="cbm-generation-new")
     parser.add_argument("--wandb_entity", type=str, default=None)
     parser.add_argument(
@@ -279,12 +288,23 @@ def main():
         default="cuda" if torch.cuda.is_available() else "cpu",
         help="Device for the reward model (e.g. cuda:1).",
     )
+    parser.add_argument(
+        "--clear_cache",
+        action="store_true",
+        help="Delete cached steerability texts and regenerate from scratch.",
+    )
     args = parser.parse_args()
 
-    with open(args.run_ids_pickle, "rb") as f:
-        run_ids = pickle.load(f)
+    if args.run_id is not None:
+        run_ids = [args.run_id]
+        print(f"Using single run ID: {args.run_id}")
+    elif args.run_ids_pickle is not None:
+        with open(args.run_ids_pickle, "rb") as f:
+            run_ids = pickle.load(f)
+        print(f"Loaded {len(run_ids)} run IDs from {args.run_ids_pickle}")
+    else:
+        parser.error("Must provide either --run_id or --run_ids_pickle")
 
-    print(f"Loaded {len(run_ids)} run IDs from {args.run_ids_pickle}")
     print(f"Run IDs: {run_ids}")
     if args.dataset is not None:
         print("Note: --dataset is ignored; using each run's W&B config['dataset'].")
@@ -316,6 +336,7 @@ def main():
                 total_runs=total_runs,
                 interventions_per_batch=args.interventions_per_batch,
                 use_label_concepts=args.use_label_concepts,
+                clear_cache=args.clear_cache,
             )
             all_results[run_id] = out
         except Exception as e:
