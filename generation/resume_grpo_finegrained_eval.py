@@ -506,7 +506,7 @@ def process_run(run_id, classifier_suffixes, seed, wandb_project, wandb_entity=N
     try:
         preLM, cbl = load_model_and_cbl(
             peft_path, cbl_path, config, concept_set, tokenizer,
-            discrimination_loss_for_loading, residual_dim
+            discrimination_loss_for_loading, residual_dim, device
         )
 
         if perplexity_only:
