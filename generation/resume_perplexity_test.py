@@ -102,9 +102,9 @@ def process_run(
     print(f"Dataset: {dataset}, Perplexity seed: {seed}")
     
     # Validate dataset matches what we expect
-    if dataset != expected_dataset:
-        print(f"SKIPPING run {run_id}: dataset mismatch. Run used '{dataset}' but expected '{expected_dataset}'.")
-        return
+    # if dataset != expected_dataset:
+    #     print(f"SKIPPING run {run_id}: dataset mismatch. Run used '{dataset}' but expected '{expected_dataset}'.")
+    #     return
     
     # Detect run layout and checkpoint prefix
     run_type, ckpt_prefix = infer_run_layout(run_id, dataset, run_config)
