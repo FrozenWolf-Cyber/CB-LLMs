@@ -4,6 +4,40 @@ from transformers import PreTrainedModel, GPT2Config, GPT2Model, GPT2TokenizerFa
 import torch.nn.functional as F
 from utils import top_k_top_p_filtering, top_k_top_p_filtering_batched
 
+
+def _safe_multinomial_from_logits(filtered_logits: torch.Tensor) -> torch.Tensor:
+    """Sample from logits robustly.
+
+    Prevents CUDA device-side asserts in ``torch.multinomial`` when the
+    probability tensor contains NaN/Inf or sums to zero (e.g. all tokens were
+    filtered to -inf).
+    """
+    # Fast path: identical to the original code when it is well-defined.
+    probs_orig = torch.softmax(filtered_logits, dim=-1)
+    denom_orig = probs_orig.sum(dim=-1)
+    if torch.isfinite(probs_orig).all() and torch.isfinite(denom_orig).all() and (denom_orig > 0).all():
+        return torch.multinomial(probs_orig, num_samples=1)
+
+    # Fallback: sanitize probabilities to avoid device-side asserts.
+    logits_f = filtered_logits.float()
+    probs = torch.softmax(logits_f, dim=-1)
+    probs = torch.where(torch.isfinite(probs), probs, torch.zeros_like(probs))
+    probs = torch.clamp(probs, min=0.0)
+
+    denom = probs.sum(dim=-1, keepdim=True)
+    safe_denom = torch.where(torch.isfinite(denom), denom, torch.zeros_like(denom))
+    probs = probs / safe_denom.clamp_min(1e-20)
+
+    bad_rows = (safe_denom <= 0).squeeze(-1)
+    if bad_rows.any():
+        safe_logits = torch.where(torch.isfinite(logits_f), logits_f, torch.full_like(logits_f, -1e9))
+        argmax = torch.argmax(safe_logits, dim=-1, keepdim=True)
+        one_hot = torch.zeros_like(probs)
+        one_hot.scatter_(-1, argmax, 1.0)
+        probs = torch.where(bad_rows.unsqueeze(-1), one_hot, probs)
+
+    return torch.multinomial(probs, num_samples=1)
+
 class Roberta_classifier(nn.Module):
     def __init__(self, class_num):
         super().__init__()
@@ -73,7 +107,7 @@ class Llama_baseline_generation(nn.Module):
             logits[:, -1, ids[0]] = score
             next_token_logits = logits[:, -1, :] / temp
             filtered_logits = top_k_top_p_filtering(next_token_logits, top_k=topk, top_p=topp)
-            next_token = torch.multinomial(F.softmax(filtered_logits, dim=-1), num_samples=1)
+            next_token = _safe_multinomial_from_logits(filtered_logits)
             ids = torch.cat((ids, next_token), dim=-1)
             if eos_token_id is not None and next_token.item() == eos_token_id:
                 break
@@ -130,7 +164,7 @@ class CBL(nn.Module):
             logits[:, -1, ids[0]] = score
             next_token_logits = logits[:, -1, :] / temp
             filtered_logits = top_k_top_p_filtering(next_token_logits, top_k=topk, top_p=topp)
-            next_token = torch.multinomial(F.softmax(filtered_logits, dim=-1), num_samples=1)
+            next_token = _safe_multinomial_from_logits(filtered_logits)
             ids = torch.cat((ids, next_token), dim=-1)
             if eos_token_id is not None and next_token.item() == eos_token_id:
                 break
@@ -189,7 +223,7 @@ class CBL(nn.Module):
                     logits[b, -1, ids[b]] = score
             next_token_logits = logits[:, -1, :] / temp  # (B, vocab_size)
             filtered_logits = top_k_top_p_filtering_batched(next_token_logits.clone(), top_k=topk, top_p=topp)
-            next_token = torch.multinomial(F.softmax(filtered_logits, dim=-1), num_samples=1)  # (B, 1)
+            next_token = _safe_multinomial_from_logits(filtered_logits)  # (B, 1)
             next_token[finished] = eos_token_id
             ids = torch.cat((ids, next_token), dim=-1)
             if eos_token_id is not None:
@@ -274,7 +308,7 @@ class CBL(nn.Module):
                     logits[b, -1, ids[b]] = score
             next_token_logits = logits[:, -1, :] / temp
             filtered_logits = top_k_top_p_filtering_batched(next_token_logits.clone(), top_k=topk, top_p=topp)
-            next_token = torch.multinomial(F.softmax(filtered_logits, dim=-1), num_samples=1)
+            next_token = _safe_multinomial_from_logits(filtered_logits)
             next_token[finished] = eos_token_id
             ids = torch.cat((ids, next_token), dim=-1)
             if eos_token_id is not None:
@@ -340,7 +374,7 @@ class CBLResidual(nn.Module):
             logits[:, -1, ids[0]] = score
             next_token_logits = logits[:, -1, :] / temp
             filtered_logits = top_k_top_p_filtering(next_token_logits, top_k=topk, top_p=topp)
-            next_token = torch.multinomial(F.softmax(filtered_logits, dim=-1), num_samples=1)
+            next_token = _safe_multinomial_from_logits(filtered_logits)
             ids = torch.cat((ids, next_token), dim=-1)
             if eos_token_id is not None and next_token.item() == eos_token_id:
                 break
@@ -399,7 +433,7 @@ class CBLResidual(nn.Module):
                     logits[b, -1, ids[b]] = score
             next_token_logits = logits[:, -1, :] / temp  # (B, vocab_size)
             filtered_logits = top_k_top_p_filtering_batched(next_token_logits.clone(), top_k=topk, top_p=topp)
-            next_token = torch.multinomial(F.softmax(filtered_logits, dim=-1), num_samples=1)  # (B, 1)
+            next_token = _safe_multinomial_from_logits(filtered_logits)  # (B, 1)
             next_token[finished] = eos_token_id
             ids = torch.cat((ids, next_token), dim=-1)
             if eos_token_id is not None:
@@ -484,7 +518,7 @@ class CBLResidual(nn.Module):
                     logits[b, -1, ids[b]] = score
             next_token_logits = logits[:, -1, :] / temp
             filtered_logits = top_k_top_p_filtering_batched(next_token_logits.clone(), top_k=topk, top_p=topp)
-            next_token = torch.multinomial(F.softmax(filtered_logits, dim=-1), num_samples=1)
+            next_token = _safe_multinomial_from_logits(filtered_logits)
             next_token[finished] = eos_token_id
             ids = torch.cat((ids, next_token), dim=-1)
             if eos_token_id is not None:
