@@ -53,6 +53,11 @@ parser.add_argument(
     action="store_true",
     help="Delete cached perplexity texts and regenerate from scratch.",
 )
+parser.add_argument(
+    "--no_wandb",
+    action="store_true",
+    help="Disable wandb logging (skip resume, all wandb.log calls become no-ops).",
+)
 
 
 def process_run(
@@ -65,6 +70,7 @@ def process_run(
     run_idx=None,
     total_runs=None,
     clear_cache=False,
+    no_wandb=False,
 ):
     """
     Process a single wandb run: load config, load best checkpoint, generate cached texts,
@@ -140,12 +146,15 @@ def process_run(
     print(f"Concept len: {len(concept_set)}")
     print(f"Perplexity n_samples: {perplexity_n_samples}")
 
-    wandb.init(
-        project=wandb_project,
-        entity=wandb_entity,
-        id=run_id,
-        resume="must"
-    )
+    if no_wandb:
+        wandb.init(mode="disabled")
+    else:
+        wandb.init(
+            project=wandb_project,
+            entity=wandb_entity,
+            id=run_id,
+            resume="must"
+        )
     
     # Run perplexity evaluation (single selected checkpoint) and log keys exactly as training scripts
     results = {}
@@ -262,6 +271,7 @@ def main():
                 run_idx=idx,
                 total_runs=total_runs,
                 clear_cache=args.clear_cache,
+                no_wandb=args.no_wandb,
             )
             all_results[run_id] = results
         except Exception as e:

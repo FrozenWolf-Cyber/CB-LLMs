@@ -52,6 +52,7 @@ def process_run(
     interventions_per_batch=1,
     use_label_concepts=False,
     clear_cache=False,
+    no_wandb=False,
 ):
     set_seed(seed)
 
@@ -119,12 +120,15 @@ def process_run(
     rm_device = torch.device(rm_device_str)
     rm_model, rm_tokenizer = load_reward_model(rm_model_name, rm_device)
 
-    wandb.init(
-        project=wandb_project,
-        entity=wandb_entity,
-        id=run_id,
-        resume="must",
-    )
+    if no_wandb:
+        wandb.init(mode="disabled")
+    else:
+        wandb.init(
+            project=wandb_project,
+            entity=wandb_entity,
+            id=run_id,
+            resume="must",
+        )
 
     results = {}
     print(f"\nRM steerability benchmark — epoch {best_epoch} (logits clipped to [{RM_LOGIT_CLIP_MIN}, {RM_LOGIT_CLIP_MAX}], no min-max)")
@@ -293,6 +297,11 @@ def main():
         action="store_true",
         help="Delete cached steerability texts and regenerate from scratch.",
     )
+    parser.add_argument(
+        "--no_wandb",
+        action="store_true",
+        help="Disable wandb logging (skip resume, all wandb.log calls become no-ops).",
+    )
     args = parser.parse_args()
 
     if args.run_id is not None:
@@ -337,6 +346,7 @@ def main():
                 interventions_per_batch=args.interventions_per_batch,
                 use_label_concepts=args.use_label_concepts,
                 clear_cache=args.clear_cache,
+                no_wandb=args.no_wandb,
             )
             all_results[run_id] = out
         except Exception as e:
