@@ -2,16 +2,15 @@
 Resume wandb runs and score steerability generations with a Skywork-style RM for benchmarking.
 
 Uses the same chat templates / user prompts as train_grpo_finegrained_llm (relevance, grammar,
-combined), but **no batch min–max**: metrics are sequence-classification logits **clipped to
+combined), but **no batch min-max**: metrics are sequence-classification logits **clipped to
 [-100, 100]**, then averaged across all generated trajectories (logged per criterion as ``rm_*``).
 
-Mirrors resume_steerability_test.py for checkpoint discovery, generation, and wandb resume.
+All evaluation logic is centralized in eval_metrics.py.
 """
 import argparse
 import os
 import pickle
 
-import numpy as np
 import torch
 import wandb
 
@@ -19,175 +18,21 @@ try:
     import config_finegrained as CFG
 except ImportError:
     import config as CFG
-from transformers import AutoModelForSequenceClassification, AutoTokenizer, LlamaConfig
+from transformers import LlamaConfig, AutoTokenizer
 
 from steerability_cache import save_all_steerability_texts, steerability_output_root
-from resume_steerability_test import (
+from eval_metrics import (
+    RM_LOGIT_CLIP_MIN,
+    RM_LOGIT_CLIP_MAX,
     find_eval_checkpoint,
     generate_steerability_texts,
     get_llama_vocab_weight,
     infer_run_layout,
     load_model_and_cbl,
+    load_reward_model,
+    run_rm_metrics,
     set_seed,
 )
-
-# Same user turns as train_grpo_finegrained_llm.compute_reward_model_scores (for comparability).
-RM_USER_RELEVANCE = "Write a text about the concept: {concept_name}"
-RM_USER_GRAMMAR = "Write a grammatically correct and fluent paragraph."
-RM_USER_TOGETHER = "Write a grammatically correct and fluent text about the concept: {concept_name}"
-
-RM_LOGIT_CLIP_MIN = -100.0
-RM_LOGIT_CLIP_MAX = 100.0
-
-
-def _make_formatted(rm_tokenizer, user_turn: str, response_text: str, max_text_len: int) -> str:
-    conv = [
-        {"role": "user", "content": user_turn},
-        {"role": "assistant", "content": response_text[:max_text_len]},
-    ]
-    formatted = rm_tokenizer.apply_chat_template(conv, tokenize=False)
-    if rm_tokenizer.bos_token and formatted.startswith(rm_tokenizer.bos_token):
-        formatted = formatted[len(rm_tokenizer.bos_token) :]
-    return formatted
-
-
-def _raw_logits_for_texts(
-    rm_model,
-    rm_tokenizer,
-    texts,
-    user_turn: str,
-    device: torch.device,
-    rm_batch_size: int,
-    max_text_len: int,
-):
-    """Single RM criterion: one user prompt for all texts; returns logits[:, 0] clipped to [-100, 100]."""
-    if not texts:
-        return []
-    formatted = [_make_formatted(rm_tokenizer, user_turn, t, max_text_len) for t in texts]
-    chunk = rm_batch_size if rm_batch_size > 0 else len(formatted)
-    all_scores = []
-    for start in range(0, len(formatted), chunk):
-        chunk_list = formatted[start : start + chunk]
-        tokenized = rm_tokenizer(
-            chunk_list,
-            return_tensors="pt",
-            padding=True,
-            truncation=True,
-            max_length=2048,
-        ).to(device)
-        with torch.no_grad():
-            logits = rm_model(**tokenized).logits
-        clipped = logits[:, 0].float().clamp(RM_LOGIT_CLIP_MIN, RM_LOGIT_CLIP_MAX)
-        all_scores.extend(clipped.detach().cpu().tolist())
-        del tokenized, logits
-    return all_scores
-
-
-def load_reward_model(rm_model_name: str, rm_device: torch.device):
-    """Load Skywork-style sequence classification RM (same loader as train_grpo_finegrained_llm)."""
-    print(f"Loading reward model: {rm_model_name} ...")
-    rm_tokenizer = AutoTokenizer.from_pretrained(rm_model_name)
-    _kwargs = dict(torch_dtype=torch.bfloat16, num_labels=1)
-    try:
-        rm_model = AutoModelForSequenceClassification.from_pretrained(
-            rm_model_name,
-            attn_implementation="flash_attention_2",
-            **_kwargs,
-        )
-        print("  Loaded RM with flash_attention_2.")
-    except Exception as fa2_err:
-        print(f"  flash_attention_2 unavailable ({fa2_err}), falling back to eager attention.")
-        rm_model = AutoModelForSequenceClassification.from_pretrained(rm_model_name, **_kwargs)
-    rm_model.eval()
-    for p in rm_model.parameters():
-        p.requires_grad = False
-    rm_model.to(rm_device)
-    print(f"  RM device: {rm_device}")
-    return rm_model, rm_tokenizer
-
-
-def run_rm_metrics_from_texts(
-    decoded_texts_by_concept,
-    concept_set,
-    rm_model,
-    rm_tokenizer,
-    rm_device,
-    rm_batch_size,
-    rm_max_text_len,
-):
-    """
-    For each concept, score generations under three RM prompts (relevance, grammar, together).
-    Logits are clipped to [RM_LOGIT_CLIP_MIN, RM_LOGIT_CLIP_MAX]; global metrics = mean (and std) over all trajectories.
-    """
-    all_rel, all_gram, all_tog = [], [], []
-    per_concept = {}
-
-    for concept_idx, concept_name in enumerate(concept_set):
-        texts = decoded_texts_by_concept[concept_idx] if concept_idx < len(decoded_texts_by_concept) else []
-        if not texts:
-            per_concept[concept_name] = {
-                "n": 0,
-                "rm_relevance_mean": float("nan"),
-                "rm_grammar_mean": float("nan"),
-                "rm_together_mean": float("nan"),
-            }
-            continue
-
-        u_rel = RM_USER_RELEVANCE.format(concept_name=concept_name)
-        u_tog = RM_USER_TOGETHER.format(concept_name=concept_name)
-
-        rel = _raw_logits_for_texts(
-            rm_model, rm_tokenizer, texts, u_rel, rm_device, rm_batch_size, rm_max_text_len
-        )
-        gram = _raw_logits_for_texts(
-            rm_model, rm_tokenizer, texts, RM_USER_GRAMMAR, rm_device, rm_batch_size, rm_max_text_len
-        )
-        tog = _raw_logits_for_texts(
-            rm_model, rm_tokenizer, texts, u_tog, rm_device, rm_batch_size, rm_max_text_len
-        )
-
-        all_rel.extend(rel)
-        all_gram.extend(gram)
-        all_tog.extend(tog)
-
-        per_concept[concept_name] = {
-            "n": len(texts),
-            "rm_relevance_mean": float(np.mean(rel)) if rel else float("nan"),
-            "rm_grammar_mean": float(np.mean(gram)) if gram else float("nan"),
-            "rm_together_mean": float(np.mean(tog)) if tog else float("nan"),
-        }
-
-        for b, (t, r, g, o) in enumerate(zip(texts, rel, gram, tog)):
-            wandb.log(
-                {
-                    f"rm_sample_{concept_name}_{b + 1}": t,
-                    f"rm_relevance_logit_{concept_name}_{b + 1}": r,
-                    f"rm_grammar_logit_{concept_name}_{b + 1}": g,
-                    f"rm_together_logit_{concept_name}_{b + 1}": o,
-                }
-            )
-
-    def _ms(xs):
-        if not xs:
-            return float("nan"), 0.0
-        a = np.array(xs, dtype=np.float64)
-        return float(a.mean()), float(a.std()) if a.size > 1 else 0.0
-
-    r_m, r_s = _ms(all_rel)
-    g_m, g_s = _ms(all_gram)
-    t_m, t_s = _ms(all_tog)
-    n = len(all_rel)
-
-    return {
-        "rm_relevance_mean": r_m,
-        "rm_relevance_std": r_s,
-        "rm_grammar_mean": g_m,
-        "rm_grammar_std": g_s,
-        "rm_together_mean": t_m,
-        "rm_together_std": t_s,
-        "rm_total_n": n,
-        "per_concept": per_concept,
-    }
 
 
 def process_run(
@@ -237,6 +82,8 @@ def process_run(
     add_llama_logits = bool(run_config.get("add_llama_logits", False))
     print(f"Add llama logits: {add_llama_logits}")
 
+    gen_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
     run_type, ckpt_prefix = infer_run_layout(run_id, dataset, run_config)
     if run_type is None or ckpt_prefix is None:
         print(f"Could not infer checkpoint layout for run {run_id}")
@@ -277,7 +124,7 @@ def process_run(
     )
 
     results = {}
-    print(f"\nRM steerability benchmark — epoch {best_epoch} (logits clipped to [{RM_LOGIT_CLIP_MIN}, {RM_LOGIT_CLIP_MAX}], no min–max)")
+    print(f"\nRM steerability benchmark — epoch {best_epoch} (logits clipped to [{RM_LOGIT_CLIP_MIN}, {RM_LOGIT_CLIP_MAX}], no min-max)")
     print(f"  rm_batch_size={rm_batch_size} max_text_len={rm_max_text_len}")
 
     steer_dir = steerability_output_root(ckpt_prefix, best_epoch, is_low_score)
@@ -297,15 +144,17 @@ def process_run(
             tokenizer,
             discrimination_loss_for_loading,
             residual_dim,
+            gen_device,
         )
 
-        llama_vocab_weight = get_llama_vocab_weight() if add_llama_logits else None
+        llama_vocab_weight = get_llama_vocab_weight(gen_device) if add_llama_logits else None
         decoded_texts_by_concept = generate_steerability_texts(
             preLM,
             cbl,
             tokenizer,
             concept_set,
             dataset,
+            gen_device,
             samples_per_concept=n_samples,
             print_k=3,
             llama_vocab_weight=llama_vocab_weight,
@@ -314,7 +163,7 @@ def process_run(
             interventions_per_batch=interventions_per_batch,
         )
 
-        metrics = run_rm_metrics_from_texts(
+        metrics = run_rm_metrics(
             decoded_texts_by_concept,
             concept_set,
             rm_model,
@@ -324,20 +173,7 @@ def process_run(
             rm_max_text_len=rm_max_text_len,
         )
 
-        print(
-            f"  rm_relevance_mean={metrics['rm_relevance_mean']:.4f} "
-            f"rm_grammar_mean={metrics['rm_grammar_mean']:.4f} "
-            f"rm_together_mean={metrics['rm_together_mean']:.4f} (n={metrics['rm_total_n']})"
-        )
-
         log_payload = {
-            "rm_relevance_mean": metrics["rm_relevance_mean"],
-            "rm_relevance_std": metrics["rm_relevance_std"],
-            "rm_grammar_mean": metrics["rm_grammar_mean"],
-            "rm_grammar_std": metrics["rm_grammar_std"],
-            "rm_together_mean": metrics["rm_together_mean"],
-            "rm_together_std": metrics["rm_together_std"],
-            "rm_total_n": metrics["rm_total_n"],
             "rm_metric_epoch": best_epoch,
             "rm_metric_run_type": run_type,
             "rm_metric_low_score_checkpoint": is_low_score,
@@ -412,8 +248,8 @@ def main():
     parser.add_argument(
         "--samples_per_concept",
         type=int,
-        default=None,
-        help="Steerability samples per concept. If omitted, max(1, 100 // num_concepts).",
+        default=50,
+        help="Steerability samples per concept. Default 50.",
     )
     parser.add_argument(
         "--rm_model_name",
@@ -426,8 +262,8 @@ def main():
     parser.add_argument(
         "--interventions_per_batch",
         type=int,
-        default=4,
-        help="Number of concept interventions to batch together during generation. (default: 4)",
+        default=50,
+        help="Number of concept interventions to batch together during generation. (default: 50)",
     )
     parser.add_argument(
         "--use_label_concepts",

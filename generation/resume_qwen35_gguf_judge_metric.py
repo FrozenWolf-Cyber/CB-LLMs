@@ -83,12 +83,13 @@ from steerability_cache import (
     sanitize_concept_slug,
     steerability_output_root,
 )
-from resume_steerability_test import (
+from eval_metrics import (
     find_eval_checkpoint,
     generate_steerability_texts,
     get_llama_vocab_weight,
     infer_run_layout,
     load_model_and_cbl,
+    release_llama_vocab_weight,
     set_seed,
 )
 
@@ -164,17 +165,8 @@ def write_judge_reasoning_log(
 
 
 def _release_generation_vram():
-    """Drop cached Llama lm_head weights from resume_steerability_test and clear CUDA cache."""
-    import resume_steerability_test as rst
-
-    rst._CACHED_LLAMA_VOCAB_WEIGHT = None
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        try:
-            torch.cuda.ipc_collect()
-        except Exception:
-            pass
+    """Drop cached Llama lm_head weights from eval_metrics and clear CUDA cache."""
+    release_llama_vocab_weight()
 
 
 def parse_score_1_to_10(assistant_text: str):
@@ -468,10 +460,6 @@ def process_run(
     wandb.init(project=wandb_project, entity=wandb_entity, id=run_id, resume="must")
 
     gen_device = torch.device(gen_device_str)
-    # resume_steerability_test uses module-level `device` for generation
-    import resume_steerability_test as rst
-
-    rst.device = gen_device
 
     config = LlamaConfig.from_pretrained("meta-llama/Meta-Llama-3-8B")
     tokenizer = AutoTokenizer.from_pretrained("meta-llama/Meta-Llama-3-8B")
@@ -495,15 +483,16 @@ def process_run(
     try:
         print(f"\n[Phase 1] Generation on {gen_device} — epoch {best_epoch}")
         preLM, cbl = load_model_and_cbl(
-            peft_path, cbl_path, config, concept_set, tokenizer, d_load, residual_dim
+            peft_path, cbl_path, config, concept_set, tokenizer, d_load, residual_dim, gen_device,
         )
-        llama_vocab_weight = get_llama_vocab_weight() if add_llama_logits else None
+        llama_vocab_weight = get_llama_vocab_weight(gen_device) if add_llama_logits else None
         decoded_texts_by_concept = generate_steerability_texts(
             preLM,
             cbl,
             tokenizer,
             concept_set,
             dataset,
+            gen_device,
             samples_per_concept=n_samples,
             print_k=3,
             llama_vocab_weight=llama_vocab_weight,
@@ -651,8 +640,8 @@ def main():
     p.add_argument(
         "--samples_per_concept",
         type=int,
-        default=None,
-        help="Steerability samples per concept. If omitted, max(1, 100 // num_concepts).",
+        default=50,
+        help="Steerability samples per concept. Default 50.",
     )
     p.add_argument(
         "--judge_gguf_path",
@@ -717,8 +706,8 @@ def main():
     p.add_argument(
         "--interventions_per_batch",
         type=int,
-        default=4,
-        help="Number of concept interventions to batch together during generation. (default: 4)",
+        default=50,
+        help="Number of concept interventions to batch together during generation. (default: 50)",
     )
     args = p.parse_args()
 

@@ -28,6 +28,7 @@ Usage:
 """
 import argparse
 import os
+import gc
 import torch
 import torch.nn.functional as F
 import numpy as np
@@ -41,15 +42,24 @@ from modules import CBLResidual, CBL, Roberta_classifier
 import time
 from module_intervention import amplify_intervention
 from utils import elastic_net_penalty, mean_pooling, eos_pooling
+from steerability_cache import save_all_steerability_texts, steerability_output_root
+from eval_metrics import (
+    set_seed,
+    get_intervention_value,
+    generate_steerability_texts,
+    run_steerability_roberta,
+    run_steerability_mpnet,
+    run_concept_accuracy_labels,
+    run_weight_analysis,
+    generate_perplexity_texts,
+    compute_perplexity,
+    load_reward_model,
+    run_rm_metrics,
+)
 import wandb
 import glob
 import copy
 
-def set_seed(seed):
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    np.random.seed(seed)
-    
 
 parser = argparse.ArgumentParser()
 
@@ -84,6 +94,17 @@ parser.add_argument("--grpo_lr", type=float, default=1e-5, help="Learning rate f
 parser.add_argument("--grpo_steps_per_epoch", type=int, default=-1, help="Max GRPO steps per epoch. -1 = full dataset.")
 parser.add_argument("--concept_distill_weight", type=float, default=0.0, help="Weight for concept prediction distillation loss (CE between policy and reference model concepts on real data). 0 disables it.")
 
+# ---- Evaluation hyperparameters ----
+parser.add_argument("--samples_per_concept", type=int, default=50,
+                    help="Steerability samples per concept. Default 50.")
+parser.add_argument("--rm_model_name", type=str, default="Skywork/Skywork-Reward-V2-Llama-3.1-8B",
+                    help="Reward model for RM evaluation.")
+parser.add_argument("--rm_batch_size", type=int, default=4,
+                    help="Batch size for RM evaluation.")
+parser.add_argument("--rm_max_text_len", type=int, default=1024,
+                    help="Max text length for RM evaluation.")
+parser.add_argument("--skip_rm", action="store_true",
+                    help="Skip RM reward evaluation after training.")
 
 class ClassificationDataset(torch.utils.data.Dataset):
     def __init__(self, encoded_text):
@@ -706,172 +727,95 @@ if __name__ == "__main__":
     end = time.time()
     print("time of GRPO training:", (end - start) / 3600, "hours")
     
-    ## delete previous models to save space
-    import gc
+    # ── Cleanup training models ──
     del ref_preLM, ref_cbl
     del opt_prelm, opt_cbl
-    torch.cuda.empty_cache()
+    for clf in grpo_classifiers:
+        del clf
+    del grpo_classifiers
     gc.collect()
-    
-    ## Load last epoch for evaluation
+    torch.cuda.empty_cache()
+
+    # ── Load best (latest) epoch for evaluation ──
     best_epoch = epochs
-    preLM_eval = LlamaModel.from_pretrained('meta-llama/Meta-Llama-3-8B', torch_dtype=torch.bfloat16).to(device)
+    preLM = LlamaModel.from_pretrained('meta-llama/Meta-Llama-3-8B', torch_dtype=torch.bfloat16).to(device)
     peft_path_eval = prefix + model_name + "_epoch_" + str(best_epoch)
-    preLM_eval.load_adapter(peft_path_eval)
-    preLM_eval.eval()
+    preLM.load_adapter(peft_path_eval)
+    preLM.eval()
     if args.arch_type == "non_residual":
-        cbl_eval = CBL(config, len(concept_set), tokenizer).to(device)
+        cbl = CBL(config, len(concept_set), tokenizer).to(device)
     else:
-        cbl_eval = CBLResidual(config, len(concept_set), args.residual_dim, tokenizer).to(device)
-    cbl_eval.load_state_dict(torch.load(prefix + cbl_name + "_epoch_" + str(best_epoch) + ".pt", map_location=device), strict=False)
-    cbl_eval.eval()
+        cbl = CBLResidual(config, len(concept_set), args.residual_dim, tokenizer).to(device)
+    cbl.load_state_dict(torch.load(prefix + cbl_name + "_epoch_" + str(best_epoch) + ".pt", map_location=device), strict=False)
+    cbl.eval()
 
-    # Use the eval models for all subsequent tests
-    preLM = preLM_eval
-    cbl = cbl_eval
-        
-    
-    
-    
-    ### TEST STEERABILITY AFTER TRAINING
-
-    
-    roberta_tokenizer = RobertaTokenizerFast.from_pretrained('roberta-base')
-    classifier_path = args.dataset.replace('/', '_') + "_classifier.pt"
-    ## this is default.
-    
-    classifier_paths = [classifier_path]
-    ### three more classifiers with different random seeds for training
+    # ── Configure evaluation ──
+    n_samples = (
+        max(1, args.samples_per_concept)
+        if args.samples_per_concept is not None
+        else max(1, 100 // len(concept_set))
+    )
+    steer_root = steerability_output_root(os.path.normpath(prefix.rstrip("/")), best_epoch, False)
     classifier_suffixes = [s.strip() for s in args.classifier_weight_suffixes.split(',')]
-    print(f"Classifier weight suffixes to test: {classifier_suffixes}")
-    for suffix in classifier_suffixes:
-        classifier_paths.append(args.dataset.replace('/', '_') + f"_classifier{suffix}.pt")
-    
-    for clf_idx, classifier_path in enumerate(classifier_paths):
-        print(f"Testing steerability with classifier weights from: {classifier_path}")
-        classifier = Roberta_classifier(len(concept_set)).to(device)
-        classifier.load_state_dict(torch.load(classifier_path, map_location=device))
-        classifier.eval()
 
-        set_seed(args.seed)
-
-        if args.dataset == "dbpedia_14":
-            intervention_value = 150
-        else:
-            intervention_value = 100
-        pred = []
-        text = []
-        acc = evaluate.load("accuracy")
-        with torch.no_grad():
-            for i in tqdm(range(100 // len(concept_set))):
-                print("example", str(i), end="\r")
-                with torch.no_grad():
-                    input_ids = torch.tensor([tokenizer.encode("")]).to(device)
-                    for j in range(len(concept_set)):
-                        v = [0] * len(concept_set)
-                        v[j] = intervention_value
-                        text_ids, _ = cbl.generate(input_ids, preLM, intervene=v)
-                        decoded_text_ids = tokenizer.decode(text_ids[0][~torch.isin(text_ids[0], torch.tensor([128000, 128001]).to(device))])
-                        wandb.log({f"steerability_sample_{concept_set[j]}_{i+1}": decoded_text_ids})
-                        text.append(decoded_text_ids)
-                        roberta_text_ids = torch.tensor([roberta_tokenizer.encode(decoded_text_ids)]).to(device)
-                        roberta_input = {"input_ids": roberta_text_ids, "attention_mask": torch.tensor([[1]*roberta_text_ids.shape[1]]).to(device)}
-                        logits = classifier(roberta_input)
-                        pred.append(logits)
-            pred = torch.cat(pred, dim=0).detach().cpu()
-            pred = np.argmax(pred.numpy(), axis=-1)
-            acc.add_batch(predictions=pred, references=list(range(len(concept_set)))*(100 // len(concept_set)))
-
-        print("Steerability test accuracy:")
-        acc = acc.compute()
-        if clf_idx == 0:
-            wandb.log({"steerability_test_accuracy": acc})
-        else:
-            wandb.log({f"steerability_test_accuracy_{clf_idx}": acc})
-        print(acc)
-    
-    
-    
-    
-    ### TEST CONCEPT PREDICTION AFTER TRAINING
-    print("eval concepts...")
-    metric = evaluate.load("accuracy")
-    concept_predictions = []
-    for batch in tqdm(test_loader, total=len(test_loader)):
-        batch = {k: v.to(device) for k, v in batch.items()}
-        with torch.no_grad():
-            features = preLM(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"]).last_hidden_state
-            concepts, _, _, _ = cbl(features.float())
-        concept_predictions.append(eos_pooling(concepts, batch["attention_mask"]))
-    concept_predictions = torch.cat(concept_predictions, dim=0).detach().cpu()
-    pred = np.argmax(concept_predictions.numpy(), axis=-1)
-    metric.add_batch(predictions=pred, references=encoded_test_dataset["label"])
-    print("Concept prediction accuracy:")
-    acc = metric.compute()
-    print(acc)
-    wandb.log({"concept_prediction_accuracy": acc})
-    
-    
-    
-    #### TEST WEIGHT
-    print("Top tokens for each concept neuron:")
-    w = cbl.fc.weight.data[:, :len(concept_set)].T
-    for i in tqdm(range(len(concept_set))):
-        top_values, top_ids = torch.topk(w[i], k=10)
-        print("Neuron: ", concept_set[i])
-        print("Top 10 tokens with highest weight:")
-        for j in range(10):
-            print("Neuron:", concept_set[i], "[",round(float(top_values.detach().cpu()[j]), 3), "]", tokenizer.decode(top_ids[j]))
-
-    print("Sparsity of concept weight matrix:")
-    print((w > 1e-6).count_nonzero() / w.numel())
-    wandb.log({"concept_weight_sparsity": (w > 1e-6).count_nonzero() / w.numel()})
-    
-    
-    
-    #### TEST PERPLEXITY AFTER TRAINING
-    print("Test perplexity after training:")
+    # ── Generate steerability texts (cached) ──
     set_seed(args.seed)
-    
-    pred = []
-    perplexity = evaluate.load("perplexity", module_type="metric")
-    input_ids = torch.tensor([tokenizer.encode("")]).to(device)
-    for i in tqdm(range(100)):
-        print("example", str(i), end="\r")
-        with torch.no_grad():
-            text_ids, _ = cbl.generate(input_ids, preLM)
-            pred.append(tokenizer.decode(text_ids[0], skip_special_tokens=True ))
-            if len(pred[-1].split()) > 30:
-                continue
-            perplexity.add_batch(predictions=[pred[i]])
+    decoded_texts_by_concept = generate_steerability_texts(
+        preLM, cbl, tokenizer, concept_set, args.dataset, device,
+        samples_per_concept=n_samples,
+        steerability_cache_dir=steer_root,
+        steerability_cache_seed=args.seed,
+        interventions_per_batch=50,
+    )
 
-        ## print some generated texts
-    print("Some generated texts:")
-    for i in range(5):
-        print(pred[i])
-    import pickle
-    if "perplexity_text" not in os.listdir("./"):
-        try:
-            os.mkdir("perplexity_text")
-        except:
-            pass
-    pickle.dump(pred, open(f"perplexity_text/{run_name}_generated_texts_{args.seed}.pkl", "wb"))
-    del preLM
-    del cbl
+    # ── Generate perplexity texts (cached) ──
+    ppl_texts = generate_perplexity_texts(
+        cbl, preLM, tokenizer, args.seed, device,
+        cache_dir=prefix, run_name=run_name,
+    )
+
+    # ── Concept prediction accuracy ──
+    run_concept_accuracy_labels(preLM, cbl, test_loader, concept_set, encoded_test_dataset, device)
+
+    # ── Weight analysis ──
+    run_weight_analysis(cbl, concept_set, tokenizer)
+
+    # ── Free model from GPU ──
+    del preLM, cbl
     gc.collect()
     torch.cuda.empty_cache()
 
-    print("Perplexity: (under 30 tokens)")
-    perplexity = perplexity.compute(model_id='meta-llama/Meta-Llama-3-8B', max_length=100)['mean_perplexity']
-    print(perplexity)
-    wandb.log({"perplexity_under_30_tokens": perplexity})
-    
-    print("Now for all tokens:")
-    perplexity = evaluate.load("perplexity", module_type="metric")
-    for p in pred:
-        perplexity.add_batch(predictions=[p])
-    perplexity = perplexity.compute(model_id='meta-llama/Meta-Llama-3-8B', max_length=100)['mean_perplexity']
-    print(perplexity)
-    wandb.log({"perplexity_all_tokens": perplexity})
-        
-    
+    # ── Steerability scoring (RoBERTa classifiers — small models) ──
+    run_steerability_roberta(
+        decoded_texts_by_concept, concept_set, args.dataset, device,
+        classifier_weight_suffixes=classifier_suffixes,
+    )
+
+    # ── Steerability scoring (MPNet cosine similarity top-k) ──
+    intervention_value_eval = get_intervention_value(args.dataset)
+    run_steerability_mpnet(
+        decoded_texts_by_concept, concept_set,
+        intervention_value_eval, args.max_length, device,
+    )
+
+    # ── Perplexity computation (evaluate library loads its own LLM) ──
+    compute_perplexity(ppl_texts)
+
+    # ── RM reward scoring (optional) ──
+    if not args.skip_rm:
+        try:
+            rm_model, rm_tokenizer_rm = load_reward_model(args.rm_model_name, device)
+            run_rm_metrics(
+                decoded_texts_by_concept, concept_set,
+                rm_model, rm_tokenizer_rm, device,
+                rm_batch_size=args.rm_batch_size,
+                rm_max_text_len=args.rm_max_text_len,
+            )
+            del rm_model, rm_tokenizer_rm
+            torch.cuda.empty_cache()
+        except Exception as rm_err:
+            print(f"RM evaluation failed (non-fatal): {rm_err}")
+
+    # ── Save steerability text cache ──
+    save_all_steerability_texts(steer_root, args.seed, concept_set, decoded_texts_by_concept)
+

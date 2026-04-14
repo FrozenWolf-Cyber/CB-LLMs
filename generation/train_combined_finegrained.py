@@ -13,7 +13,19 @@ from modules import CBLResidual, CBL, Roberta_classifier
 import time
 from module_intervention import amplify_intervention
 from utils import elastic_net_penalty, mean_pooling, eos_pooling, get_labels, cos_sim_cubed
-from steerability_cache import load_concept_samples, save_all_steerability_texts, steerability_output_root, write_sample
+from steerability_cache import save_all_steerability_texts, steerability_output_root
+from eval_metrics import (
+    set_seed,
+    get_intervention_value,
+    generate_steerability_texts,
+    run_steerability_mpnet,
+    run_concept_accuracy_cosine,
+    run_weight_analysis,
+    generate_perplexity_texts,
+    compute_perplexity,
+    load_reward_model,
+    run_rm_metrics,
+)
 import wandb
 
 
@@ -49,12 +61,6 @@ def _align_similarity_and_encoded(similarity: np.ndarray, encoded, split_name: s
         "for the original split.)"
     )
     return similarity[:n], _truncate_encoded(encoded, n)
-
-
-def set_seed(seed):
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    np.random.seed(seed)
 
 
 def build_intervened_concepts_from_similarity(
@@ -164,8 +170,8 @@ parser.add_argument("--seed", type=int, default=42)
 parser.add_argument(
     "--samples_per_concept",
     type=int,
-    default=None,
-    help="Steerability evaluation: samples per concept. Default max(1, 100 // num_concepts), same as resume_steerability_test.",
+    default=50,
+    help="Steerability evaluation: samples per concept. Default 50.",
 )
 parser.add_argument(
     "--train_size",
@@ -225,6 +231,11 @@ parser.add_argument(
         "This keeps CBL unchanged (no extra parameters) and acts like a residual-on-logits."
     ),
 )
+parser.add_argument("--rm_model_name", type=str, default="Skywork/Skywork-Reward-V2-Llama-3.1-8B",
+                    help="HF id for sequence-classification reward model.")
+parser.add_argument("--rm_batch_size", type=int, default=0, help="0 = score all texts per chunk in one forward.")
+parser.add_argument("--rm_max_text_len", type=int, default=500)
+parser.add_argument("--skip_rm", action="store_true", help="Skip RM reward evaluation after training.")
 
 
 class ClassificationDataset(torch.utils.data.Dataset):
@@ -751,14 +762,17 @@ if __name__ == "__main__":
     end = time.time()
     print("time of training CBM:", (end - start) / 3600, "hours")
     
-    ## delete previous models to save space
+    ## delete training objects and free GPU before evaluation
     import gc
+    if llama_vocab_weight is not None:
+        del llama_vocab_weight
+        llama_vocab_weight = None
     del preLM, cbl, classifier, opt_prelm, opt_cbl
     
     if args.discrimination_loss > 0:
         del opt_classifier
-    torch.cuda.empty_cache()
     gc.collect()
+    torch.cuda.empty_cache()
     
     ## lOAD BEST MODEL AND
     if best_epoch == -1:
@@ -770,329 +784,84 @@ if __name__ == "__main__":
 
     llama_vocab_weight = None
     if args.add_llama_logits:
-        lm_head_model = AutoModelForCausalLM.from_pretrained(
-            'meta-llama/Meta-Llama-3-8B',
-            torch_dtype=torch.bfloat16,
-        ).to(device)
-        llama_vocab_weight = lm_head_model.get_output_embeddings().weight.detach()
-        del lm_head_model
+        from eval_metrics import get_llama_vocab_weight
+        llama_vocab_weight = get_llama_vocab_weight(device)
+
     if args.discrimination_loss > 0:
         cbl = CBL(config, len(concept_set), tokenizer).to(device)
     else:
         cbl = CBLResidual(config, len(concept_set), args.residual_dim, tokenizer).to(device)
     cbl.load_state_dict(torch.load(prefix + cbl_name + "_epoch_" + str(best_epoch) + ".pt", map_location=device))
     cbl.eval()
-        
-    
-    
-    
-    ### TEST STEERABILITY AFTER TRAINING
-    
-    from transformers import AutoTokenizer, AutoModel
-    tokenizer_sim = AutoTokenizer.from_pretrained('sentence-transformers/all-mpnet-base-v2')
-    sim_model = AutoModel.from_pretrained('sentence-transformers/all-mpnet-base-v2').to(device)
-    sim_model.eval()
 
-    encoded_c = tokenizer_sim(concept_set, padding=True, truncation=True, max_length=args.max_length)
-    encoded_c = {k: torch.tensor(v).to(device) for k, v in encoded_c.items()}
-    concept_features = sim_model(input_ids=encoded_c["input_ids"], attention_mask=encoded_c["attention_mask"])
-    concept_features = mean_pooling(concept_features.last_hidden_state, encoded_c["attention_mask"])
-    concept_features = F.normalize(concept_features, p=2, dim=1)
-
-    if args.dataset == "dbpedia_14":
-        intervention_value = 150
-    else:
-        intervention_value = 100
-        
-    text = []
-    cos_sim_cubed_values = []
-    softmax_values = []
-    top1_correct = 0
-    top3_correct = 0
-    top5_correct = 0
-    top10_correct = 0
-    top20_correct = 0
-    total_evals = 0
-    
-    # Use batched generation for steerability evaluation: for each concept
-    # generate N samples with `generate_batch` (with on-disk cache under checkpoint dir).
+    # ── Configure evaluation ──
+    intervention_value = get_intervention_value(args.dataset)
     num_steerability_samples = (
         max(1, args.samples_per_concept)
         if args.samples_per_concept is not None
         else max(1, 100 // len(concept_set))
     )
-    print(
-        f"Steerability samples per concept: {num_steerability_samples}"
-        + (" (from --samples_per_concept)" if args.samples_per_concept is not None else " (default: 100 // num_concepts)")
-    )
     steer_root = steerability_output_root(os.path.normpath(prefix.rstrip("/")), best_epoch, False)
     print(f"Steerability sample cache: {steer_root}")
-    steerability_texts_for_save = [[] for _ in range(len(concept_set))]
-    gen_input = torch.tensor([tokenizer.encode("")]).to(device)  # (1, prompt_len)
-    special_tokens_mask = torch.tensor([128000, 128001]).to(device)  # (2,)
-    ce_loss_fn = torch.nn.CrossEntropyLoss(reduction="none")  # CE over classes
-    steer_chunk = 25
-    cseed = args.seed
 
-    with torch.no_grad():
-        for j in tqdm(range(len(concept_set)), desc="Steerability concepts"):
-            v = [0] * len(concept_set)  # (C,)
-            v[j] = intervention_value
-            cname = concept_set[j]
-            slots = load_concept_samples(steer_root, cseed, j, cname, num_steerability_samples)
-            pos = 0
-            while pos < num_steerability_samples:
-                if slots[pos] is not None:
-                    pos += 1
-                    continue
-                end = pos
-                while end < num_steerability_samples and slots[end] is None:
-                    end += 1
-                gen_pos = pos
-                while gen_pos < end:
-                    current_batch = min(steer_chunk, end - gen_pos)
-                    text_ids_batch, _ = cbl.generate_batch(
-                        gen_input,
-                        preLM,
-                        num_samples=current_batch,
-                        intervene=v,
-                        length=50,
-                        keep_other_concepts=args.intervention_keep_other_concepts,
-                        llama_vocab_weight=llama_vocab_weight,
-                    )
-                    for b in range(current_batch):
-                        sample_idx = gen_pos + b
-                        tokens = text_ids_batch[b][~torch.isin(text_ids_batch[b], special_tokens_mask)]
-                        decoded = tokenizer.decode(tokens)
-                        slots[sample_idx] = decoded
-                        write_sample(steer_root, j, cname, cseed, sample_idx, decoded)
-                        text.append(decoded)
-                    gen_pos += current_batch
-                pos = end
-
-            decoded_texts = [slots[k] for k in range(num_steerability_samples)]
-            steerability_texts_for_save[j] = decoded_texts
-            for idx, dt in enumerate(decoded_texts):
-                wandb.log({f"steerability_sample_{cname}_{idx + 1}": dt})
-            # Batched similarity scoring with MPNet
-            generated_c = tokenizer_sim(
-                decoded_texts,
-                padding=True,
-                truncation=True,
-                max_length=args.max_length,
-                return_tensors="pt",
-            )  # dict: input_ids -> (B, L), attention_mask -> (B, L)
-            generated_c = {k: v.to(device) for k, v in generated_c.items()}
-            generated_features = sim_model(
-                input_ids=generated_c["input_ids"],
-                attention_mask=generated_c["attention_mask"],
-            )  # last_hidden_state: (B, L, H)
-            generated_features = mean_pooling(
-                generated_features.last_hidden_state,
-                generated_c["attention_mask"],
-            )  # (B, H)
-            generated_features = F.normalize(generated_features, p=2, dim=1)  # (B, H)
-
-            sims = generated_features @ concept_features.T  # (B, C)
-            v_tensor = torch.tensor(v).to(device).unsqueeze(0).expand(sims.size(0), -1)  # (B, C)
-
-            # cos_sim_cubed per sample (no reduction)
-            cos_vals = cos_sim_cubed(sims, v_tensor.float(), reduce=False)  # (B,)
-            cos_sim_cubed_values.extend(cos_vals.detach().cpu().tolist())
-
-            # Cross-entropy loss per sample w.r.t. true concept j
-            targets = torch.full((sims.size(0),), j, dtype=torch.long, device=device)  # (B,)
-            ce_vals = ce_loss_fn(sims, targets)  # (B,)
-            softmax_values.extend(ce_vals.detach().cpu().tolist())
-
-            # Top-k accuracy counts (vectorized over the batch)
-            sorted_indices = torch.argsort(sims, dim=1, descending=True)  # (B, C)
-            top1_correct += (sorted_indices[:, 0] == j).sum().item()
-            top3_correct += (sorted_indices[:, :3] == j).any(dim=1).sum().item()
-            top5_correct += (sorted_indices[:, :5] == j).any(dim=1).sum().item()
-            top10_correct += (sorted_indices[:, :10] == j).any(dim=1).sum().item()
-            top20_correct += (sorted_indices[:, :20] == j).any(dim=1).sum().item()
-            total_evals += sims.size(0)
-
-    wandb.log({
-        "steerability_cos_sim_cubed": sum(cos_sim_cubed_values) / len(cos_sim_cubed_values),
-        "steerability_softmax": sum(softmax_values) / len(softmax_values),
-        "steerability_top1_acc": top1_correct / total_evals,
-        "steerability_top3_acc": top3_correct / total_evals,
-        "steerability_top5_acc": top5_correct / total_evals,
-        "steerability_top10_acc": top10_correct / total_evals,
-        "steerability_top20_acc": top20_correct / total_evals,
-    })
-    
-    print(f"Steerability Top-1 Acc: {top1_correct / total_evals}")
-    print(f"Steerability Top-3 Acc: {top3_correct / total_evals}")
-    print(f"Steerability Top-5 Acc: {top5_correct / total_evals}")
-    print(f"Steerability Top-10 Acc: {top10_correct / total_evals}")
-    print(f"Steerability Top-20 Acc: {top20_correct / total_evals}")
-    
-    
-    ### TEST CONCEPT PREDICTION AFTER TRAINING (COSINE-SIMILARITY-BASED)
-    print("eval concepts (cosine similarity to MPNet labels)...")
-    concept_predictions = []  # list of tensors, each (B, num_concepts)
-
-    for batch, _ in tqdm(test_loader, total=len(test_loader)):
-        # batch["input_ids"]: (B, seq_len), batch["attention_mask"]: (B, seq_len)
-        batch = {k: v.to(device) for k, v in batch.items()}
-        with torch.no_grad():
-            features = preLM(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"]).last_hidden_state  # (B, seq_len, hidden_dim)
-            concepts, _, _, _ = cbl(features.float())  # concepts: (B, seq_len, num_concepts)
-        pooled_concepts = eos_pooling(concepts, batch["attention_mask"])  # (B, num_concepts)
-        concept_predictions.append(pooled_concepts.detach().cpu())
-
-    # concept_predictions: (N_test, num_concepts)
-    concept_predictions = torch.cat(concept_predictions, dim=0)  # (N_test, num_concepts)
-
-    # Load test-time MPNet/ACS concept label vectors, if available
-    test_sim_path = label_prefix + "/concept_labels_test.npy"
-    if os.path.exists(test_sim_path):
-        test_similarity_np = np.load(test_sim_path)  # (N_test, num_concepts)
-        test_similarity = torch.tensor(test_similarity_np, dtype=torch.float32)  # (N_test, num_concepts)
-
-        if test_similarity.shape != concept_predictions.shape:
-            print("[WARN] Shape mismatch between concept_predictions",
-                  f"{tuple(concept_predictions.shape)} and test_similarity {tuple(test_similarity.shape)}.")
-            print("       Skipping cosine-similarity-based concept evaluation.")
-        else:
-            # Average cosine similarity over test set (same objective as training cos_sim_cubed)
-            # concept_predictions: (N_test, num_concepts)
-            # test_similarity:     (N_test, num_concepts)
-            test_cos_sim = cos_sim_cubed(concept_predictions, test_similarity)  # scalar
-            test_cos_loss = -test_cos_sim.item()
-
-            print(f"Test concept cosine similarity (cos_sim_cubed): {test_cos_sim.item():.4f}")
-            print(f"Test concept cosine loss: {test_cos_loss:.4f}")
-
-            # --- Raw (non-cubed) cosine similarity between prediction and ACS vectors ---
-            # Normalize along the concept dimension and compute mean cosine similarity
-            pred_norm = F.normalize(concept_predictions, p=2, dim=-1)
-            label_norm = F.normalize(test_similarity, p=2, dim=-1)
-            test_cos_raw = (pred_norm * label_norm).sum(dim=-1).mean().item()
-
-            print(f"Test concept cosine similarity (raw): {test_cos_raw:.4f}")
-
-            # --- Concept-level top-k accuracy w.r.t. ACS labels ---
-            # Ground-truth concept per example: top concept from test_similarity
-            # true_concepts: (N_test,)
-            true_concepts = torch.argmax(test_similarity, dim=-1)  # indices in [0, num_concepts-1]
-
-            # Predicted ranking over concepts per example
-            # pred_sorted: (N_test, num_concepts), each row is concept indices sorted by predicted score
-            pred_sorted = torch.argsort(concept_predictions, dim=-1, descending=True)
-
-            topk_list = [1, 3, 5, 10, 20]
-            topk_hits = {k: 0 for k in topk_list}
-            topk_iou_sums = {k: 0.0 for k in topk_list}
-            total = concept_predictions.size(0)
-
-            for i in range(total):
-                gt_idx = true_concepts[i].item()
-                row = pred_sorted[i]
-                # For IoU, also collect top-k sets from GT similarity and predictions
-                for k in topk_list:
-                    k_clipped = min(k, row.size(0))
-                    gt_topk = torch.topk(test_similarity[i], k=k_clipped, dim=-1).indices.tolist()
-                    pred_topk = row[:k_clipped].tolist()
-                    gt_set = set(gt_topk)
-                    pred_set = set(pred_topk)
-                    inter = len(gt_set & pred_set)
-                    union = len(gt_set | pred_set)
-                    if union > 0:
-                        topk_iou_sums[k] += inter / union
-                for k in topk_list:
-                    if k <= row.size(0) and gt_idx in row[:k].tolist():
-                        topk_hits[k] += 1
-
-            topk_acc = {f"test_concept_top{k}_acc": topk_hits[k] / total for k in topk_list}
-            topk_iou = {f"test_concept_top{k}_iou": topk_iou_sums[k] / total for k in topk_list}
-
-            for k in topk_list:
-                print(f"Test concept Top-{k} Acc (w.r.t. ACS top concept): {topk_acc[f'test_concept_top{k}_acc']:.4f}")
-                print(f"Test concept Top-{k} IoU (GT vs pred top-k concepts): {topk_iou[f'test_concept_top{k}_iou']:.4f}")
-
-            wandb.log({
-                "test_concept_cosine_similarity": float(test_cos_sim.item()),
-                "test_concept_cosine_loss": float(test_cos_loss),
-                "test_concept_cosine_raw": float(test_cos_raw),
-                **topk_acc,
-                **topk_iou,
-            })
-    else:
-        print(f"[WARN] {test_sim_path} not found. Skipping cosine-similarity-based concept evaluation.")
-    
-    
-    
-    #### TEST WEIGHT
-    print("Top tokens for each concept neuron:")
-    w = cbl.fc.weight.data[:, :len(concept_set)].T
-    for i in tqdm(range(len(concept_set))):
-        top_values, top_ids = torch.topk(w[i], k=10)
-        print("Neuron: ", concept_set[i])
-        print("Top 10 tokens with highest weight:")
-        for j in range(10):
-            print("Neuron:", concept_set[i], "[",round(float(top_values.detach().cpu()[j]), 3), "]", tokenizer.decode(top_ids[j]))
-
-    print("Sparsity of concept weight matrix:")
-    print((w > 1e-6).count_nonzero() / w.numel())
-    wandb.log({"concept_weight_sparsity": (w > 1e-6).count_nonzero() / w.numel()})
-    
-    
-    
-    #### TEST PERPLEXITY AFTER TRAINING
-    print("Test perplexity after training:")
+    # ── Generate steerability texts (cached) ──
     set_seed(args.seed)
-    
-    pred = []
-    c = 0
-    perplexity = evaluate.load("perplexity", module_type="metric")
-    input_ids = torch.tensor([tokenizer.encode("")]).to(device)
-    for i in tqdm(range(100)):
-        print("example", str(i), end="\r")
-        with torch.no_grad():
-            text_ids, _ = cbl.generate(input_ids, preLM, llama_vocab_weight=llama_vocab_weight)
-            pred.append(tokenizer.decode(text_ids[0], skip_special_tokens=True ))
-            if len(pred[-1].split()) > 30:
-                continue
-            c += 1
-            perplexity.add_batch(predictions=[pred[i]])
+    decoded_texts_by_concept = generate_steerability_texts(
+        preLM, cbl, tokenizer, concept_set, args.dataset, device,
+        samples_per_concept=num_steerability_samples,
+        llama_vocab_weight=llama_vocab_weight,
+        keep_other_concepts=args.intervention_keep_other_concepts,
+        steerability_cache_dir=steer_root,
+        steerability_cache_seed=args.seed,
+        interventions_per_batch=50,
+    )
 
-        ## print some generated texts
-    print("Some generated texts:")
-    for i in range(5):
-        print(pred[i])
-    import pickle
-    if "perplexity_text" not in os.listdir("./"):
-        try:
-            os.mkdir("perplexity_text")
-        except:
-            pass
-    pickle.dump(pred, open(f"perplexity_text/{run_name}_generated_texts_{args.seed}.pkl", "wb"))
-    del preLM
-    del cbl
+    # ── Generate perplexity texts (cached) ──
+    ppl_texts = generate_perplexity_texts(
+        cbl, preLM, tokenizer, args.seed, device,
+        cache_dir=prefix, run_name=run_name,
+        llama_vocab_weight=llama_vocab_weight,
+    )
+
+    # ── Concept accuracy (cosine similarity) ──
+    run_concept_accuracy_cosine(preLM, cbl, test_loader, concept_set, label_prefix, device)
+
+    # ── Weight analysis ──
+    run_weight_analysis(cbl, concept_set, tokenizer)
+
+    # ── Free model from GPU ──
+    del preLM, cbl
+    if llama_vocab_weight is not None:
+        from eval_metrics import release_llama_vocab_weight
+        release_llama_vocab_weight()
+        llama_vocab_weight = None
     gc.collect()
     torch.cuda.empty_cache()
 
-    print("Perplexity: (under 30 tokens)")
-    if c > 0:
-        perplexity = perplexity.compute(model_id='meta-llama/Meta-Llama-3-8B', max_length=100)['mean_perplexity']
-        print(perplexity)
-        wandb.log({"perplexity_under_30_tokens": perplexity})
-    else:
-        print("No generated texts under 30 tokens to compute perplexity.")
-        wandb.log({"perplexity_under_30_tokens": None})
-    
-    print("Now for all tokens:")
-    perplexity = evaluate.load("perplexity", module_type="metric")
-    for p in pred:
-        perplexity.add_batch(predictions=[p])
-    perplexity = perplexity.compute(model_id='meta-llama/Meta-Llama-3-8B', max_length=100)['mean_perplexity']
-    print(perplexity)
-    wandb.log({"perplexity_all_tokens": perplexity})
+    # ── Steerability scoring (MPNet similarity) ──
+    run_steerability_mpnet(
+        decoded_texts_by_concept, concept_set,
+        intervention_value, args.max_length, device,
+    )
 
-    save_all_steerability_texts(steer_root, args.seed, concept_set, steerability_texts_for_save)
+    # ── Perplexity computation (evaluate library loads its own LLM) ──
+    compute_perplexity(ppl_texts)
 
+    # ── RM reward scoring (optional) ──
+    if not args.skip_rm:
+        try:
+            rm_model, rm_tokenizer_rm = load_reward_model(args.rm_model_name, device)
+            run_rm_metrics(
+                decoded_texts_by_concept, concept_set,
+                rm_model, rm_tokenizer_rm, device,
+                rm_batch_size=args.rm_batch_size,
+                rm_max_text_len=args.rm_max_text_len,
+            )
+            del rm_model, rm_tokenizer_rm
+            torch.cuda.empty_cache()
+        except Exception as rm_err:
+            print(f"RM evaluation failed (non-fatal): {rm_err}")
+
+    # ── Save steerability text cache ──
+    save_all_steerability_texts(steer_root, args.seed, concept_set, decoded_texts_by_concept)
     
