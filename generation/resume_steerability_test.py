@@ -4,7 +4,6 @@ Resume wandb runs and run steerability tests with RoBERTa classifiers.
 All evaluation logic is centralized in eval_metrics.py.
 """
 import argparse
-import builtins
 import os
 import pickle
 
@@ -62,20 +61,21 @@ parser.add_argument(
 
 
 def process_run(run_id, classifier_suffixes, expected_dataset, seed, wandb_project, wandb_entity=None,
-                samples_per_concept=None, run_idx=None, total_runs=None, interventions_per_batch=1):
+                samples_per_concept=None, run_idx=None, total_runs=None, interventions_per_batch=1, verbose_prints=False):
     """
     Process a single wandb run: load config, load models, run steerability tests, and log results.
     """
     # Reseed at the start of every run for reproducibility
     set_seed(seed)
+    vprint = print if verbose_prints else (lambda *_args, **_kwargs: None)
     
-    print(f"\n{'='*60}")
+    vprint(f"\n{'='*60}")
     if run_idx is not None and total_runs is not None:
         runs_left = total_runs - run_idx
-        print(f"Processing run {run_idx}/{total_runs}: {run_id} (seed={seed}, remaining={runs_left})")
+        vprint(f"Processing run {run_idx}/{total_runs}: {run_id} (seed={seed}, remaining={runs_left})")
     else:
-        print(f"Processing run: {run_id} (seed={seed})")
-    print(f"{'='*60}")
+        vprint(f"Processing run: {run_id} (seed={seed})")
+    vprint(f"{'='*60}")
     
     # Initialize wandb API and get run config
     api = wandb.Api()
@@ -87,12 +87,12 @@ def process_run(run_id, classifier_suffixes, expected_dataset, seed, wandb_proje
     try:
         original_run = api.run(run_path)
     except Exception as e:
-        print(f"Error fetching run {run_id}: {e}")
+        vprint(f"Error fetching run {run_id}: {e}")
         return
     
     # Extract config from the run
     run_config = original_run.config
-    print(f"Run config: {run_config}")
+    vprint(f"Run config: {run_config}")
     
     # Extract necessary parameters
     dataset = run_config.get('dataset', 'SetFit/sst2')
@@ -101,29 +101,29 @@ def process_run(run_id, classifier_suffixes, expected_dataset, seed, wandb_proje
     residual_dim = run_config.get('residual_dim', 768)
 
     add_llama_logits = bool(run_config.get('add_llama_logits', False))
-    print(f"Add llama logits: {add_llama_logits} (source=wandb_config_default_false)")
+    vprint(f"Add llama logits: {add_llama_logits} (source=wandb_config_default_false)")
     
-    print(f"Dataset: {dataset}, Steerability seed: {seed}")
+    vprint(f"Dataset: {dataset}, Steerability seed: {seed}")
     
     # Validate dataset matches what we expect
     if dataset != expected_dataset:
-        print(f"SKIPPING run {run_id}: dataset mismatch. Run used '{dataset}' but expected '{expected_dataset}'.")
+        vprint(f"SKIPPING run {run_id}: dataset mismatch. Run used '{dataset}' but expected '{expected_dataset}'.")
         return
     
     # Detect run layout and checkpoint prefix
     run_type, ckpt_prefix = infer_run_layout(run_id, dataset, run_config)
     if run_type is None or ckpt_prefix is None:
-        print(f"Could not infer checkpoint layout for run {run_id}")
+        vprint(f"Could not infer checkpoint layout for run {run_id}")
         return
 
-    print(f"Detected run type: {run_type}")
-    print(f"Checkpoint prefix: {ckpt_prefix}")
+    vprint(f"Detected run type: {run_type}")
+    vprint(f"Checkpoint prefix: {ckpt_prefix}")
 
     peft_path, cbl_path, best_epoch, is_low_score = find_eval_checkpoint(ckpt_prefix, run_type, dataset)
-    print(f"Evaluation epoch: {best_epoch} (low_score={is_low_score})")
+    vprint(f"Evaluation epoch: {best_epoch} (low_score={is_low_score})")
 
     if best_epoch is None:
-        print(f"No model weights found for run {run_id}")
+        vprint(f"No model weights found for run {run_id}")
         return
     
     # Setup tokenizers and config
@@ -135,9 +135,9 @@ def process_run(run_id, classifier_suffixes, expected_dataset, seed, wandb_proje
     
     # Match train_combined_finegrained.py: concept_set drives CBL output dimension.
     concept_set = CFG.concept_set.get(dataset, CFG.concepts_from_labels[dataset])
-    print(f"Concept len: {len(concept_set)}")
+    vprint(f"Concept len: {len(concept_set)}")
     n_samples = max(1, samples_per_concept) if samples_per_concept is not None else max(1, 100 // len(concept_set))
-    print(f"Samples per concept: {n_samples}" + (" (from --samples_per_concept)" if samples_per_concept is not None else " (default: 100 // num_concepts)"))
+    vprint(f"Samples per concept: {n_samples}" + (" (from --samples_per_concept)" if samples_per_concept is not None else " (default: 100 // num_concepts)"))
     
     # Load multiple roberta classifiers for steerability test (same order as training scripts)
     classifiers = {}
@@ -148,7 +148,7 @@ def process_run(run_id, classifier_suffixes, expected_dataset, seed, wandb_proje
 
     for clf_idx, classifier_path in enumerate(classifier_paths):
         if not os.path.exists(classifier_path):
-            print(f"Warning: Classifier not found at {classifier_path}, skipping...")
+            vprint(f"Warning: Classifier not found at {classifier_path}, skipping...")
             continue
         
         classifier = Roberta_classifier(len(concept_set)).to(device)
@@ -157,12 +157,12 @@ def process_run(run_id, classifier_suffixes, expected_dataset, seed, wandb_proje
         try:
             classifier = torch.compile(classifier)
         except Exception as compile_err:
-            print(f"Warning: torch.compile failed for {classifier_path}, using eager mode: {compile_err}")
+            vprint(f"Warning: torch.compile failed for {classifier_path}, using eager mode: {compile_err}")
         classifiers[clf_idx] = classifier
-        print(f"Loaded classifier from {classifier_path}")
+        vprint(f"Loaded classifier from {classifier_path}")
     
     if not classifiers:
-        print(f"No classifiers found for run {run_id}")
+        vprint(f"No classifiers found for run {run_id}")
         return
 
     wandb.init(
@@ -180,9 +180,9 @@ def process_run(run_id, classifier_suffixes, expected_dataset, seed, wandb_proje
     
     # Run steerability test (single selected checkpoint) and log keys exactly as training scripts
     results = {}
-    print(f"\nTesting epoch {best_epoch}...")
-    print(f"Loading model from: {peft_path}")
-    print(f"Loading CBL from: {cbl_path}")
+    vprint(f"\nTesting epoch {best_epoch}...")
+    vprint(f"Loading model from: {peft_path}")
+    vprint(f"Loading CBL from: {cbl_path}")
 
     # Select CBL architecture robustly across train_combined.py and train_grpo.py variants.
     if arch_type is not None:
@@ -191,7 +191,7 @@ def process_run(run_id, classifier_suffixes, expected_dataset, seed, wandb_proje
         discrimination_loss_for_loading = discrimination_loss
 
     steer_dir = steerability_output_root(ckpt_prefix, best_epoch, is_low_score)
-    print(f"Steerability sample cache: {steer_dir}")
+    vprint(f"Steerability sample cache: {steer_dir}")
 
     try:
         preLM, cbl = load_model_and_cbl(
@@ -208,7 +208,7 @@ def process_run(run_id, classifier_suffixes, expected_dataset, seed, wandb_proje
             dataset,
             device,
             samples_per_concept=n_samples,
-            print_k=3,
+            print_k=3 if verbose_prints else 0,
             llama_vocab_weight=llama_vocab_weight,
             steerability_cache_dir=steer_dir,
             steerability_cache_seed=seed,
@@ -216,7 +216,7 @@ def process_run(run_id, classifier_suffixes, expected_dataset, seed, wandb_proje
         )
 
         for clf_idx, classifier in classifiers.items():
-            print(f"\n  Testing with classifier idx={clf_idx}...")
+            vprint(f"\n  Testing with classifier idx={clf_idx}...")
 
             acc = score_steerability_roberta(
                 decoded_texts_by_concept,
@@ -226,7 +226,7 @@ def process_run(run_id, classifier_suffixes, expected_dataset, seed, wandb_proje
                 device,
             )
 
-            print(f"  Steerability test accuracy (epoch={best_epoch}, classifier_idx={clf_idx}): {acc}")
+            vprint(f"  Steerability test accuracy (epoch={best_epoch}, classifier_idx={clf_idx}): {acc}")
 
             # Use exactly the key names in train_combined.py / train_grpo.py.
             if clf_idx == 0:
@@ -249,47 +249,46 @@ def process_run(run_id, classifier_suffixes, expected_dataset, seed, wandb_proje
         torch.cuda.empty_cache()
 
     except Exception as e:
-        print(f"Error testing epoch {best_epoch}: {e}")
+        vprint(f"Error testing epoch {best_epoch}: {e}")
         import traceback
-        traceback.print_exc()
+        if verbose_prints:
+            traceback.print_exc()
     
     # Finish the resumed run
     wandb.finish()
     
-    print(f"\nCompleted processing run {run_id}")
-    print(f"Results: {results}")
+    vprint(f"\nCompleted processing run {run_id}")
+    vprint(f"Results: {results}")
     
     return results
 
 
 def main():
     args = parser.parse_args()
-    status_print = builtins.print
-    if not args.verbose_prints:
-        globals()["print"] = lambda *_args, **_kwargs: None
+    vprint = print if args.verbose_prints else (lambda *_args, **_kwargs: None)
     
     # Load run IDs from pickle file
     with open(args.run_ids_pickle, 'rb') as f:
         run_ids = pickle.load(f)
     
-    print(f"Loaded {len(run_ids)} run IDs from {args.run_ids_pickle}")
-    print(f"Run IDs: {run_ids}")
+    vprint(f"Loaded {len(run_ids)} run IDs from {args.run_ids_pickle}")
+    vprint(f"Run IDs: {run_ids}")
     
     # Parse classifier weight suffixes
     classifier_suffixes = [s.strip() for s in args.classifier_weight_suffixes.split(',')]
-    print(f"Classifier weight suffixes to test: {classifier_suffixes}")
+    vprint(f"Classifier weight suffixes to test: {classifier_suffixes}")
     
-    print(f"Expected dataset: {args.dataset}")
-    print(f"Steerability seed: {args.seed}")
-    print(f"samples_per_concept arg: {args.samples_per_concept}")
-    print(f"interventions_per_batch: {args.interventions_per_batch}")
+    vprint(f"Expected dataset: {args.dataset}")
+    vprint(f"Steerability seed: {args.seed}")
+    vprint(f"samples_per_concept arg: {args.samples_per_concept}")
+    vprint(f"interventions_per_batch: {args.interventions_per_batch}")
     
     # Process each run
     all_results = {}
     total_runs = len(run_ids)
     for idx, run_id in enumerate(run_ids, start=1):
         runs_left_after_this = total_runs - idx
-        status_print(f"\nStarting run {idx}/{total_runs}. Runs left after this: {runs_left_after_this}")
+        print(f"\nStarting run {idx}/{total_runs}. Runs left after this: {runs_left_after_this}")
         try:
             results = process_run(
                 run_id,
@@ -302,19 +301,21 @@ def main():
                 run_idx=idx,
                 total_runs=total_runs,
                 interventions_per_batch=args.interventions_per_batch,
+                verbose_prints=args.verbose_prints,
             )
             all_results[run_id] = results
         except Exception as e:
-            print(f"Error processing run {run_id}: {e}")
+            vprint(f"Error processing run {run_id}: {e}")
             import traceback
-            traceback.print_exc()
+            if args.verbose_prints:
+                traceback.print_exc()
             continue
     
-    print("\n" + "="*60)
-    print("All results:")
-    print("="*60)
+    vprint("\n" + "="*60)
+    vprint("All results:")
+    vprint("="*60)
     for run_id, results in all_results.items():
-        print(f"{run_id}: {results}")
+        vprint(f"{run_id}: {results}")
 
 
 if __name__ == "__main__":

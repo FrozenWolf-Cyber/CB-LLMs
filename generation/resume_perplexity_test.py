@@ -8,7 +8,6 @@ The perplexity computation uses the ``evaluate`` library which loads its own
 LLM, so we explicitly free the training model from GPU before scoring.
 """
 import argparse
-import builtins
 import gc
 import os
 import pickle
@@ -77,6 +76,7 @@ def process_run(
     total_runs=None,
     clear_cache=False,
     no_wandb=False,
+    verbose_prints=False,
 ):
     """
     Process a single wandb run: load config, load best checkpoint, generate cached texts,
@@ -84,14 +84,15 @@ def process_run(
     """
     # Reseed at the start of every run for reproducibility
     set_seed(seed)
+    vprint = print if verbose_prints else (lambda *_args, **_kwargs: None)
     
-    print(f"\n{'='*60}")
+    vprint(f"\n{'='*60}")
     if run_idx is not None and total_runs is not None:
         runs_left = total_runs - run_idx
-        print(f"Processing run {run_idx}/{total_runs}: {run_id} (seed={seed}, remaining={runs_left})")
+        vprint(f"Processing run {run_idx}/{total_runs}: {run_id} (seed={seed}, remaining={runs_left})")
     else:
-        print(f"Processing run: {run_id} (seed={seed})")
-    print(f"{'='*60}")
+        vprint(f"Processing run: {run_id} (seed={seed})")
+    vprint(f"{'='*60}")
     
     # Initialize wandb API and get run config
     api = wandb.Api()
@@ -103,12 +104,12 @@ def process_run(
     try:
         original_run = api.run(run_path)
     except Exception as e:
-        print(f"Error fetching run {run_id}: {e}")
+        vprint(f"Error fetching run {run_id}: {e}")
         return
     
     # Extract config from the run
     run_config = original_run.config
-    print(f"Run config: {run_config}")
+    vprint(f"Run config: {run_config}")
     
     # Extract necessary parameters
     dataset = run_config.get('dataset', 'SetFit/sst2')
@@ -117,9 +118,9 @@ def process_run(
     residual_dim = run_config.get('residual_dim', 768)
 
     add_llama_logits = bool(run_config.get('add_llama_logits', False))
-    print(f"Add llama logits: {add_llama_logits} (source=wandb_config_default_false)")
+    vprint(f"Add llama logits: {add_llama_logits} (source=wandb_config_default_false)")
     
-    print(f"Dataset: {dataset}, Perplexity seed: {seed}")
+    vprint(f"Dataset: {dataset}, Perplexity seed: {seed}")
     
     # Validate dataset matches what we expect
     # if dataset != expected_dataset:
@@ -129,17 +130,17 @@ def process_run(
     # Detect run layout and checkpoint prefix
     run_type, ckpt_prefix = infer_run_layout(run_id, dataset, run_config)
     if run_type is None or ckpt_prefix is None:
-        print(f"Could not infer checkpoint layout for run {run_id}")
+        vprint(f"Could not infer checkpoint layout for run {run_id}")
         return
 
-    print(f"Detected run type: {run_type}")
-    print(f"Checkpoint prefix: {ckpt_prefix}")
+    vprint(f"Detected run type: {run_type}")
+    vprint(f"Checkpoint prefix: {ckpt_prefix}")
 
     peft_path, cbl_path, best_epoch, is_low_score = find_eval_checkpoint(ckpt_prefix, run_type, dataset)
-    print(f"Evaluation epoch: {best_epoch} (low_score={is_low_score})")
+    vprint(f"Evaluation epoch: {best_epoch} (low_score={is_low_score})")
 
     if best_epoch is None:
-        print(f"No model weights found for run {run_id}")
+        vprint(f"No model weights found for run {run_id}")
         return
     
     # Setup tokenizers and config
@@ -149,8 +150,8 @@ def process_run(
     
     # Match train_combined_finegrained.py: concept_set drives CBL output dimension.
     concept_set = CFG.concept_set.get(dataset, CFG.concepts_from_labels[dataset])
-    print(f"Concept len: {len(concept_set)}")
-    print(f"Perplexity n_samples: {perplexity_n_samples}")
+    vprint(f"Concept len: {len(concept_set)}")
+    vprint(f"Perplexity n_samples: {perplexity_n_samples}")
 
     if no_wandb:
         wandb.init(mode="disabled")
@@ -170,9 +171,9 @@ def process_run(
     
     # Run perplexity evaluation (single selected checkpoint) and log keys exactly as training scripts
     results = {}
-    print(f"\nEvaluating epoch {best_epoch}...")
-    print(f"Loading model from: {peft_path}")
-    print(f"Loading CBL from: {cbl_path}")
+    vprint(f"\nEvaluating epoch {best_epoch}...")
+    vprint(f"Loading model from: {peft_path}")
+    vprint(f"Loading CBL from: {cbl_path}")
 
     # Select CBL architecture robustly across train_combined.py and train_grpo.py variants.
     if arch_type is not None:
@@ -182,16 +183,16 @@ def process_run(
 
     # Use the run prefix for caching generated perplexity texts.
     cache_dir = os.path.normpath(str(ckpt_prefix).rstrip("/"))
-    print(f"Perplexity text cache dir: {cache_dir}")
+    vprint(f"Perplexity text cache dir: {cache_dir}")
 
     if clear_cache:
         cache_file = _perplexity_cache_path(cache_dir, seed)
         if os.path.isfile(cache_file):
-            print(f"--clear_cache: removing perplexity cache at {cache_file}")
+            vprint(f"--clear_cache: removing perplexity cache at {cache_file}")
             os.remove(cache_file)
-            print("  Cache cleared. Texts will be regenerated.")
+            vprint("  Cache cleared. Texts will be regenerated.")
         else:
-            print(f"--clear_cache: no existing cache file at {cache_file}")
+            vprint(f"--clear_cache: no existing cache file at {cache_file}")
 
     try:
         preLM, cbl = load_model_and_cbl(
@@ -230,47 +231,46 @@ def process_run(
         })
 
     except Exception as e:
-        print(f"Error evaluating epoch {best_epoch}: {e}")
+        vprint(f"Error evaluating epoch {best_epoch}: {e}")
         import traceback
-        traceback.print_exc()
+        if verbose_prints:
+            traceback.print_exc()
     
     # Finish the resumed run
     wandb.finish()
     
-    print(f"\nCompleted processing run {run_id}")
-    print(f"Results: {results}")
+    vprint(f"\nCompleted processing run {run_id}")
+    vprint(f"Results: {results}")
     
     return results
 
 
 def main():
     args = parser.parse_args()
-    status_print = builtins.print
-    if not args.verbose_prints:
-        globals()["print"] = lambda *_args, **_kwargs: None
+    vprint = print if args.verbose_prints else (lambda *_args, **_kwargs: None)
     
     if args.run_id is not None:
         run_ids = [args.run_id]
-        print(f"Using single run ID: {args.run_id}")
+        vprint(f"Using single run ID: {args.run_id}")
     elif args.run_ids_pickle is not None:
         with open(args.run_ids_pickle, 'rb') as f:
             run_ids = pickle.load(f)
-        print(f"Loaded {len(run_ids)} run IDs from {args.run_ids_pickle}")
+        vprint(f"Loaded {len(run_ids)} run IDs from {args.run_ids_pickle}")
     else:
         parser.error("Must provide either --run_id or --run_ids_pickle")
 
-    print(f"Run IDs: {run_ids}")
+    vprint(f"Run IDs: {run_ids}")
     
-    print(f"Expected dataset: {args.dataset}")
-    print(f"Perplexity seed: {args.seed}")
-    print(f"perplexity_n_samples: {args.perplexity_n_samples}")
+    vprint(f"Expected dataset: {args.dataset}")
+    vprint(f"Perplexity seed: {args.seed}")
+    vprint(f"perplexity_n_samples: {args.perplexity_n_samples}")
     
     # Process each run
     all_results = {}
     total_runs = len(run_ids)
     for idx, run_id in enumerate(run_ids, start=1):
         runs_left_after_this = total_runs - idx
-        status_print(f"\nStarting run {idx}/{total_runs}. Runs left after this: {runs_left_after_this}")
+        print(f"\nStarting run {idx}/{total_runs}. Runs left after this: {runs_left_after_this}")
         try:
             results = process_run(
                 run_id,
@@ -283,19 +283,21 @@ def main():
                 total_runs=total_runs,
                 clear_cache=args.clear_cache,
                 no_wandb=args.no_wandb,
+                verbose_prints=args.verbose_prints,
             )
             all_results[run_id] = results
         except Exception as e:
-            print(f"Error processing run {run_id}: {e}")
+            vprint(f"Error processing run {run_id}: {e}")
             import traceback
-            traceback.print_exc()
+            if args.verbose_prints:
+                traceback.print_exc()
             continue
     
-    print("\n" + "="*60)
-    print("All results:")
-    print("="*60)
+    vprint("\n" + "="*60)
+    vprint("All results:")
+    vprint("="*60)
     for run_id, results in all_results.items():
-        print(f"{run_id}: {results}")
+        vprint(f"{run_id}: {results}")
 
 
 if __name__ == "__main__":

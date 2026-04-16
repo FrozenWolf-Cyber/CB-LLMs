@@ -8,7 +8,6 @@ combined), but **no batch min-max**: metrics are sequence-classification logits 
 All evaluation logic is centralized in eval_metrics.py.
 """
 import argparse
-import builtins
 import os
 import pickle
 
@@ -54,15 +53,17 @@ def process_run(
     use_label_concepts=False,
     clear_cache=False,
     no_wandb=False,
+    verbose_prints=False,
 ):
     set_seed(seed)
+    vprint = print if verbose_prints else (lambda *_args, **_kwargs: None)
 
-    print(f"\n{'='*60}")
+    vprint(f"\n{'='*60}")
     if run_idx is not None and total_runs is not None:
-        print(f"Processing run {run_idx}/{total_runs}: {run_id} (seed={seed})")
+        vprint(f"Processing run {run_idx}/{total_runs}: {run_id} (seed={seed})")
     else:
-        print(f"Processing run: {run_id} (seed={seed})")
-    print(f"{'='*60}")
+        vprint(f"Processing run: {run_id} (seed={seed})")
+    vprint(f"{'='*60}")
 
     api = wandb.Api()
     if wandb_entity:
@@ -73,35 +74,35 @@ def process_run(
     try:
         original_run = api.run(run_path)
     except Exception as e:
-        print(f"Error fetching run {run_id}: {e}")
+        vprint(f"Error fetching run {run_id}: {e}")
         return None
 
     run_config = original_run.config
-    print(f"Run config: {run_config}")
+    vprint(f"Run config: {run_config}")
 
     dataset = run_config.get("dataset", "SetFit/sst2")
-    print(f"Dataset (from W&B run config): {dataset}")
+    vprint(f"Dataset (from W&B run config): {dataset}")
     discrimination_loss = run_config.get("discrimination_loss", 1.0)
     arch_type = run_config.get("arch_type", None)
     residual_dim = run_config.get("residual_dim", 768)
     add_llama_logits = bool(run_config.get("add_llama_logits", False))
-    print(f"Add llama logits: {add_llama_logits}")
+    vprint(f"Add llama logits: {add_llama_logits}")
 
     gen_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     run_type, ckpt_prefix = infer_run_layout(run_id, dataset, run_config)
     if run_type is None or ckpt_prefix is None:
-        print(f"Could not infer checkpoint layout for run {run_id}")
+        vprint(f"Could not infer checkpoint layout for run {run_id}")
         return None
 
-    print(f"Detected run type: {run_type}")
-    print(f"Checkpoint prefix: {ckpt_prefix}")
+    vprint(f"Detected run type: {run_type}")
+    vprint(f"Checkpoint prefix: {ckpt_prefix}")
 
     peft_path, cbl_path, best_epoch, is_low_score = find_eval_checkpoint(ckpt_prefix, run_type, dataset)
-    print(f"Evaluation epoch: {best_epoch} (low_score={is_low_score})")
+    vprint(f"Evaluation epoch: {best_epoch} (low_score={is_low_score})")
 
     if best_epoch is None:
-        print(f"No model weights found for run {run_id}")
+        vprint(f"No model weights found for run {run_id}")
         return None
 
     config = LlamaConfig.from_pretrained("meta-llama/Meta-Llama-3-8B")
@@ -110,13 +111,13 @@ def process_run(
 
     if use_label_concepts:
         concept_set = CFG.concepts_from_labels[dataset]
-        print("Concept source: class labels (CFG.concepts_from_labels)")
+        vprint("Concept source: class labels (CFG.concepts_from_labels)")
     else:
         concept_set = CFG.concept_set[dataset]
-        print("Concept source: fine-grained concepts (CFG.concept_set)")
-    print(f"Concept len: {len(concept_set)}")
+        vprint("Concept source: fine-grained concepts (CFG.concept_set)")
+    vprint(f"Concept len: {len(concept_set)}")
     n_samples = max(1, samples_per_concept) if samples_per_concept is not None else max(1, 100 // len(concept_set))
-    print(f"Samples per concept: {n_samples}" + (" (from --samples_per_concept)" if samples_per_concept is not None else " (default: 100 // num_concepts)"))
+    vprint(f"Samples per concept: {n_samples}" + (" (from --samples_per_concept)" if samples_per_concept is not None else " (default: 100 // num_concepts)"))
 
     rm_device = torch.device(rm_device_str)
     rm_model, rm_tokenizer = load_reward_model(rm_model_name, rm_device)
@@ -138,16 +139,16 @@ def process_run(
         )
 
     results = {}
-    print(f"\nRM steerability benchmark — epoch {best_epoch} (logits clipped to [{RM_LOGIT_CLIP_MIN}, {RM_LOGIT_CLIP_MAX}], no min-max)")
-    print(f"  rm_batch_size={rm_batch_size} max_text_len={rm_max_text_len}")
+    vprint(f"\nRM steerability benchmark — epoch {best_epoch} (logits clipped to [{RM_LOGIT_CLIP_MIN}, {RM_LOGIT_CLIP_MAX}], no min-max)")
+    vprint(f"  rm_batch_size={rm_batch_size} max_text_len={rm_max_text_len}")
 
     steer_dir = steerability_output_root(ckpt_prefix, best_epoch, is_low_score)
-    print(f"Steerability sample cache: {steer_dir}")
+    vprint(f"Steerability sample cache: {steer_dir}")
 
     if clear_cache and os.path.isdir(steer_dir):
-        print(f"--clear_cache: removing steerability cache at {steer_dir}")
+        vprint(f"--clear_cache: removing steerability cache at {steer_dir}")
         shutil.rmtree(steer_dir)
-        print("  Cache cleared. Texts will be regenerated.")
+        vprint("  Cache cleared. Texts will be regenerated.")
 
     if arch_type is not None:
         discrimination_loss_for_loading = 1.0 if arch_type == "non_residual" else 0.0
@@ -175,7 +176,7 @@ def process_run(
             dataset,
             gen_device,
             samples_per_concept=n_samples,
-            print_k=3,
+            print_k=3 if verbose_prints else 0,
             llama_vocab_weight=llama_vocab_weight,
             steerability_cache_dir=steer_dir,
             steerability_cache_seed=seed,
@@ -220,16 +221,17 @@ def process_run(
         torch.cuda.empty_cache()
 
     except Exception as e:
-        print(f"Error during RM metric test (epoch={best_epoch}): {e}")
+        vprint(f"Error during RM metric test (epoch={best_epoch}): {e}")
         import traceback
 
-        traceback.print_exc()
+        if verbose_prints:
+            traceback.print_exc()
 
     wandb.finish()
 
-    print(f"\nCompleted processing run {run_id}")
+    vprint(f"\nCompleted processing run {run_id}")
     if results:
-        print(
+        vprint(
             f"  relevance={results.get('rm_relevance_mean')} "
             f"grammar={results.get('rm_grammar_mean')} "
             f"together={results.get('rm_together_mean')}"
@@ -304,28 +306,26 @@ def main():
         help="Enable detailed stdout logs. Default keeps only remaining-runs progress lines.",
     )
     args = parser.parse_args()
-    status_print = builtins.print
-    if not args.verbose_prints:
-        globals()["print"] = lambda *_args, **_kwargs: None
+    vprint = print if args.verbose_prints else (lambda *_args, **_kwargs: None)
 
     if args.run_id is not None:
         run_ids = [args.run_id]
-        print(f"Using single run ID: {args.run_id}")
+        vprint(f"Using single run ID: {args.run_id}")
     elif args.run_ids_pickle is not None:
         with open(args.run_ids_pickle, "rb") as f:
             run_ids = pickle.load(f)
-        print(f"Loaded {len(run_ids)} run IDs from {args.run_ids_pickle}")
+        vprint(f"Loaded {len(run_ids)} run IDs from {args.run_ids_pickle}")
     else:
         parser.error("Must provide either --run_id or --run_ids_pickle")
 
-    print(f"Run IDs: {run_ids}")
+    vprint(f"Run IDs: {run_ids}")
     if args.dataset is not None:
-        print("Note: --dataset is ignored; using each run's W&B config['dataset'].")
-    print(
+        vprint("Note: --dataset is ignored; using each run's W&B config['dataset'].")
+    vprint(
         f"RM: {args.rm_model_name} | logits clipped to [{RM_LOGIT_CLIP_MIN}, {RM_LOGIT_CLIP_MAX}] "
         f"(relevance, grammar, together) | rm_device={args.rm_device}"
     )
-    print(
+    vprint(
         "Concept mode: "
         + ("class labels (train_combined.py compatible)" if args.use_label_concepts else "fine-grained concepts")
     )
@@ -333,7 +333,7 @@ def main():
     all_results = {}
     total_runs = len(run_ids)
     for idx, run_id in enumerate(run_ids, start=1):
-        status_print(f"\nStarting run {idx}/{total_runs}. Runs left after this: {total_runs - idx}")
+        print(f"\nStarting run {idx}/{total_runs}. Runs left after this: {total_runs - idx}")
         try:
             out = process_run(
                 run_id,
@@ -351,22 +351,24 @@ def main():
                 use_label_concepts=args.use_label_concepts,
                 clear_cache=args.clear_cache,
                 no_wandb=args.no_wandb,
+                verbose_prints=args.verbose_prints,
             )
             all_results[run_id] = out
         except Exception as e:
-            print(f"Error processing run {run_id}: {e}")
+            vprint(f"Error processing run {run_id}: {e}")
             import traceback
 
-            traceback.print_exc()
+            if args.verbose_prints:
+                traceback.print_exc()
 
-    print("\n" + "=" * 60)
-    print("All runs — rm_relevance_mean / rm_grammar_mean / rm_together_mean (clipped logits):")
-    print("=" * 60)
+    vprint("\n" + "=" * 60)
+    vprint("All runs — rm_relevance_mean / rm_grammar_mean / rm_together_mean (clipped logits):")
+    vprint("=" * 60)
     for rid, res in all_results.items():
         if not res:
-            print(f"{rid}: None")
+            vprint(f"{rid}: None")
             continue
-        print(
+        vprint(
             f"{rid}: rel={res.get('rm_relevance_mean')} "
             f"gram={res.get('rm_grammar_mean')} "
             f"tog={res.get('rm_together_mean')}"
