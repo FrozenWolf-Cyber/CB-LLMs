@@ -23,6 +23,7 @@ from transformers import LlamaConfig, AutoTokenizer
 import shutil
 
 from steerability_cache import save_all_steerability_texts, steerability_output_root
+from wandb_pending_io import append_rm_run
 from eval_metrics import (
     RM_LOGIT_CLIP_MIN,
     RM_LOGIT_CLIP_MAX,
@@ -53,6 +54,7 @@ def process_run(
     use_label_concepts=False,
     clear_cache=False,
     no_wandb=False,
+    pending_wandb_pickle=None,
     verbose_prints=False,
 ):
     set_seed(seed)
@@ -122,9 +124,8 @@ def process_run(
     rm_device = torch.device(rm_device_str)
     rm_model, rm_tokenizer = load_reward_model(rm_model_name, rm_device)
 
-    if no_wandb:
-        wandb.init(mode="disabled")
-    else:
+    use_wandb = not no_wandb
+    if use_wandb:
         wandb.init(
             project=wandb_project,
             entity=wandb_entity,
@@ -206,7 +207,16 @@ def process_run(
                 log_payload[f"rm_grammar_mean_{safe}"] = row["rm_grammar_mean"]
                 log_payload[f"rm_together_mean_{safe}"] = row["rm_together_mean"]
 
-        wandb.log(log_payload)
+        if use_wandb:
+            wandb.log(log_payload)
+        elif pending_wandb_pickle:
+            append_rm_run(
+                pending_wandb_pickle,
+                run_id,
+                log_payload,
+                wandb_project=wandb_project,
+                wandb_entity=wandb_entity,
+            )
 
         results = {
             **metrics,
@@ -227,7 +237,8 @@ def process_run(
         if verbose_prints:
             traceback.print_exc()
 
-    wandb.finish()
+    if use_wandb:
+        wandb.finish()
 
     vprint(f"\nCompleted processing run {run_id}")
     if results:
@@ -296,9 +307,20 @@ def main():
         help="Delete cached steerability texts and regenerate from scratch.",
     )
     parser.add_argument(
+        "--skip_wandb",
+        action="store_true",
+        help="Do not init or log to W&B (no uploads). Use with --pending_wandb_pickle to save metrics for publish_resume_wandb_pending.py.",
+    )
+    parser.add_argument(
         "--no_wandb",
         action="store_true",
-        help="Disable wandb logging (skip resume, all wandb.log calls become no-ops).",
+        help="Alias for --skip_wandb.",
+    )
+    parser.add_argument(
+        "--pending_wandb_pickle",
+        type=str,
+        default=None,
+        help="Append RM metrics for each run to this pickle (merge with grpo section from resume_grpo_finegrained_eval.py).",
     )
     parser.add_argument(
         "--verbose_prints",
@@ -306,7 +328,13 @@ def main():
         help="Enable detailed stdout logs. Default keeps only remaining-runs progress lines.",
     )
     args = parser.parse_args()
+    skip_wandb = args.skip_wandb or args.no_wandb
     vprint = print if args.verbose_prints else (lambda *_args, **_kwargs: None)
+    if skip_wandb and not args.pending_wandb_pickle:
+        print(
+            "Warning: --skip_wandb without --pending_wandb_pickle: metrics will not be saved for later W&B upload.",
+            flush=True,
+        )
 
     if args.run_id is not None:
         run_ids = [args.run_id]
@@ -350,7 +378,8 @@ def main():
                 interventions_per_batch=args.interventions_per_batch,
                 use_label_concepts=args.use_label_concepts,
                 clear_cache=args.clear_cache,
-                no_wandb=args.no_wandb,
+                no_wandb=skip_wandb,
+                pending_wandb_pickle=args.pending_wandb_pickle,
                 verbose_prints=args.verbose_prints,
             )
             all_results[run_id] = out

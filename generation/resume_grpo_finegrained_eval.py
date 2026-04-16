@@ -1,4 +1,5 @@
 import argparse
+import copy
 import os
 import pickle
 import torch
@@ -24,6 +25,7 @@ from resume_steerability_test import (
     load_model_and_cbl,
     set_seed,
 )
+from wandb_pending_io import append_grpo_run_logs
 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -87,6 +89,17 @@ parser.add_argument(
     action="store_true",
     help="If set, run Weight Analysis. Default: skip.",
 )
+parser.add_argument(
+    "--skip_wandb",
+    action="store_true",
+    help="Do not init or log to W&B (no uploads). Use with --pending_wandb_pickle to save metrics for publish_resume_wandb_pending.py.",
+)
+parser.add_argument(
+    "--pending_wandb_pickle",
+    type=str,
+    default=None,
+    help="Append GRPO eval log sequence per run to this pickle (merge with rm_metric from resume_rm_metric_test.py).",
+)
 
 
 def run_steerability_test_from_texts(decoded_texts_by_concept, roberta_tokenizer, classifier, concept_set):
@@ -138,10 +151,17 @@ def run_evaluation(
     run_perplexity=False,
     run_concept_prediction=False,
     run_weight_analysis=False,
+    wandb_log_buffer=None,
 ):
     """
     Run all evaluations from train_grpo_finegrained.py.
     """
+    def _log(payload):
+        if wandb_log_buffer is not None:
+            wandb_log_buffer.append(copy.deepcopy(payload))
+        else:
+            wandb.log(payload)
+
     results = {}
     
     if perplexity_only:
@@ -235,7 +255,7 @@ def run_evaluation(
             "steerability_top10_acc": top10_correct / total_evals,
             "steerability_top20_acc": top20_correct / total_evals,
         }
-        wandb.log(steer_results)
+        _log(steer_results)
         results.update(steer_results)
         print(f"Steerability Top-1 Acc: {steer_results['steerability_top1_acc']}")
 
@@ -339,7 +359,7 @@ def run_evaluation(
                         **topk_acc,
                         **topk_iou,
                     }
-                    wandb.log(concept_pred_results)
+                    _log(concept_pred_results)
                     results.update(concept_pred_results)
                     print(f"Test concept cosine similarity (raw): {test_cos_raw:.4f}")
                 else:
@@ -359,7 +379,7 @@ def run_evaluation(
                     # Log or print, but avoid excessive printing in a loop
                 
                 sparsity = (w > 1e-6).count_nonzero() / w.numel()
-                wandb.log({"concept_weight_sparsity": sparsity})
+                _log({"concept_weight_sparsity": sparsity})
                 results["concept_weight_sparsity"] = sparsity.item()
                 print(f"  Concept weight sparsity: {sparsity.item()}")
             except AttributeError:
@@ -392,11 +412,11 @@ def run_evaluation(
 
     if c > 0:
         ppl_under_30 = perplexity_metric.compute(model_id='meta-llama/Meta-Llama-3-8B')['mean_perplexity']
-        wandb.log({"perplexity_under_30_tokens": ppl_under_30})
+        _log({"perplexity_under_30_tokens": ppl_under_30})
         results["perplexity_under_30_tokens"] = ppl_under_30
         print(f"  Perplexity (under 30 tokens): {ppl_under_30}")
     else:
-        wandb.log({"perplexity_under_30_tokens": None})
+        _log({"perplexity_under_30_tokens": None})
         print("  No generated texts under 30 tokens to compute perplexity.")
 
     perplexity_all = evaluate.load("perplexity", module_type="metric")
@@ -405,11 +425,11 @@ def run_evaluation(
     if pred_non_empty:
         perplexity_all.add_batch(predictions=pred_non_empty)
         ppl_all = perplexity_all.compute(model_id='meta-llama/Meta-Llama-3-8B')['mean_perplexity']
-        wandb.log({"perplexity_all_tokens": ppl_all})
+        _log({"perplexity_all_tokens": ppl_all})
         results["perplexity_all_tokens"] = ppl_all
         print(f"  Perplexity (all tokens): {ppl_all}")
     else:
-        wandb.log({"perplexity_all_tokens": None})
+        _log({"perplexity_all_tokens": None})
         print("  No non-empty generated texts to compute perplexity for all tokens.")
 
     return results
@@ -418,7 +438,8 @@ def run_evaluation(
 def process_run(run_id, classifier_suffixes, seed, wandb_project, wandb_entity=None,
                 samples_per_concept=None, run_idx=None, total_runs=None, interventions_per_batch=4,
                 use_label_concepts=False, perplexity_only=False, run_perplexity=False,
-                run_concept_prediction=False, run_weight_analysis=False):
+                run_concept_prediction=False, run_weight_analysis=False,
+                skip_wandb=False, pending_wandb_pickle=None):
     """
     Process a single wandb run: load config, load models, run evaluations, and log results.
     """
@@ -485,13 +506,17 @@ def process_run(run_id, classifier_suffixes, seed, wandb_project, wandb_entity=N
     n_samples = max(1, samples_per_concept) if samples_per_concept is not None else max(1, 100 // len(concept_set))
     if not perplexity_only:
         print(f"Samples per concept: {n_samples}" + (" (from --samples_per_concept)" if samples_per_concept is not None else " (default: 100 // num_concepts)"))
-    
-    resumed_run = wandb.init(
-        project=wandb_project,
-        entity=wandb_entity,
-        id=run_id,
-        resume="must"
-    )
+
+    wandb_log_buffer = [] if skip_wandb else None
+    run_name = getattr(original_run, "name", None) or str(run_id)
+    if not skip_wandb:
+        resumed_run = wandb.init(
+            project=wandb_project,
+            entity=wandb_entity,
+            id=run_id,
+            resume="must"
+        )
+        run_name = resumed_run.name
     
     results = {}
     print(f"\nTesting epoch {best_epoch}...")
@@ -518,7 +543,7 @@ def process_run(run_id, classifier_suffixes, seed, wandb_project, wandb_entity=N
                 dataset,
                 run_config,
                 classifier_suffixes,
-                resumed_run.name,
+                run_name,
                 seed,
                 None,
                 steerability_cache_dir=None,
@@ -527,6 +552,7 @@ def process_run(run_id, classifier_suffixes, seed, wandb_project, wandb_entity=N
                 run_perplexity=True,
                 run_concept_prediction=False,
                 run_weight_analysis=False,
+                wandb_log_buffer=wandb_log_buffer,
             )
         else:
             llama_vocab_weight = get_llama_vocab_weight() if add_llama_logits else None
@@ -552,7 +578,7 @@ def process_run(run_id, classifier_suffixes, seed, wandb_project, wandb_entity=N
                 dataset,
                 run_config,
                 classifier_suffixes,
-                resumed_run.name,
+                run_name,
                 seed,
                 decoded_texts_by_concept,
                 steerability_cache_dir=steer_dir,
@@ -561,6 +587,7 @@ def process_run(run_id, classifier_suffixes, seed, wandb_project, wandb_entity=N
                 run_perplexity=run_perplexity,
                 run_concept_prediction=run_concept_prediction,
                 run_weight_analysis=run_weight_analysis,
+                wandb_log_buffer=wandb_log_buffer,
             )
         results.update(eval_results)
 
@@ -573,9 +600,22 @@ def process_run(run_id, classifier_suffixes, seed, wandb_project, wandb_entity=N
         traceback.print_exc()
     
     if results:
-        wandb.log({"evaluation_summary": results})
-    
-    wandb.finish()
+        if skip_wandb:
+            wandb_log_buffer.append(copy.deepcopy({"evaluation_summary": results}))
+        else:
+            wandb.log({"evaluation_summary": results})
+
+    if skip_wandb and pending_wandb_pickle and wandb_log_buffer:
+        append_grpo_run_logs(
+            pending_wandb_pickle,
+            run_id,
+            wandb_log_buffer,
+            wandb_project=wandb_project,
+            wandb_entity=wandb_entity,
+        )
+
+    if not skip_wandb:
+        wandb.finish()
     
     print(f"\nCompleted processing run {run_id}")
     print(f"Results: {results}")
@@ -627,6 +667,8 @@ def main():
                 run_perplexity=(args.perplexity or args.perplexity_only),
                 run_concept_prediction=args.concept_prediction,
                 run_weight_analysis=args.weight_analysis,
+                skip_wandb=args.skip_wandb,
+                pending_wandb_pickle=args.pending_wandb_pickle,
             )
             all_results[run_id] = results
         except Exception as e:
