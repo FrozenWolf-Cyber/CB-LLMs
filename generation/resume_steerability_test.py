@@ -4,6 +4,7 @@ Resume wandb runs and run steerability tests with RoBERTa classifiers.
 All evaluation logic is centralized in eval_metrics.py.
 """
 import argparse
+import builtins
 import os
 import pickle
 
@@ -52,6 +53,11 @@ parser.add_argument(
     default=50,
     help="Number of concept interventions to batch together during generation. "
          "Higher values reduce sequential autoregressive loops but increase VRAM usage. (default: 50)",
+)
+parser.add_argument(
+    "--verbose_prints",
+    action="store_true",
+    help="Enable detailed stdout logs. Default keeps only remaining-runs progress lines.",
 )
 
 
@@ -258,6 +264,9 @@ def process_run(run_id, classifier_suffixes, expected_dataset, seed, wandb_proje
 
 def main():
     args = parser.parse_args()
+    status_print = builtins.print
+    if not args.verbose_prints:
+        globals()["print"] = lambda *_args, **_kwargs: None
     
     # Load run IDs from pickle file
     with open(args.run_ids_pickle, 'rb') as f:
@@ -280,7 +289,7 @@ def main():
     total_runs = len(run_ids)
     for idx, run_id in enumerate(run_ids, start=1):
         runs_left_after_this = total_runs - idx
-        print(f"\nStarting run {idx}/{total_runs}. Runs left after this: {runs_left_after_this}")
+        status_print(f"\nStarting run {idx}/{total_runs}. Runs left after this: {runs_left_after_this}")
         try:
             results = process_run(
                 run_id,

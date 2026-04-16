@@ -8,6 +8,7 @@ The perplexity computation uses the ``evaluate`` library which loads its own
 LLM, so we explicitly free the training model from GPU before scoring.
 """
 import argparse
+import builtins
 import gc
 import os
 import pickle
@@ -57,6 +58,11 @@ parser.add_argument(
     "--no_wandb",
     action="store_true",
     help="Disable wandb logging (skip resume, all wandb.log calls become no-ops).",
+)
+parser.add_argument(
+    "--verbose_prints",
+    action="store_true",
+    help="Enable detailed stdout logs. Default keeps only remaining-runs progress lines.",
 )
 
 
@@ -239,6 +245,9 @@ def process_run(
 
 def main():
     args = parser.parse_args()
+    status_print = builtins.print
+    if not args.verbose_prints:
+        globals()["print"] = lambda *_args, **_kwargs: None
     
     if args.run_id is not None:
         run_ids = [args.run_id]
@@ -261,7 +270,7 @@ def main():
     total_runs = len(run_ids)
     for idx, run_id in enumerate(run_ids, start=1):
         runs_left_after_this = total_runs - idx
-        print(f"\nStarting run {idx}/{total_runs}. Runs left after this: {runs_left_after_this}")
+        status_print(f"\nStarting run {idx}/{total_runs}. Runs left after this: {runs_left_after_this}")
         try:
             results = process_run(
                 run_id,
