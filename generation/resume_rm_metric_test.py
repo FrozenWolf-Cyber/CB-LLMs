@@ -128,6 +128,12 @@ def process_run(
             entity=wandb_entity,
             id=run_id,
             resume="must",
+            save_code=False,
+            settings=wandb.Settings(
+                console="off",
+                disable_git=True,
+                _disable_stats=True,
+            ),
         )
 
     results = {}
@@ -217,17 +223,6 @@ def process_run(
         import traceback
 
         traceback.print_exc()
-
-    if results:
-        summary = {
-            "rm_relevance_mean": results.get("rm_relevance_mean"),
-            "rm_grammar_mean": results.get("rm_grammar_mean"),
-            "rm_together_mean": results.get("rm_together_mean"),
-            "rm_total_n": results.get("rm_total_n"),
-            "epoch": results.get("epoch"),
-            "per_concept": results.get("per_concept"),
-        }
-        wandb.log({"rm_metric_results_summary": summary})
 
     wandb.finish()
 

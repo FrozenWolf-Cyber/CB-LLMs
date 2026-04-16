@@ -153,7 +153,13 @@ def process_run(
             project=wandb_project,
             entity=wandb_entity,
             id=run_id,
-            resume="must"
+            resume="must",
+            save_code=False,
+            settings=wandb.Settings(
+                console="off",
+                disable_git=True,
+                _disable_stats=True,
+            ),
         )
     
     # Run perplexity evaluation (single selected checkpoint) and log keys exactly as training scripts
@@ -221,10 +227,6 @@ def process_run(
         print(f"Error evaluating epoch {best_epoch}: {e}")
         import traceback
         traceback.print_exc()
-    
-    # Log summary
-    if results:
-        wandb.log({"perplexity_results_summary": results})
     
     # Finish the resumed run
     wandb.finish()
