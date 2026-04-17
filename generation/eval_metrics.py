@@ -337,12 +337,15 @@ def generate_steerability_texts(
                         write_samples_batch(steerability_cache_dir, pending_writes)
                     gen_offset += current_chunk
 
+    should_log_samples_to_wandb = wandb.run is not None
+
     all_texts: list[list[str]] = []
     for concept_idx in range(num_concepts):
         cname = concept_set[concept_idx]
         concept_texts = [all_slots[concept_idx][k] for k in range(samples_per_concept)]
-        for idx, t in enumerate(concept_texts):
-            wandb.log({f"steerability_sample_{cname}_{idx + 1}": t})
+        if should_log_samples_to_wandb:
+            for idx, t in enumerate(concept_texts):
+                wandb.log({f"steerability_sample_{cname}_{idx + 1}": t})
         if print_k > 0:
             print(f"Concept '{cname}' sample preview:")
             for k in range(min(print_k, len(concept_texts))):
