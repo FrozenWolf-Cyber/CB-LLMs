@@ -562,6 +562,7 @@ def process_run(run_id, classifier_suffixes, seed, wandb_project, wandb_entity=N
                 tokenizer,
                 concept_set,
                 dataset,
+                device,
                 samples_per_concept=n_samples,
                 print_k=3,
                 llama_vocab_weight=llama_vocab_weight,
